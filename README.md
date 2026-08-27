@@ -30,7 +30,7 @@ PAT is accepted.
 - Catalog-event contract: v1, promoted byte-for-byte from immutable
   `catalog-ingestion` commit `e7038d1492da54e91444bfa990598e8963972ce2`.
 - Persistence compatibility: v1, promoted from immutable `database-schema` commit
-  `4622bfeb4cd9c9553cbf640bb96c1e80b2cba710`.
+  `6a29e2859a2177eebae1d97dd8550997ff43e9d0`.
 
 `just source-check` verifies both promoted files and the generated Python binding by SHA-256.
 There are no cross-repository relative imports or generated writes.
