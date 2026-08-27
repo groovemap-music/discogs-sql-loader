@@ -25,4 +25,11 @@ The exact `git filter-repo` arguments were:
 
 The destination `main` branch retains 198 relevant source commits and no tags. The
 current tree is MIT licensed by owner decision; earlier license revisions remain in
-history. The original monorepo and its refs were not rewritten or deleted.
+history.
+
+During preparation, an initial command-context error invoked the filter in the local
+source clone. No source remote was changed. Before continuing, every pre-filter local
+branch tip was recovered by exact object ID from the filter ref map and intact local or
+GitHub objects, all linked worktrees were verified clean, `git fsck --full --no-dangling`
+passed, and the source `main` was verified against its unchanged public remote. The
+accidental filtered refs and an intact recovery clone remain available locally.
