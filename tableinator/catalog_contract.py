@@ -1,4 +1,4 @@
-"""Generated from extractor/contracts/catalog-events/v1/contract.json; do not edit."""
+"""Generated from contracts/catalog-events/v1/contract.json; do not edit."""
 
 from __future__ import annotations
 

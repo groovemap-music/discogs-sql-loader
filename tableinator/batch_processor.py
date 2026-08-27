@@ -19,6 +19,7 @@ from psycopg import sql
 from psycopg.errors import InterfaceError, OperationalError
 from psycopg.types.json import Jsonb
 
+
 logger = structlog.get_logger(__name__)
 
 
@@ -35,9 +36,7 @@ class BatchConfig:
     backoff_max: float = 30.0  # Maximum backoff delay (seconds)
     backoff_multiplier: float = 2.0  # Exponential backoff multiplier
     max_flush_retries: int = 5  # Max retries per data type during flush_queue drain
-    max_poison_retries: int = (
-        5  # Consecutive non-transient failures before nacking a poison batch to the DLQ
-    )
+    max_poison_retries: int = 5  # Consecutive non-transient failures before nacking a poison batch to the DLQ
 
 
 @dataclass
@@ -227,7 +226,7 @@ class PostgreSQLBatchProcessor:
         # Normalize the data
         try:
             normalized_data = normalize_record(data_type, data)
-        except Exception as e:  # noqa: BLE001 - a malformed record must not abort the whole batch
+        except Exception as e:
             logger.error(
                 "❌ Failed to normalize data",
                 data_type=data_type,
@@ -250,10 +249,7 @@ class PostgreSQLBatchProcessor:
         )
 
         # Check if we should flush (use adaptive batch size)
-        if (
-            len(queue) >= self._effective_batch_size[data_type]
-            or time.time() - self.last_flush[data_type] >= self.config.flush_interval
-        ):
+        if len(queue) >= self._effective_batch_size[data_type] or time.time() - self.last_flush[data_type] >= self.config.flush_interval:
             await self._flush_queue(data_type)
 
         return True
@@ -346,9 +342,7 @@ class PostgreSQLBatchProcessor:
 
         # Limit concurrent PostgreSQL operations to prevent pool exhaustion
         if self._flush_semaphore is None:
-            self._flush_semaphore = asyncio.Semaphore(
-                self.config.max_concurrent_flushes
-            )
+            self._flush_semaphore = asyncio.Semaphore(self.config.max_concurrent_flushes)
 
         # Acquire manually (not `async with`) so a cancellation delivered
         # WHILE BLOCKED on the acquire itself is caught here and re-enqueues
@@ -394,11 +388,7 @@ class PostgreSQLBatchProcessor:
                 # Exponential backoff — prevent tight retry loop that worsens pool exhaustion
                 self._transient_failures[data_type] += 1
                 delay = min(
-                    self.config.backoff_initial
-                    * (
-                        self.config.backoff_multiplier
-                        ** (self._transient_failures[data_type] - 1)
-                    ),
+                    self.config.backoff_initial * (self.config.backoff_multiplier ** (self._transient_failures[data_type] - 1)),
                     self.config.backoff_max,
                 )
                 self._backoff_until[data_type] = time.time() + delay
@@ -428,21 +418,16 @@ class PostgreSQLBatchProcessor:
                 # Messages are back on deque for retry — do NOT nack them
                 return
 
-            except Exception as e:  # noqa: BLE001 - per-batch fault must nack rather than kill the consumer
+            except Exception as e:
                 # A generic (non-transient) error is deterministic — a poison
                 # record fails every retry. Count consecutive failures so the
                 # local retry loop is BOUNDED; otherwise the identical batch is
                 # re-enqueued and retried forever, and once its unacked messages
                 # fill the prefetch window RabbitMQ stops delivering and the
                 # consumer is permanently wedged (never acked, never nacked).
-                self._consecutive_failures[data_type] = (
-                    self._consecutive_failures.get(data_type, 0) + 1
-                )
+                self._consecutive_failures[data_type] = self._consecutive_failures.get(data_type, 0) + 1
 
-                if (
-                    self._consecutive_failures[data_type]
-                    >= self.config.max_poison_retries
-                ):
+                if self._consecutive_failures[data_type] >= self.config.max_poison_retries:
                     # Poison batch: stop re-enqueueing and nack the messages so
                     # the quorum queue's x-delivery-limit / DLX routes the
                     # persistent poison to the DLQ. _flush_queue is the single
@@ -458,10 +443,8 @@ class PostgreSQLBatchProcessor:
                     for msg in messages:
                         try:
                             await msg.nack_callback()
-                        except Exception as nack_err:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
-                            logger.warning(
-                                "⚠️ Failed to nack message", error=str(nack_err)
-                            )
+                        except Exception as nack_err:
+                            logger.warning("⚠️ Failed to nack message", error=str(nack_err))
                     # Reset per-data-type state so healthy batches behind the
                     # poison resume normal processing.
                     self._consecutive_failures[data_type] = 0
@@ -489,11 +472,7 @@ class PostgreSQLBatchProcessor:
                 )
                 # Apply backoff to prevent tight retry loop on persistent errors
                 delay = min(
-                    self.config.backoff_initial
-                    * (
-                        self.config.backoff_multiplier
-                        ** (self._consecutive_failures[data_type] - 1)
-                    ),
+                    self.config.backoff_initial * (self.config.backoff_multiplier ** (self._consecutive_failures[data_type] - 1)),
                     self.config.backoff_max,
                 )
                 self._backoff_until[data_type] = time.time() + delay
@@ -509,7 +488,7 @@ class PostgreSQLBatchProcessor:
             for msg in messages:
                 try:
                     await msg.ack_callback()
-                except Exception as e:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+                except Exception as e:
                     logger.warning("⚠️ Failed to ack message", error=str(e))
 
             self.processed_counts[data_type] += len(messages)
@@ -525,8 +504,7 @@ class PostgreSQLBatchProcessor:
                 old_size = self._effective_batch_size[data_type]
                 self._effective_batch_size[data_type] = min(
                     self.config.batch_size,
-                    self._effective_batch_size[data_type]
-                    + max(10, self.config.batch_size // 10),
+                    self._effective_batch_size[data_type] + max(10, self.config.batch_size // 10),
                 )
                 if self._effective_batch_size[data_type] != old_size:
                     logger.info(
@@ -540,15 +518,11 @@ class PostgreSQLBatchProcessor:
                 data_type=data_type,
                 batch_size=len(messages),
                 duration_ms=round(batch_duration * 1000),
-                records_per_sec=round(len(messages) / batch_duration)
-                if batch_duration > 0
-                else 0,
+                records_per_sec=round(len(messages) / batch_duration) if batch_duration > 0 else 0,
                 total_processed=self.processed_counts[data_type],
             )
 
-    async def _process_batch(
-        self, data_type: str, messages: list[PendingMessage]
-    ) -> None:
+    async def _process_batch(self, data_type: str, messages: list[PendingMessage]) -> None:
         """Process a batch of records using efficient bulk operations.
 
         Uses async PostgreSQL operations with a single transaction:
@@ -563,9 +537,7 @@ class PostgreSQLBatchProcessor:
                 # Step 1: Fetch all existing hashes in one query
                 data_ids = [msg.data_id for msg in messages]
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL(
-                        "SELECT data_id, hash FROM {table} WHERE data_id = ANY(%s)"
-                    ).format(table=sql.Identifier(data_type)),
+                    sql.SQL("SELECT data_id, hash FROM {table} WHERE data_id = ANY(%s)").format(table=sql.Identifier(data_type)),
                     (data_ids,),
                 )
                 existing_hashes = {row[0]: row[1] for row in await cursor.fetchall()}
@@ -590,10 +562,7 @@ class PostgreSQLBatchProcessor:
                     # Refresh updated_at so post-extraction stale row purge
                     # does not delete unchanged-but-still-present records
                     await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                        sql.SQL(
-                            "UPDATE {table} SET updated_at = NOW() "
-                            "WHERE data_id = ANY(%s)"
-                        ).format(table=sql.Identifier(data_type)),
+                        sql.SQL("UPDATE {table} SET updated_at = NOW() WHERE data_id = ANY(%s)").format(table=sql.Identifier(data_type)),
                         (unchanged_ids,),
                     )
 
@@ -691,11 +660,7 @@ class PostgreSQLBatchProcessor:
             await asyncio.sleep(self.config.flush_interval)
 
             for data_type, queue in self.queues.items():
-                if (
-                    queue
-                    and time.time() - self.last_flush[data_type]
-                    >= self.config.flush_interval
-                ):
+                if queue and time.time() - self.last_flush[data_type] >= self.config.flush_interval:
                     await self._flush_queue(data_type)
 
     def shutdown(self) -> None:

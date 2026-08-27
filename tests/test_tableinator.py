@@ -2,15 +2,15 @@
 
 import asyncio
 import contextlib
-from datetime import UTC
 import json
 import signal
 import time
+from datetime import UTC
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-from aio_pika.abc import AbstractIncomingMessage
 import pytest
+from aio_pika.abc import AbstractIncomingMessage
 
 from tableinator.tableinator import (
     channel_prefetch,
@@ -3486,9 +3486,8 @@ class TestOutageRequeueBackoff:
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_db_outage_engages_throttle(self, sample_artist_data: dict[str, Any]) -> None:
         """Non-batch mode must throttle requeues during a PostgreSQL outage."""
-        from psycopg.errors import OperationalError
-
         from common.outage_backoff import OutageBackoff
+        from psycopg.errors import OperationalError
 
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps(sample_artist_data).encode()

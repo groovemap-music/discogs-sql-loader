@@ -1,0 +1,6 @@
+{
+  "binding_sha256": "d9b73e0ea8f4d540670ea69abe38b3b2d2c7760b08628dfd775a87b3a3c6dff4",
+  "contract_sha256": "7c4e2836176d98127a6548d23891cbadb80550a0a1a89a0d560450d67daaf18d",
+  "producer_commit": "e7038d1492da54e91444bfa990598e8963972ce2",
+  "producer_repository": "https://github.com/groovemap-music/catalog-ingestion"
+}

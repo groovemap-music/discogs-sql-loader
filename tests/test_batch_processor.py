@@ -5,8 +5,8 @@ import contextlib
 import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
-from psycopg.errors import InterfaceError, OperationalError
 import pytest
+from psycopg.errors import InterfaceError, OperationalError
 
 from tableinator.batch_processor import (
     BatchConfig,

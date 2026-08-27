@@ -41,9 +41,7 @@ class TableinatorConfig:
             if not value
         ]
         if missing_vars:
-            raise ValueError(
-                f"Missing required environment variables: {', '.join(missing_vars)}"
-            )
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
         pool_min, pool_max = resolve_postgres_pool_sizes(default_min=2, default_max=12)
         return cls(
             amqp_connection=_build_amqp_url(),

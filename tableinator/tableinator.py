@@ -44,6 +44,7 @@ from tableinator.catalog_contract import (
 )
 from tableinator.config import TableinatorConfig
 
+
 logger = structlog.get_logger(__name__)
 
 # Config will be initialized in main
@@ -65,13 +66,9 @@ current_progress = 0.0
 
 # Consumer management
 consumer_tags: dict[str, str] = {}  # {"artists": "consumer-tag-123", ...}
-consumer_cancel_tasks: dict[
-    str, asyncio.Task[None]
-] = {}  # {"artists": asyncio.Task, ...}
+consumer_cancel_tasks: dict[str, asyncio.Task[None]] = {}  # {"artists": asyncio.Task, ...}
 queues: dict[str, Any] = {}  # {"artists": queue_object, ...}
-CONSUMER_CANCEL_DELAY = int(
-    os.environ.get("CONSUMER_CANCEL_DELAY", "300")
-)  # Default 5 minutes
+CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # Default 5 minutes
 
 # Safety cap for the stale-row purge. A resumed extraction skips files completed in an
 # earlier session, so those data types receive zero messages this run while still getting
@@ -89,17 +86,11 @@ QUEUE_CHECK_INTERVAL = int(
 )  # Default 1 hour - how often to check for new messages when connection is closed
 
 # Interval for checking stuck state (consumers died unexpectedly)
-STUCK_CHECK_INTERVAL = int(
-    os.environ.get("STUCK_CHECK_INTERVAL", "30")
-)  # Default 30 seconds - how often to check for stuck state
+STUCK_CHECK_INTERVAL = int(os.environ.get("STUCK_CHECK_INTERVAL", "30"))  # Default 30 seconds - how often to check for stuck state
 
 # Idle mode settings - reduce log noise when no messages arrive after startup
-STARTUP_IDLE_TIMEOUT = int(
-    os.environ.get("STARTUP_IDLE_TIMEOUT", "30")
-)  # Seconds after startup with no messages before entering idle mode
-IDLE_LOG_INTERVAL = int(
-    os.environ.get("IDLE_LOG_INTERVAL", "300")
-)  # 5 min between idle status logs
+STARTUP_IDLE_TIMEOUT = int(os.environ.get("STARTUP_IDLE_TIMEOUT", "30"))  # Seconds after startup with no messages before entering idle mode
+IDLE_LOG_INTERVAL = int(os.environ.get("IDLE_LOG_INTERVAL", "300"))  # 5 min between idle status logs
 
 # Idle mode state
 idle_mode = False
@@ -114,9 +105,7 @@ connection_pool: AsyncPostgreSQLPool | None = None
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
 active_connection: Any = None  # Current active connection
 active_channel: Any = None  # Current active channel
-connection_check_task: asyncio.Task[None] | None = (
-    None  # Background task for periodic queue checks
-)
+connection_check_task: asyncio.Task[None] | None = None  # Background task for periodic queue checks
 
 
 def get_health_data() -> dict[str, Any]:
@@ -210,9 +199,7 @@ def channel_prefetch() -> tuple[int, bool]:
     if BATCH_MODE:
         # prefetch_count must be >= batch_size to allow batches to fill before flushing
         return max(200, BATCH_SIZE * 2), False
-    pool_max = (
-        config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
-    )
+    pool_max = config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
     return pool_max, True
 
 
@@ -265,10 +252,8 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
                 if await check_all_consumers_idle():
                     logger.info("🔧 All consumers idle, closing RabbitMQ connection")
                     await close_rabbitmq_connection()
-        except Exception as e:  # noqa: BLE001 - consumer cancellation is best-effort
-            logger.error(
-                "❌ Failed to cancel consumer", data_type=data_type, error=str(e)
-            )
+        except Exception as e:
+            logger.error("❌ Failed to cancel consumer", data_type=data_type, error=str(e))
         finally:
             # Clean up the task reference
             consumer_cancel_tasks.pop(data_type, None)
@@ -298,7 +283,7 @@ async def cancel_all_consumers() -> None:
         try:
             await queue.cancel(consumer_tag, nowait=True)
             consumer_tags.pop(data_type, None)
-        except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+        except Exception as e:
             logger.warning(
                 "⚠️ Failed to cancel consumer during shutdown",
                 data_type=data_type,
@@ -316,7 +301,7 @@ async def close_rabbitmq_connection() -> None:
             try:
                 await active_channel.close()
                 logger.info("🔧 Closed RabbitMQ channel - all consumers idle")
-            except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+            except Exception as e:
                 logger.warning("⚠️ Error closing channel", error=str(e))
             active_channel = None
 
@@ -324,7 +309,7 @@ async def close_rabbitmq_connection() -> None:
             try:
                 await active_connection.close()
                 logger.info("🔧 Closed RabbitMQ connection - all consumers idle")
-            except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+            except Exception as e:
                 logger.warning("⚠️ Error closing connection", error=str(e))
             active_connection = None
 
@@ -332,7 +317,7 @@ async def close_rabbitmq_connection() -> None:
             f"✅ RabbitMQ connection closed. Will check for new messages every {QUEUE_CHECK_INTERVAL}s",
             QUEUE_CHECK_INTERVAL=QUEUE_CHECK_INTERVAL,
         )
-    except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+    except Exception as e:
         logger.error("❌ Error closing RabbitMQ connection", error=str(e))
 
 
@@ -381,8 +366,7 @@ async def periodic_queue_checker() -> None:
             # Check for stuck state (consumers died but work remains)
             if await check_consumers_unexpectedly_dead():
                 logger.warning(
-                    "⚠️ Detected stuck state: consumers died but files not completed. "
-                    "Attempting recovery...",
+                    "⚠️ Detected stuck state: consumers died but files not completed. Attempting recovery...",
                     active_consumers=len(consumer_tags),
                     completed_files=list(completed_files),
                     message_counts=message_counts,
@@ -406,7 +390,7 @@ async def periodic_queue_checker() -> None:
         except asyncio.CancelledError:
             logger.info("🛑 Queue checker task cancelled")
             break
-        except Exception as e:  # noqa: BLE001 - long-running loop must survive per-iteration faults
+        except Exception as e:
             logger.error("❌ Error in periodic queue checker", error=str(e))
             # Continue running despite errors
 
@@ -424,10 +408,8 @@ async def _recover_consumers() -> None:
     if active_connection:
         try:
             await active_connection.close()
-        except Exception as e:  # noqa: BLE001 - the connection is already broken; recovery must proceed regardless
-            logger.warning(
-                "⚠️ Error closing broken connection during recovery", error=str(e)
-            )
+        except Exception as e:
+            logger.warning("⚠️ Error closing broken connection during recovery", error=str(e))
         active_connection = None
         active_channel = None
 
@@ -435,7 +417,7 @@ async def _recover_consumers() -> None:
     try:
         temp_connection = await rabbitmq_manager.connect()
         temp_channel = await temp_connection.channel()
-    except Exception as e:  # noqa: BLE001 - recovery must not raise into its caller
+    except Exception as e:
         logger.error("❌ Failed to connect to RabbitMQ for recovery", error=str(e))
         return
 
@@ -446,14 +428,10 @@ async def _recover_consumers() -> None:
             queue_name = catalog_queue_name("tableinator", data_type)
 
             # Use queue.declare with passive=True to get message count without affecting the queue
-            declared_queue = await temp_channel.declare_queue(
-                name=queue_name, passive=True
-            )
+            declared_queue = await temp_channel.declare_queue(name=queue_name, passive=True)
 
             if declared_queue.declaration_result.message_count > 0:
-                queues_with_messages.append(
-                    (data_type, declared_queue.declaration_result.message_count)
-                )
+                queues_with_messages.append((data_type, declared_queue.declaration_result.message_count))
 
         if queues_with_messages:
             total_messages = sum(count for _, count in queues_with_messages)
@@ -470,9 +448,7 @@ async def _recover_consumers() -> None:
             # Set QoS - scale with batch_size in batch mode, couple to the PostgreSQL
             # pool capacity in non-batch mode (see channel_prefetch).
             prefetch_count, prefetch_global = channel_prefetch()
-            await active_channel.set_qos(
-                prefetch_count=prefetch_count, global_=prefetch_global
-            )
+            await active_channel.set_qos(prefetch_count=prefetch_count, global_=prefetch_global)
 
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
@@ -558,13 +534,13 @@ async def _recover_consumers() -> None:
             await temp_channel.close()
             await temp_connection.close()
 
-    except Exception as e:  # noqa: BLE001 - recovery must not raise into its caller
+    except Exception as e:
         logger.error("❌ Error during consumer recovery", error=str(e))
         # Make sure to close temporary connection on error
         try:
             await temp_channel.close()
             await temp_connection.close()
-        except Exception as close_error:  # noqa: BLE001 - best-effort cleanup inside an error path
+        except Exception as close_error:
             logger.warning(
                 "⚠️ Error closing temporary connection after recovery failure",
                 error=str(close_error),
@@ -579,9 +555,7 @@ async def _recover_consumers() -> None:
         consumer_tags.clear()
 
 
-async def purge_stale_rows(
-    data_type: str, started_at: str, record_count: int | None = None
-) -> None:
+async def purge_stale_rows(data_type: str, started_at: str, record_count: int | None = None) -> None:
     """Delete rows from prior extractions that were not updated in the current run.
 
     The extraction_complete message includes started_at — the time the extraction
@@ -615,8 +589,7 @@ async def purge_stale_rows(
     # re-sent, so every current row predates started_at — purging would wipe the table.
     if record_count == 0:
         logger.warning(
-            "⚠️ Skipping stale row purge — extractor reported 0 records this session "
-            "(resumed extraction?)",
+            "⚠️ Skipping stale row purge — extractor reported 0 records this session (resumed extraction?)",
             data_type=data_type,
         )
         return
@@ -633,9 +606,7 @@ async def purge_stale_rows(
                 # Count the table and the would-be-deleted rows BEFORE deleting so a
                 # near-total wipe can be vetoed inside the same transaction.
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL("SELECT count(*) FROM {table}").format(
-                        table=sql.Identifier(data_type)
-                    )
+                    sql.SQL("SELECT count(*) FROM {table}").format(table=sql.Identifier(data_type))
                 )
                 total_row = await cursor.fetchone()
                 total_count = total_row[0] if total_row else 0
@@ -648,9 +619,7 @@ async def purge_stale_rows(
                     return
 
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL(
-                        "SELECT count(*) FROM {table} WHERE updated_at < %s"
-                    ).format(table=sql.Identifier(data_type)),
+                    sql.SQL("SELECT count(*) FROM {table} WHERE updated_at < %s").format(table=sql.Identifier(data_type)),
                     (started_at_dt,),
                 )
                 stale_row = await cursor.fetchone()
@@ -686,16 +655,13 @@ async def purge_stale_rows(
                 # discard it after counting — a multi-GB allocation on a
                 # large purge (discogsography-6u1o).
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL("DELETE FROM {table} WHERE updated_at < %s").format(
-                        table=sql.Identifier(data_type)
-                    ),
+                    sql.SQL("DELETE FROM {table} WHERE updated_at < %s").format(table=sql.Identifier(data_type)),
                     (started_at_dt,),
                 )
                 deleted_count = cursor.rowcount
 
                 logger.info(
-                    f"🧹 Purged {deleted_count} stale {data_type} rows "
-                    f"(not updated since extraction started)",
+                    f"🧹 Purged {deleted_count} stale {data_type} rows (not updated since extraction started)",
                     data_type=data_type,
                     deleted=deleted_count,
                 )
@@ -736,15 +702,10 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # Check if this is a file completion message
         if data.get("type") == "file_complete":
             total_processed = data.get("total_processed", 0)
-            logger.info(
-                f"✅ File processing complete for {data_type}! "
-                f"Total records processed: {total_processed}"
-            )
+            logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
 
             # Flush remaining batches for this data type before cancellation
-            if batch_processor is not None and not await batch_processor.flush_queue(
-                data_type
-            ):
+            if batch_processor is not None and not await batch_processor.flush_queue(data_type):
                 # The drain gave up with rows still pending (typically a database
                 # outage). Marking the file complete here would cancel the
                 # consumer and let purge_stale_rows delete the very rows those
@@ -782,9 +743,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             # messages' rows still carry an old updated_at, so purge_stale_rows
             # would DELETE exactly the records that were about to be refreshed.
             # See discogsography-hh7r.
-            if batch_processor is not None and not await batch_processor.flush_queue(
-                data_type
-            ):
+            if batch_processor is not None and not await batch_processor.flush_queue(data_type):
                 logger.error(
                     "❌ Flush incomplete — requeueing extraction_complete instead of purging stale rows",
                     data_type=data_type,
@@ -802,8 +761,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             purge_ok = True
             if batch_processor is not None and batch_processor.had_dlq_nacks(data_type):
                 logger.warning(
-                    "⚠️ Skipping stale row purge — messages were nacked to the DLQ "
-                    "this run, so some dump-present rows may not have been refreshed",
+                    "⚠️ Skipping stale row purge — messages were nacked to the DLQ this run, so some dump-present rows may not have been refreshed",
                     data_type=data_type,
                 )
                 batch_processor.reset_dlq_nacks(data_type)
@@ -815,7 +773,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                         data.get("started_at", ""),
                         record_counts.get(data_type),
                     )
-                except Exception as purge_exc:  # noqa: BLE001 - per-message fault must nack rather than kill the consumer
+                except Exception as purge_exc:
                     logger.error(
                         "❌ Purge failed, nacking extraction_complete for retry",
                         data_type=data_type,
@@ -906,11 +864,9 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                 record_name=record_name,
             )
         else:
-            logger.debug(
-                "🔄 Processing record", data_type=data_type[:-1], data_id=data_id
-            )
+            logger.debug("🔄 Processing record", data_type=data_type[:-1], data_id=data_id)
 
-    except Exception as e:  # noqa: BLE001 - per-message fault must nack rather than kill the consumer
+    except Exception as e:
         logger.error("❌ Failed to parse message", error=str(e))
         await message.nack(requeue=False)
         return
@@ -986,13 +942,13 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         )
         try:
             await message.nack(requeue=False)
-        except Exception as nack_error:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+        except Exception as nack_error:
             logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-    except Exception as e:  # noqa: BLE001 - per-message fault must nack rather than kill the consumer
+    except Exception as e:
         logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
         try:
             await message.nack(requeue=True)
-        except Exception as nack_error:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+        except Exception as nack_error:
             logger.warning("⚠️ Failed to nack message", error=str(nack_error))
 
 
@@ -1020,16 +976,11 @@ async def progress_reporter() -> None:
 
         # Idle mode detection: no messages received after STARTUP_IDLE_TIMEOUT
         # Idle mode only suppresses reporting - consumers stay connected
-        if (
-            not idle_mode
-            and total == 0
-            and (current_time - startup_time) >= STARTUP_IDLE_TIMEOUT
-        ):
+        if not idle_mode and total == 0 and (current_time - startup_time) >= STARTUP_IDLE_TIMEOUT:
             idle_mode = True
             last_idle_log = current_time
             logger.info(
-                f"😴 No messages received after {STARTUP_IDLE_TIMEOUT}s, entering idle mode. "
-                "Consumers remain connected, reporting paused.",
+                f"😴 No messages received after {STARTUP_IDLE_TIMEOUT}s, entering idle mode. Consumers remain connected, reporting paused.",
                 startup_idle_timeout=STARTUP_IDLE_TIMEOUT,
             )
             continue
@@ -1050,51 +1001,28 @@ async def progress_reporter() -> None:
         # Check for stalled consumers (skip completed files)
         stalled_consumers = []
         for data_type, last_time in last_message_time.items():
-            if (
-                data_type not in completed_files
-                and last_time > 0
-                and (current_time - last_time) > 120
-            ):  # No messages for 2 minutes
+            if data_type not in completed_files and last_time > 0 and (current_time - last_time) > 120:  # No messages for 2 minutes
                 stalled_consumers.append(data_type)
 
         if stalled_consumers:
-            logger.error(
-                f"⚠️ Stalled consumers detected: {stalled_consumers}. "
-                f"No messages processed for >2 minutes."
-            )
+            logger.error(f"⚠️ Stalled consumers detected: {stalled_consumers}. No messages processed for >2 minutes.")
 
         # Always show progress, even if no messages processed yet
         # Build progress string with completion emojis
         progress_parts = []
         for data_type in ["artists", "labels", "masters", "releases"]:
             emoji = "✅ " if data_type in completed_files else ""
-            progress_parts.append(
-                f"{emoji}{data_type.capitalize()}: {message_counts[data_type]}"
-            )
+            progress_parts.append(f"{emoji}{data_type.capitalize()}: {message_counts[data_type]}")
 
-        logger.info(
-            f"📊 PostgreSQL Progress: {total} total messages processed "
-            f"({', '.join(progress_parts)})"
-        )
+        logger.info(f"📊 PostgreSQL Progress: {total} total messages processed ({', '.join(progress_parts)})")
 
         # Log current processing state
         if total == 0:
             logger.info("⏳ Waiting for messages to process...")
-        elif all(
-            current_time - last_time < 5
-            for last_time in last_message_time.values()
-            if last_time > 0
-        ):
+        elif all(current_time - last_time < 5 for last_time in last_message_time.values() if last_time > 0):
             logger.info("✅ All consumers actively processing")
-        elif any(
-            last_time > 0 and 5 < current_time - last_time < 120
-            for last_time in last_message_time.values()
-        ):
-            slow_consumers = [
-                dt
-                for dt, lt in last_message_time.items()
-                if lt > 0 and 5 < current_time - lt < 120
-            ]
+        elif any(last_time > 0 and 5 < current_time - last_time < 120 for last_time in last_message_time.values()):
+            slow_consumers = [dt for dt, lt in last_message_time.items() if lt > 0 and 5 < current_time - lt < 120]
             logger.warning(
                 f"⚠️ Slow consumers detected: {slow_consumers}",
                 slow_consumers=slow_consumers,
@@ -1102,9 +1030,7 @@ async def progress_reporter() -> None:
 
         # Log consumer status
         active_consumers = list(consumer_tags.keys())
-        canceled_consumers = [
-            dt for dt in DATA_TYPES if dt not in consumer_tags and dt in completed_files
-        ]
+        canceled_consumers = [dt for dt in DATA_TYPES if dt not in consumer_tags and dt in completed_files]
 
         if canceled_consumers:
             logger.info(
@@ -1189,7 +1115,7 @@ async def main() -> None:
             config.postgres_pool_min_size,
             config.postgres_pool_max_size,
         )
-    except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+    except Exception as e:
         logger.error("❌ Failed to initialize connection pool", error=str(e))
         return
 
@@ -1248,7 +1174,7 @@ async def main() -> None:
             amqp_connection = await rabbitmq_manager.connect()
             active_connection = amqp_connection
             break
-        except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+        except Exception as e:
             startup_retry += 1
             if startup_retry < max_startup_retries:
                 wait_time = min(30, 5 * startup_retry)  # Exponential backoff up to 30s
@@ -1283,9 +1209,7 @@ async def main() -> None:
             prefetch_count=prefetch_count,
             channel_global=prefetch_global,
             # Per-consumer QoS means the real channel-wide ceiling is prefetch x consumers.
-            channel_wide_max=prefetch_count
-            if prefetch_global
-            else prefetch_count * len(DATA_TYPES),
+            channel_wide_max=prefetch_count if prefetch_global else prefetch_count * len(DATA_TYPES),
             batch_size=BATCH_SIZE if BATCH_MODE else "N/A",
         )
 
@@ -1298,14 +1222,10 @@ async def main() -> None:
             dlq_name = catalog_dead_letter_queue_name("tableinator", data_type)
 
             # Declare fanout exchange (must match extractor)
-            exchange = await channel.declare_exchange(
-                exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False
-            )
+            exchange = await channel.declare_exchange(exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
             # Declare consumer-owned dead-letter exchange
-            dlx_exchange = await channel.declare_exchange(
-                dlx_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False
-            )
+            dlx_exchange = await channel.declare_exchange(dlx_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
             # Declare DLQ (classic queue for dead letters)
             dlq = await channel.declare_queue(
@@ -1392,7 +1312,7 @@ async def main() -> None:
                 try:
                     await batch_processor.flush_all()
                     logger.info("✅ Batch processor flushed and stopped")
-                except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+                except Exception as e:
                     logger.warning("⚠️ Error flushing batch processor", error=str(e))
 
             # Cancel any pending consumer cancellation tasks
@@ -1407,19 +1327,24 @@ async def main() -> None:
                 if connection_pool:
                     await connection_pool.close()
                     logger.info("✅ Async connection pool closed")
-            except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+            except Exception as e:
                 logger.warning("⚠️ Error closing connection pool", error=str(e))
 
         # Stop health server
         health_server.stop()
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Run the async service from its console-script entry point."""
     try:
         run(main())
     except KeyboardInterrupt:
         logger.warning("⚠️ Application interrupted")
-    except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+    except Exception as e:
         logger.error("❌ Application error", error=str(e))
     finally:
         logger.info("✅ Tableinator service shutdown complete")
+
+
+if __name__ == "__main__":
+    cli()
