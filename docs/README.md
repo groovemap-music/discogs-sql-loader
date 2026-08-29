@@ -1,11 +1,23 @@
 # Discogs SQL loader documentation
 
-- [Consumer cancellation and draining](consumer-cancellation.md)
-- [File completion tracking](file-completion-tracking.md)
+Start with these repository-specific guides:
+
+- [Operations](operations.md) — inputs, PostgreSQL output, configuration, health,
+  restart and completion behavior, validation, and troubleshooting.
+- [Compatibility identifiers](compatibility.md) — names retained to preserve Python
+  imports, durable AMQP queues, and regression provenance.
+- [Consumer cancellation and draining](consumer-cancellation.md) — how terminal
+  messages stop deliveries without losing accepted work.
+- [File completion tracking](file-completion-tracking.md) — file and extraction
+  completion semantics.
+- [Database resilience](database-resilience.md) — outage and recovery behavior.
+- [Performance](performance-guide.md) — batching and PostgreSQL tuning guidance.
+- [PostgreSQL pool exhaustion analysis](postgres-pool-exhaustion-analysis.md) — why
+  non-batch concurrency is bounded by the pool.
+
+Additional migrated reference material:
+
 - [Database schema](database-schema.md)
-- [Database resilience](database-resilience.md)
-- [PostgreSQL pool exhaustion analysis](postgres-pool-exhaustion-analysis.md)
-- [Performance](performance-guide.md)
 - [Query performance optimizations](query-performance-optimizations.md)
 - [Source-history provenance](extraction.md)
-- [Plans](superpowers/plans/)
+- [Historical implementation plan](superpowers/plans/2026-03-21-query-perf-opt-v5.md)

@@ -17,12 +17,12 @@ GrooveMap uses two complementary database systems with data from two sources:
 
 ### Schema Ownership
 
-All schema definitions are owned exclusively by the **`schema-init`** service, which runs as a one-shot init container before any other service starts:
+The [`database-schema`](https://github.com/groovemap-music/database-schema) repository owns every schema definition. Its canonical sources are:
 
-- **`schema-init/neo4j_schema.py`**: All Neo4j constraints and indexes
-- **`schema-init/postgres_schema.py`**: All PostgreSQL tables and indexes
+- **`src/groovemap_schema/neo4j.py`**: Neo4j constraints and indexes
+- **`src/groovemap_schema/postgres.py`**: PostgreSQL tables and indexes
 
-All DDL statements use `IF NOT EXISTS` -- the schema is never dropped and is safe to re-run on every startup. Graphinator and Tableinator only write data; they rely on schema-init to have prepared the database beforehand.
+`schema-init` is only the one-shot service name used by the `deployment` repository to apply those definitions before application services start; it does not own a separate schema implementation. All DDL statements use `IF NOT EXISTS` -- the schema is never dropped and is safe to re-run on every startup. `discogs-graph-enricher` and `discogs-sql-loader` only write data; they rely on schema initialization to have prepared the database beforehand.
 
 ## Neo4j Graph Database
 
@@ -38,11 +38,11 @@ Neo4j stores music industry relationships as a graph, making it ideal for:
 
 ### Data Pipeline
 
-Raw XML data from the Discogs dump is parsed by the **extractor**, which **normalizes** each record — flattening nested XML-dict structures, stripping `@`/`#text` prefixes, and extracting IDs — *before* computing the `sha256` content hash and publishing JSON messages to RabbitMQ. Each message includes a `type` field (`"data"` or `"file_complete"`), an `id`, and a `sha256` hash, and arrives consumer-ready. The **graphinator**'s own `normalize_record()` then performs only consumer-side year parsing before writing to Neo4j. See [Extractor Message Format](#extractor-message-format) for the published data structure.
+Raw XML data from the Discogs dump is parsed by `catalog-ingestion`, which **normalizes** each record — flattening nested XML-dict structures, stripping `@`/`#text` prefixes, and extracting IDs — *before* computing the `sha256` content hash and publishing JSON messages to RabbitMQ. Each message includes a `type` field (`"data"` or `"file_complete"`), an `id`, and a `sha256` hash, and arrives consumer-ready. `discogs-graph-enricher` performs only consumer-side year parsing before writing to Neo4j. See [Extractor Message Format](#extractor-message-format) for the published data structure.
 
 ### Node Types
 
-The graphinator stores only the properties needed for graph traversal and querying. Detailed record data is stored in PostgreSQL. The following sections document the **actual properties written to Neo4j** by the graphinator.
+`discogs-graph-enricher` stores only the properties needed for graph traversal and querying. Detailed record data is stored in PostgreSQL. The following sections document the **actual properties written to Neo4j** by that service.
 
 #### Artist Node
 
@@ -183,7 +183,7 @@ CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;
 
 #### Person Node
 
-Represents a non-performing release credit (e.g. producer, engineer, mastering engineer) from the Discogs `extraartists` field. Created by the graphinator.
+Represents a non-performing release credit (e.g. producer, engineer, mastering engineer) from the Discogs `extraartists` field. Created by `discogs-graph-enricher`.
 
 ```cypher
 (:Person {
@@ -790,7 +790,7 @@ Notes:
 
 - `year` is parsed from the `released` date field (`"1969-09-26"` -> `1969`) by `_parse_year_int()`.
 - `master_id` is extracted from the `#text` field of the dict.
-- `formats` is unwrapped into an array with `@`-prefixed keys stripped at the top level (nested objects like `descriptions` are left as-is — the extractor's prefix-stripping does not recurse); the graphinator then pulls each item's `name` field inline in `process_release()` to produce `["Vinyl"]` for storage on the Release node (not deduplicated).
+- `formats` is unwrapped into an array with `@`-prefixed keys stripped at the top level (nested objects like `descriptions` are left as-is — the extractor's prefix-stripping does not recurse); `discogs-graph-enricher` then pulls each item's `name` field inline in `process_release()` to produce `["Vinyl"]` for storage on the Release node (not deduplicated).
 
 ### XML-to-JSON Conventions
 
@@ -1032,7 +1032,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_log_admin_id ON admin_audit_log (admi
 
 #### Insights Tables
 
-Precomputed analytics stored in a dedicated `insights` schema. All tables include a `computed_at` timestamp for cache freshness checks. The schema is created by `schema-init` alongside the public tables.
+Precomputed analytics stored in a dedicated `insights` schema. All tables include a `computed_at` timestamp for cache freshness checks. The definition is owned by `database-schema` and applied alongside the public tables by the deployment service named `schema-init`.
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS insights;
@@ -1313,7 +1313,7 @@ CREATE INDEX IF NOT EXISTS idx_mb_links_service ON musicbrainz.external_links (s
 
 #### MusicBrainz Neo4j Enrichment Properties
 
-The brainzgraphinator adds `mb_`-prefixed properties to existing Discogs nodes. The `mbid` property is the exception to the prefix convention.
+`musicbrainz-graph-enricher` adds `mb_`-prefixed properties to existing Discogs nodes. The `mbid` property is the exception to the prefix convention.
 
 ```mermaid
 graph LR
@@ -1409,12 +1409,12 @@ Both databases receive data from two sources (Discogs and MusicBrainz) but store
 
 ```mermaid
 graph TD
-    EXT_D[Extractor<br/>--source discogs] -->|JSON Messages| RMQ[RabbitMQ]
-    EXT_MB[Extractor<br/>--source musicbrainz] -->|JSON Messages| RMQ
-    RMQ -->|Discogs Data| GRAPH[Graphinator]
-    RMQ -->|Discogs Data| TABLE[Tableinator]
-    RMQ -->|MB Data| BGRAPH[Brainzgraphinator]
-    RMQ -->|MB Data| BTABLE[Brainztableinator]
+    EXT_D[catalog-ingestion<br/>Discogs] -->|JSON Messages| RMQ[RabbitMQ]
+    EXT_MB[catalog-ingestion<br/>MusicBrainz] -->|JSON Messages| RMQ
+    RMQ -->|Discogs Data| GRAPH[discogs-graph-enricher]
+    RMQ -->|Discogs Data| TABLE[discogs-sql-loader]
+    RMQ -->|MB Data| BGRAPH[musicbrainz-graph-enricher]
+    RMQ -->|MB Data| BTABLE[musicbrainz-sql-loader]
     GRAPH -->|Build Graph| NEO4J[(Neo4j)]
     TABLE -->|Store JSONB| PG[(PostgreSQL)]
     BGRAPH -->|Enrich Nodes| NEO4J
@@ -1433,7 +1433,7 @@ graph TD
 
 ### Processing Pipeline
 
-Both graphinator and tableinator follow the same pipeline:
+Both `discogs-graph-enricher` and `discogs-sql-loader` follow the same pipeline:
 
 1. Pre-normalized JSON message received from RabbitMQ (structural normalization already done by the extractor)
 1. `normalize_record(data_type, data)` called for consumer-side year parsing
@@ -1447,9 +1447,9 @@ Both batch and single-message processing paths call `normalize_record()` at the 
 
 After all files are processed, the extractor sends an `extraction_complete` message to all 4 fanout exchanges. Each consumer handles cleanup for its database:
 
-**Graphinator (Neo4j)** — Deletes stub nodes that have no `sha256` property. During extraction, `MERGE` operations in relationship queries create skeleton nodes for cross-referenced entities (e.g., a release referencing an artist that hasn't been processed yet). Primary records always set `sha256`, so nodes without it are stubs that were never filled by their own data file.
+**discogs-graph-enricher (Neo4j)** — Deletes stub nodes that have no `sha256` property. During extraction, `MERGE` operations in relationship queries create skeleton nodes for cross-referenced entities (e.g., a release referencing an artist that hasn't been processed yet). Primary records always set `sha256`, so nodes without it are stubs that were never filled by their own data file.
 
-**Tableinator (PostgreSQL)** — Purges stale rows where `updated_at < started_at`. The `started_at` timestamp from the `extraction_complete` message marks when the extraction began. Any row not touched during the current run was either removed from the Discogs dump or is left over from a prior extraction.
+**discogs-sql-loader (PostgreSQL)** — Purges stale rows where `updated_at < started_at`. The `started_at` timestamp from the `extraction_complete` message marks when the extraction began. Any row not touched during the current run was either removed from the Discogs dump or is left over from a prior extraction.
 
 This ensures database counts match the extractor's record counts after each run.
 
@@ -1464,14 +1464,14 @@ This ensures database counts match the extractor's record counts after each run.
 
 ### Data Flow
 
-1. **Schema-Init** creates all constraints, indexes, and tables in Neo4j and PostgreSQL (before any other service starts)
-1. Extractor parses XML and computes SHA256 hash
+1. The deployment service named `schema-init` applies the definitions owned by `database-schema` before application services start
+1. `catalog-ingestion` parses XML and computes the SHA256 hash
 1. Message published to RabbitMQ with data + hash
-1. Graphinator normalizes and writes nodes and relationships to Neo4j
-1. Tableinator normalizes and upserts JSONB records to PostgreSQL (always refreshing `updated_at`, only rewriting data when hash differs)
+1. `discogs-graph-enricher` normalizes and writes nodes and relationships to Neo4j
+1. `discogs-sql-loader` normalizes and upserts JSONB records to PostgreSQL (always refreshing `updated_at`, only rewriting data when hash differs)
 1. New/changed records inserted/updated in both databases
-1. After all files complete, extractor sends `extraction_complete` to all exchanges
-1. Graphinator deletes stub nodes (no `sha256`); Tableinator purges stale rows (`updated_at < started_at`)
+1. After all files complete, `catalog-ingestion` sends `extraction_complete` to all exchanges
+1. `discogs-graph-enricher` deletes stub nodes (no `sha256`); `discogs-sql-loader` purges stale rows (`updated_at < started_at`)
 
 ## Performance Considerations
 

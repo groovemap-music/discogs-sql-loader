@@ -1,226 +1,55 @@
-# GrooveMap Discogs SQL loader service
+# `discogs-sql-loader` implementation
 
-This package is the PostgreSQL loader owned by `discogs-sql-loader`. See the repository
-[documentation index](../docs/README.md) for schema, resilience, completion, and
-performance guidance.
+The `tableinator` Python package contains the implementation behind the public
+`discogs-sql-loader` console command. The package name is retained for import
+compatibility; it is not the service's runtime identity.
 
-Consumes Discogs data from AMQP queues and stores it in PostgreSQL relational database tables for structured querying and analysis.
+## Processing boundary
 
-## Overview
+```mermaid
+flowchart TD
+    exchange[Discogs fanout exchange] --> queue[Durable compatibility queue]
+    queue --> validate[Validate and normalize record]
+    validate --> batch[Per-entity bounded batch]
+    batch --> upsert[PostgreSQL JSONB upsert]
+    upsert --> commit{Transaction committed?}
+    commit -->|yes| ack[Acknowledge messages]
+    commit -->|transient failure| retry[Re-enqueue with backoff]
+    commit -->|poison data| dlq[Dead-letter message]
+```
 
-The tableinator service:
+The loader consumes `artists`, `labels`, `masters`, and `releases`. Every entity table
+uses `data_id` as its primary key and stores a source hash plus the normalized record in
+JSONB. Upserts skip unchanged hashes and update changed records atomically.
 
-- Consumes parsed Discogs data from RabbitMQ queues
-- Stores data as JSONB in PostgreSQL tables
-- Implements efficient bulk inserts with psycopg3
-- Provides deduplication using SHA256 hashes
-- Maintains data integrity with transactions
+`file_complete` drains the entity's pending batch before marking it complete.
+`extraction_complete` drains all batches, then deletes rows older than the extraction's
+`started_at` only when the completion evidence is safe. A configurable large-delete
+guard refuses suspicious cleanup after a resumed extraction.
 
-## Architecture
+## Entry points
 
-- **Language**: Python 3.13+
-- **Database**: PostgreSQL 18 (with JSONB performance improvements)
-- **Message Broker**: RabbitMQ 4.x (quorum queues)
-- **Health Port**: 8002
-- **Driver**: psycopg3 with binary support
+- Console command: `uv run discogs-sql-loader`
+- Python entry point: `tableinator.tableinator:cli`
+- Health endpoint: `http://localhost:8002/health`
+- Local image: `discogs-sql-loader:local`
+- Published image: `ghcr.io/groovemap-music/discogs-sql-loader`
 
-## Configuration
+For environment variables and lifecycle behavior, see
+[Operations](../docs/operations.md). For the intentionally retained package and AMQP
+identifiers, see [Compatibility identifiers](../docs/compatibility.md).
 
-Environment variables:
+## Tests
+
+Run `just check` from the repository root. Focused commands are available when
+diagnosing a failure:
 
 ```bash
-# PostgreSQL connection
-POSTGRES_HOST=postgres
-POSTGRES_USERNAME=groovemap
-POSTGRES_PASSWORD=groovemap
-POSTGRES_DATABASE=groovemap
-
-# RabbitMQ (individual vars; also supports _FILE variants for Docker secrets)
-RABBITMQ_USERNAME=groovemap
-RABBITMQ_PASSWORD=groovemap
-RABBITMQ_HOST=rabbitmq              # Default: rabbitmq
-RABBITMQ_PORT=5672                  # Default: 5672
-
-# Consumer Management (Smart Connection Lifecycle)
-CONSUMER_CANCEL_DELAY=300           # Seconds before canceling idle consumers (default: 5 min)
-QUEUE_CHECK_INTERVAL=3600           # Seconds between queue checks when idle (default: 1 hr)
-STUCK_CHECK_INTERVAL=30             # Seconds between stuck-state checks (default: 30)
-
-# Idle Mode
-STARTUP_IDLE_TIMEOUT=30             # Seconds after startup with no messages before idle mode (default: 30)
-IDLE_LOG_INTERVAL=300               # Seconds between idle status logs (default: 300)
-STARTUP_DELAY=5                     # Seconds to wait for dependent services at startup (default: 5)
-
-# Batch Processing (Enabled by Default)
-POSTGRES_BATCH_MODE=true            # Enable batch processing (default: true)
-POSTGRES_BATCH_SIZE=100             # Records per batch (default: 100)
-POSTGRES_BATCH_FLUSH_INTERVAL=5.0   # Seconds between automatic flushes (default: 5.0)
-
-# PostgreSQL connection pool (optional — shares the deployment's PgBouncer backend budget)
-POSTGRES_POOL_MIN_SIZE=2            # Default: 2
-POSTGRES_POOL_MAX_SIZE=12           # Default: 12
+just test
+uv run pytest tests/test_file_completion.py -q
+uv run pytest tests/test_shutdown_delivery_churn.py -q
+uv run pytest tests/test_batch_performance.py -q
 ```
 
-The health server port is fixed at **8002**.
-
-### Smart Connection Lifecycle
-
-The tableinator implements intelligent RabbitMQ connection management:
-
-- **Automatic Closure**: When all queues complete processing, the RabbitMQ connection is automatically closed
-- **Periodic Checks**: Every `QUEUE_CHECK_INTERVAL` seconds, briefly connects to check all queues for new messages
-- **Auto-Reconnection**: When messages are detected, automatically reconnects and resumes processing
-- **Silent When Idle**: Progress logging stops when all queues are complete to reduce log noise
-
-This ensures minimal resource usage while maintaining responsiveness to new data.
-
-### Batch Processing
-
-The tableinator implements intelligent batch processing for optimal PostgreSQL write performance:
-
-- **Automatic Batching**: Messages are collected into batches instead of being processed individually
-- **Dual Triggers**: Batches flush when reaching size limit (`POSTGRES_BATCH_SIZE`) OR time interval (`POSTGRES_BATCH_FLUSH_INTERVAL`)
-- **Graceful Shutdown**: All pending batches are flushed automatically before service shutdown
-- **Performance Gains**: 3-5x faster write throughput compared to individual transactions
-
-**Configuration Examples:**
-
-```bash
-# High throughput (initial data load)
-POSTGRES_BATCH_SIZE=500
-POSTGRES_BATCH_FLUSH_INTERVAL=10.0
-
-# Low latency (real-time updates)
-POSTGRES_BATCH_SIZE=10
-POSTGRES_BATCH_FLUSH_INTERVAL=1.0
-
-# Disabled (per-message processing)
-POSTGRES_BATCH_MODE=false
-```
-
-See the [performance guide](../docs/performance-guide.md) for detailed tuning guidance.
-
-## Database Schema
-
-All four entity tables (artists, labels, masters, releases) share the same structure:
-
-```sql
-CREATE TABLE IF NOT EXISTS <entity_type> (
-    data_id    VARCHAR PRIMARY KEY,               -- Discogs entity ID
-    hash       VARCHAR NOT NULL,                   -- SHA256 hash for change detection
-    data       JSONB   NOT NULL,                   -- Complete normalized record
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()  -- Last write timestamp
-);
-
-CREATE INDEX IF NOT EXISTS idx_<entity>_hash ON <entity> (hash);
-CREATE INDEX IF NOT EXISTS idx_<entity>_updated_at ON <entity> (updated_at);
-```
-
-The `data` column stores the full normalized record from `normalize_record()`, preserving all fields (profile, tracklist, notes, etc.) as JSONB.
-
-### Indexes
-
-- Primary key on `data_id` for each table
-- Hash index on `hash` for change detection lookups
-- Index on `updated_at` for recency-based lookups
-
-## Processing Logic
-
-### Queue Consumption
-
-```python
-# Consumes from four queues
-queues = ["labels", "artists", "releases", "masters"]
-```
-
-### Database Operations
-
-- Uses psycopg3 with JSONB storage for all entity data
-- Connection pooling for efficiency
-
-### Upsert Strategy
-
-- SHA256 hash stored alongside each record
-- `ON CONFLICT (data_id) DO UPDATE SET hash, data WHERE hash != EXCLUDED.hash`
-- Skips writes when the hash is unchanged (no-op update)
-- Updates data when the hash differs (content changed)
-
-## Development
-
-### Running Locally
-
-```bash
-# Install dependencies
-uv sync --extra tableinator
-
-# Run the tableinator
-uv run python tableinator/tableinator.py
-```
-
-### Running Tests
-
-```bash
-# Run tableinator tests
-uv run pytest tests/tableinator/ -v
-
-# Run specific test
-uv run pytest tests/tableinator/test_tableinator.py -v
-```
-
-## Docker
-
-Build and run with Docker:
-
-```bash
-# Build
-docker build -f tableinator/Dockerfile .
-
-# Run with docker-compose
-docker-compose up tableinator
-```
-
-## SQL Queries
-
-Example queries for data analysis (using JSONB operators):
-
-```sql
--- Find all releases by title (JSONB field access)
-SELECT data_id, data->>'title' AS title, data->>'year' AS year
-FROM releases
-WHERE data->>'title' ILIKE '%Kind of Blue%';
-
--- Count records per entity type
-SELECT 'artists' AS entity, COUNT(*) FROM artists
-UNION ALL
-SELECT 'labels', COUNT(*) FROM labels
-UNION ALL
-SELECT 'masters', COUNT(*) FROM masters
-UNION ALL
-SELECT 'releases', COUNT(*) FROM releases;
-
--- Find artists by name
-SELECT data_id, data->>'name' AS name
-FROM artists
-WHERE data->>'name' ILIKE '%Beatles%';
-```
-
-## Performance Features
-
-- Batch upserts with psycopg3
-- JSONB storage for flexible schema evolution
-- Connection pooling
-- Hash-based change detection to skip unchanged records
-
-## Monitoring
-
-- Health endpoint at `http://localhost:8002/health`
-- Structured JSON logging with visual emoji prefixes
-- Insert timing and row count metrics
-- Error tracking with detailed messages
-
-## Error Handling
-
-- Transaction rollback on failures
-- Message requeuing on processing errors
-- Graceful handling of constraint violations
-- Comprehensive exception logging with context
+These tests use mocked persistence and broker boundaries; they do not require live
+infrastructure.
