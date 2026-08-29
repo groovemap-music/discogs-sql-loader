@@ -5,9 +5,8 @@ queries, analysis, and cross-catalog enrichment.
 
 ## Development
 
-This service consumes the private `groovemap-runtime` package at immutable commit
-`28fa329702bc76896cc54ab8d05ec5b1bd3d929e`. Local setup requires read access to
-`groovemap-music/python-libraries` through the operator's normal Git credential helper.
+This service consumes the private `groovemap-runtime` package. Local setup requires read
+access to `groovemap-music/python-libraries`; the lockfile records the reviewed revision.
 
 ```bash
 mise install
@@ -27,10 +26,8 @@ PAT is accepted.
 
 ## Contracts
 
-- Catalog-event contract: v1, promoted byte-for-byte from immutable
-  `catalog-ingestion` commit `e7038d1492da54e91444bfa990598e8963972ce2`.
-- Persistence compatibility: v1, promoted from immutable `database-schema` commit
-  `6a29e2859a2177eebae1d97dd8550997ff43e9d0`.
+- Catalog-event contract: v1, promoted byte-for-byte from `catalog-ingestion`.
+- Persistence compatibility: v1, promoted from `database-schema`.
 
 `just source-check` verifies both promoted files and the generated Python binding by SHA-256.
 There are no cross-repository relative imports or generated writes.
@@ -41,3 +38,8 @@ This repository versions one service wheel and container image. Commitizen reads
 version and uses annotated `v$version` tags. Dry runs do not tag, push, publish, or release.
 
 The current tree is MIT licensed. Historical revisions retain their then-applicable license.
+
+## Documentation
+
+See the [documentation index](docs/README.md) and the
+[tableinator reference](tableinator/README.md).

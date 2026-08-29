@@ -1,4 +1,4 @@
-name: Source CI
+name: CI
 
 on:
   pull_request:
@@ -10,17 +10,15 @@ permissions:
   contents: read
 
 jobs:
-  source-check:
-    runs-on: macos-15
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Install pinned tools
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          install: true
-          cache: true
-      - name: Run credential-free source gate
-        run: just source-check
+  ci:
+    uses: groovemap-music/.github/.github/workflows/reusable-ci.yml@main
+    with:
+      runner: ubuntu-24.04
+      requires-private-library: true
+      setup-command: just setup
+      check-command: just check
+      fallback-command: just source-check
+      audit-command: just audit
+      image-command: just image
+      coverage-flags: python,discogs,postgres
+    secrets: inherit

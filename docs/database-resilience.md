@@ -1,6 +1,6 @@
 # Database Resilience Documentation
 
-This document describes the database resilience features implemented in the Discogsography platform to handle nightly
+This document describes the database resilience features implemented in the GrooveMap platform to handle nightly
 maintenance windows and other database outages.
 
 ## Overview
@@ -92,7 +92,7 @@ During database outages:
 ### Tableinator Service (PostgreSQL)
 
 - Uses `ResilientPostgreSQLPool` with health monitoring
-- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](configuration.md))
+- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](../tableinator/README.md#configuration))
 - Handles `InterfaceError` and `OperationalError`
 - Automatic connection recycling
 
@@ -113,7 +113,7 @@ During database outages:
 
 - Uses `ResilientPostgreSQLPool` with health monitoring
 - Stores MusicBrainz data in `musicbrainz` PostgreSQL schema
-- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](configuration.md)); RabbitMQ prefetch (channel-global QoS) is coupled to the pool max instead of using batch flushing
+- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](../tableinator/README.md#configuration)); RabbitMQ prefetch (channel-global QoS) is coupled to the pool max instead of using batch flushing
 - Handles `InterfaceError` and `OperationalError`
 
 ## Configuration
@@ -130,14 +130,14 @@ NEO4J_PASSWORD=password
 
 # PostgreSQL
 POSTGRES_HOST=postgres
-POSTGRES_DATABASE=discogsography
+POSTGRES_DATABASE=groovemap
 POSTGRES_USERNAME=postgres
 POSTGRES_PASSWORD=postgres
 
 # RabbitMQ
 RABBITMQ_HOST=rabbitmq
-RABBITMQ_USERNAME=discogsography
-RABBITMQ_PASSWORD=discogsography
+RABBITMQ_USERNAME=groovemap
+RABBITMQ_PASSWORD=groovemap
 ```
 
 ### Tuning Parameters

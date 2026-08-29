@@ -35,6 +35,22 @@ Homepage = "https://groovemap.music"
 Repository = "https://github.com/groovemap-music/discogs-sql-loader"
 Issues = "https://github.com/groovemap-music/discogs-sql-loader/issues"
 
+[dependency-groups]
+dev = [
+    "build>=1.3.0",
+    "commitizen>=4.18.0",
+    "cyclonedx-bom>=7.3.1",
+    "mypy>=2.3.1",
+    "pip-audit>=2.10.1",
+    "pip-licenses>=5.5.5",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.16.4",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["tableinator"]
 
@@ -43,20 +59,6 @@ exclude-newer = "2 days"
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e" }
-
-[dependency-groups]
-dev = [
-    "build>=1.3.0",
-    "commitizen>=4.9.1",
-    "cyclonedx-bom>=7.2.1",
-    "mypy>=2.3.1",
-    "pip-audit>=2.10.1",
-    "pip-licenses>=5.0.0",
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "pytest-cov>=7.1.0",
-    "ruff>=0.16.4",
-]
 
 [tool.ruff]
 extend-exclude = ["tableinator/catalog_contract.py"]
@@ -74,6 +76,7 @@ lines-after-imports = 2
 [tool.ruff.lint.per-file-ignores]
 "tableinator/tableinator.py" = ["T201"]
 "tests/**/*.py" = ["PLC", "S105", "T201"]
+"scripts/*.py" = ["S108", "T201"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -99,9 +102,26 @@ addopts = "-ra -q --strict-markers --tb=short"
 testpaths = ["tests"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+timeout = 60
+timeout_method = "thread"
+markers = [
+    "benchmark: performance regression benchmarks",
+    "e2e: end-to-end tests requiring external services",
+    "integration: tests requiring a live backing service",
+]
 
 [tool.coverage.run]
 source = ["tableinator"]
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "def __repr__",
+    "if __name__ == .__main__.:",
+    "pragma: no cover",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
@@ -112,4 +132,3 @@ tag_format = "v$version"
 annotated_tag = true
 update_changelog_on_bump = true
 changelog_file = "CHANGELOG.md"
-changelog_start_rev = "ba67297"

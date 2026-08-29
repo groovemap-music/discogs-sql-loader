@@ -11,11 +11,11 @@ DISCOGS_DATA_TYPES = ["artists", "labels", "masters", "releases"]
 MUSICBRAINZ_DATA_TYPES = ["artists", "labels", "release-groups", "releases"]
 DISCOGS_EXCHANGE_PREFIX = getenv(
     "DISCOGS_EXCHANGE_PREFIX",
-    "discogsography-discogs",
+    "groovemap-discogs",
 )
 MUSICBRAINZ_EXCHANGE_PREFIX = getenv(
     "MUSICBRAINZ_EXCHANGE_PREFIX",
-    "discogsography-musicbrainz",
+    "groovemap-musicbrainz",
 )
 CONSUMER_SOURCES = {
     "brainzgraphinator": {"source": "musicbrainz"},

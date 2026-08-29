@@ -1,4 +1,8 @@
-# Tableinator Service
+# GrooveMap Discogs SQL loader service
+
+This package is the PostgreSQL loader owned by `discogs-sql-loader`. See the repository
+[documentation index](../docs/README.md) for schema, resilience, completion, and
+performance guidance.
 
 Consumes Discogs data from AMQP queues and stores it in PostgreSQL relational database tables for structured querying and analysis.
 
@@ -27,13 +31,13 @@ Environment variables:
 ```bash
 # PostgreSQL connection
 POSTGRES_HOST=postgres
-POSTGRES_USERNAME=discogsography
-POSTGRES_PASSWORD=discogsography
-POSTGRES_DATABASE=discogsography
+POSTGRES_USERNAME=groovemap
+POSTGRES_PASSWORD=groovemap
+POSTGRES_DATABASE=groovemap
 
 # RabbitMQ (individual vars; also supports _FILE variants for Docker secrets)
-RABBITMQ_USERNAME=discogsography
-RABBITMQ_PASSWORD=discogsography
+RABBITMQ_USERNAME=groovemap
+RABBITMQ_PASSWORD=groovemap
 RABBITMQ_HOST=rabbitmq              # Default: rabbitmq
 RABBITMQ_PORT=5672                  # Default: 5672
 
@@ -94,7 +98,7 @@ POSTGRES_BATCH_FLUSH_INTERVAL=1.0
 POSTGRES_BATCH_MODE=false
 ```
 
-See the [Configuration Guide](../docs/configuration.md#batch-processing-configuration) for detailed tuning guidance.
+See the [performance guide](../docs/performance-guide.md) for detailed tuning guidance.
 
 ## Database Schema
 

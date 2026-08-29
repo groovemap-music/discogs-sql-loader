@@ -23,7 +23,7 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest --cov=tableinator --cov-report=term-missing
+    uv run pytest --cov=tableinator --cov-report=term-missing --cov-report=xml
 
 build:
     uv build --out-dir dist --clear

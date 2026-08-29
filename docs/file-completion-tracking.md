@@ -12,7 +12,7 @@ Last Updated: March 2026
 
 ## Overview
 
-The file completion tracking system ensures accurate monitoring of file processing status across the Discogsography
+The file completion tracking system ensures accurate monitoring of file processing status across the GrooveMap
 platform. It prevents false warnings about stalled extractors and coordinates with the consumer cancellation feature for
 optimal resource management.
 

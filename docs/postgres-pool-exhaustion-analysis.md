@@ -7,7 +7,7 @@ In production all long-lived services connect to a shared PostgreSQL through a
 session mode every client connection is pinned to a dedicated Postgres backend for its
 entire lifetime — there is no multiplexing, even while the connection is idle. PgBouncer
 enforces a **per-database backend cap of 45**. The total number of Postgres connections
-the discogsography app holds open is therefore its real footprint and must stay modest.
+the groovemap app holds open is therefore its real footprint and must stay modest.
 
 ### Observed symptoms (during a MusicBrainz bulk import)
 

@@ -9,7 +9,7 @@ ______________________________________________________________________
 
 ## Executive Summary
 
-Over 11 optimization rounds, the Discogsography API went from a system where most graph queries took **10-70 seconds** to one where **82 of 88 endpoints respond in under 100ms**. The overall average latency dropped **249x** (10.95s → 0.044s), errors dropped from 37 to 3 (only expected), and 26 new endpoints were added during the process while still improving performance.
+Over 11 optimization rounds, the GrooveMap API went from a system where most graph queries took **10-70 seconds** to one where **82 of 88 endpoints respond in under 100ms**. The overall average latency dropped **249x** (10.95s → 0.044s), errors dropped from 37 to 3 (only expected), and 26 new endpoints were added during the process while still improving performance.
 
 | Metric                | Pre-Opt | **Final (Opt-11)** | Improvement |
 | --------------------- | ------- | ------------------ | ----------- |

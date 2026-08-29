@@ -1,6 +1,6 @@
 # ⚡ Performance Optimization Guide
 
-> Strategies and techniques for optimizing Discogsography's performance at scale
+> Strategies and techniques for optimizing GrooveMap's performance at scale
 
 ## Overview
 
@@ -305,7 +305,7 @@ POSTGRES_BATCH_SIZE=500
 POSTGRES_BATCH_FLUSH_INTERVAL=2.0
 ```
 
-See [Configuration Guide](configuration.md#batch-processing-configuration) for complete details.
+See [Configuration Guide](../tableinator/README.md#configuration) for complete details.
 
 #### Neo4j Performance
 

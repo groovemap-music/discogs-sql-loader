@@ -4,13 +4,13 @@
 
 **Complete database schema documentation for Neo4j and PostgreSQL**
 
-[Back to Main](../README.md) | [Documentation Index](README.md) | [Architecture](architecture.md)
+[Back to Main](../README.md) | [Documentation Index](README.md) | [Architecture](https://github.com/groovemap-music/deployment/blob/main/docs/architecture.md)
 
 </div>
 
 ## Overview
 
-Discogsography uses two complementary database systems with data from two sources:
+GrooveMap uses two complementary database systems with data from two sources:
 
 - **Neo4j**: Graph database for complex relationship queries (Discogs data + MusicBrainz enrichment)
 - **PostgreSQL**: Relational database for fast analytics and full-text search (Discogs data in `public` schema, MusicBrainz data in `musicbrainz` schema, precomputed analytics in `insights` schema)
@@ -860,7 +860,7 @@ CREATE INDEX IF NOT EXISTS idx_releases_labels ON releases USING GIN ((data->'la
 
 #### User Tables
 
-There is no separate admin-account table — admin status is the `users.is_admin` boolean, and `admin_setup` (see [Admin Guide](admin-guide.md)) creates/promotes rows directly in `users`.
+There is no separate admin-account table — admin status is the `users.is_admin` boolean, and `admin_setup` (see [Admin Guide](https://github.com/groovemap-music/deployment/blob/main/docs/admin-guide.md)) creates/promotes rows directly in `users`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -1552,9 +1552,9 @@ ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
 
 ## Related Documentation
 
-- [Architecture Overview](architecture.md) - System architecture and data flow
-- [Neo4j Indexing](neo4j-indexing.md) - Advanced indexing strategies
-- [State Marker System](state-marker-system.md) - Extractor progress tracking
+- [Architecture Overview](https://github.com/groovemap-music/deployment/blob/main/docs/architecture.md) - System architecture and data flow
+- [Neo4j Indexing](https://github.com/groovemap-music/discogs-graph-enricher/blob/main/docs/neo4j-indexing.md) - Advanced indexing strategies
+- [State Marker System](https://github.com/groovemap-music/catalog-ingestion/blob/main/docs/state-marker-system.md) - Extractor progress tracking
 
 ______________________________________________________________________
 

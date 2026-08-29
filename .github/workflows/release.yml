@@ -1,0 +1,19 @@
+name: Publish image
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  publish:
+    uses: groovemap-music/.github/.github/workflows/reusable-image-release.yml@main
+    with:
+      image-name: discogs-sql-loader
+      requires-private-library: true
+      prepare-command: just prepare-runtime-wheel
+    secrets: inherit

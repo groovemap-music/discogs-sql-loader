@@ -6,6 +6,8 @@
 .mise.local.toml
 .venv/
 .coverage
+coverage.xml
+/coverage/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/

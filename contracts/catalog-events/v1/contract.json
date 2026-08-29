@@ -64,7 +64,7 @@
   },
   "sources": {
     "discogs": {
-      "default_exchange_prefix": "discogsography-discogs",
+      "default_exchange_prefix": "groovemap-discogs",
       "entities": [
         "artists",
         "labels",
@@ -74,7 +74,7 @@
       "exchange_prefix_env": "DISCOGS_EXCHANGE_PREFIX"
     },
     "musicbrainz": {
-      "default_exchange_prefix": "discogsography-musicbrainz",
+      "default_exchange_prefix": "groovemap-musicbrainz",
       "entities": [
         "artists",
         "labels",
