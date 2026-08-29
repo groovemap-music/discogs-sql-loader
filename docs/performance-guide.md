@@ -175,7 +175,7 @@ RETURN year, count ORDER BY year
 
 #### 2. Pre-Computed Node Properties
 
-For expensive aggregate queries that only change on data import, compute results during the graphinator post-import step and store as node properties:
+For expensive aggregate queries that only change on data import, compute results during the `discogs-graph-enricher` post-import step and store them as node properties:
 
 ```cypher
 -- At import time: compute once
@@ -255,18 +255,18 @@ The extractor publishes to 4 fanout exchanges (one per data type). Each consumer
 
 #### Batch Processing (Implemented)
 
-**Graphinator and Tableinator** now include built-in batch processing for optimal write performance:
+`discogs-graph-enricher` and `discogs-sql-loader` include built-in batch processing for optimal write performance:
 
 ```python
 # Configured via environment variables (enabled by default)
-# Code defaults shown; docker-compose.yml overrides to 500/2.0 for production
+# Code defaults shown; the deployment repository can override them
 NEO4J_BATCH_MODE = true  # Enable batch processing
-NEO4J_BATCH_SIZE = 500  # Records per batch (docker-compose default)
-NEO4J_BATCH_FLUSH_INTERVAL = 2.0  # Seconds between flushes (docker-compose default)
+NEO4J_BATCH_SIZE = 500  # Records per batch
+NEO4J_BATCH_FLUSH_INTERVAL = 2.0  # Seconds between flushes
 
 POSTGRES_BATCH_MODE = true  # Enable batch processing
-POSTGRES_BATCH_SIZE = 500  # Records per batch (docker-compose default)
-POSTGRES_BATCH_FLUSH_INTERVAL = 2.0  # Seconds between flushes (docker-compose default)
+POSTGRES_BATCH_SIZE = 100  # Records per batch
+POSTGRES_BATCH_FLUSH_INTERVAL = 5.0  # Seconds between flushes
 ```
 
 **How it works:**
@@ -298,14 +298,14 @@ NEO4J_BATCH_FLUSH_INTERVAL=1.0
 POSTGRES_BATCH_SIZE=10
 POSTGRES_BATCH_FLUSH_INTERVAL=1.0
 
-# Balanced (docker-compose default - good for most use cases)
+# Balanced (good for most deployments)
 NEO4J_BATCH_SIZE=500
 NEO4J_BATCH_FLUSH_INTERVAL=2.0
 POSTGRES_BATCH_SIZE=500
 POSTGRES_BATCH_FLUSH_INTERVAL=2.0
 ```
 
-See [Configuration Guide](../tableinator/README.md#configuration) for complete details.
+See [Operations](operations.md#configuration) for complete details.
 
 #### Neo4j Performance
 
@@ -584,7 +584,7 @@ fs.file-max = 2097152
 ### Docker Resource Limits
 
 ```yaml
-# docker-compose.yml
+# deployment/docker-compose.yml
 services:
   extractor:
     deploy:

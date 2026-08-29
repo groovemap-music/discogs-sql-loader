@@ -1,4 +1,4 @@
-"""Discogs SQL loader configuration owned by the tableinator service."""
+"""Configuration for the GrooveMap Discogs SQL loader."""
 
 from dataclasses import dataclass, field
 from os import getenv

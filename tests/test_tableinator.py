@@ -1710,7 +1710,7 @@ class TestGetHealthData:
 
         # Verify values
         assert result["status"] == "healthy"
-        assert result["service"] == "tableinator"
+        assert result["service"] == "discogs-sql-loader"
         # Should show "Processing artists" because it has recent activity (5 seconds ago)
         assert result["current_task"] == "Processing artists"
 
@@ -1753,7 +1753,7 @@ class TestGetHealthData:
         result = get_health_data()
 
         assert result["status"] == "unhealthy"
-        assert result["service"] == "tableinator"
+        assert result["service"] == "discogs-sql-loader"
 
     def test_idle_status_with_active_consumers(self) -> None:
         """Test that get_health_data shows idle status when consumers active but no recent messages."""

@@ -1,45 +1,76 @@
 # GrooveMap Discogs SQL loader
 
-Consumes versioned Discogs catalog events and builds PostgreSQL tables for structured
-queries, analysis, and cross-catalog enrichment.
+`discogs-sql-loader` consumes normalized Discogs catalog events and maintains the
+PostgreSQL copy of GrooveMap's Discogs catalog. It owns the artists, labels, masters,
+and releases tables used for structured queries and downstream enrichment.
 
-## Development
+```mermaid
+flowchart LR
+    ingestion[catalog-ingestion] -->|Discogs catalog events| rabbit[(RabbitMQ)]
+    rabbit --> loader[discogs-sql-loader]
+    loader -->|batched idempotent upserts| postgres[(PostgreSQL)]
+    loader -->|status on port 8002| health[Health endpoint]
+```
 
-This service consumes the private `groovemap-runtime` package. Local setup requires read
-access to `groovemap-music/python-libraries`; the lockfile records the reviewed revision.
+The loader accepts the versioned `groovemap.catalog-events` contract on four durable
+fanout exchanges: `groovemap-discogs-artists`, `groovemap-discogs-labels`,
+`groovemap-discogs-masters`, and `groovemap-discogs-releases`. Normal records become
+JSONB rows keyed by Discogs ID. Terminal `file_complete` and `extraction_complete`
+messages drain pending writes before completion or stale-row cleanup is acknowledged.
+
+## Run and validate
+
+Install the pinned toolchain and dependencies, then run the credential-free checks:
 
 ```bash
 mise install
 just setup
 just check
-just image
 ```
 
-`just check` is credential-free and uses mocked PostgreSQL/RabbitMQ boundaries. Live
-integration, load, and deployment checks remain separate. See
-[tableinator/README.md](tableinator/README.md) for configuration and behavior.
+Run the service locally with `uv run discogs-sql-loader`. PostgreSQL and RabbitMQ are
+external dependencies; use the separately versioned
+[`deployment`](https://github.com/groovemap-music/deployment) repository for the full
+stack. Build and inspect the repository-owned image with `just image`. The published
+image name is `ghcr.io/groovemap-music/discogs-sql-loader`.
 
-The source-check workflow can run with the repository-scoped GitHub token. Full dependency
-installation and tests remain operator-local until a narrowly installed GitHub App can mint
-a short-lived token that reads the private Python libraries repository; no cross-repository
-PAT is accepted.
+`just check` formats and lints the source, verifies promoted contracts, scans for
+secrets, type-checks, runs the mocked unit and regression suite with coverage, builds
+and installs the wheel, checks licenses, and previews the next version. Tests do not
+connect to live PostgreSQL or RabbitMQ services.
 
-## Contracts
+## Operational behavior
 
-- Catalog-event contract: v1, promoted byte-for-byte from `catalog-ingestion`.
-- Persistence compatibility: v1, promoted from `database-schema`.
+- Batch mode is on by default. Messages are acknowledged only after their PostgreSQL
+  transaction commits.
+- On a transient PostgreSQL outage, messages remain recoverable and retry with bounded
+  backoff rather than consuming the dead-letter budget.
+- Shutdown first cancels consumers, then flushes accepted batches, and finally closes
+  RabbitMQ and PostgreSQL connections.
+- After `file_complete`, the matching consumer drains and may be canceled after a grace
+  period. After `extraction_complete`, all remaining batches drain before guarded
+  stale-row cleanup.
+- Restart does not persist in-memory completion state. The producer may resume an
+  extraction, and the large-delete guard prevents a resumed run from purging an
+  almost-complete table.
 
-`just source-check` verifies both promoted files and the generated Python binding by SHA-256.
-There are no cross-repository relative imports or generated writes.
+See [Operations](docs/operations.md) for configuration, input and output details,
+completion semantics, health states, and troubleshooting. The
+[documentation index](docs/README.md) links the focused resilience, performance, and
+schema references.
 
-## Release and license
+## Contracts and compatibility
 
-This repository versions one service wheel and container image. Commitizen reads the PEP 621
-version and uses annotated `v$version` tags. Dry runs do not tag, push, publish, or release.
+The catalog-event contract is promoted from `catalog-ingestion`; persistence
+compatibility is promoted from `database-schema`. `just source-check` verifies both
+boundaries and their generated binding.
 
-The current tree is MIT licensed. Historical revisions retain their then-applicable license.
+The repository name, image, executable, health identity, logs, and startup banner use
+`discogs-sql-loader`. A small set of pre-split identifiers remains intentionally stable
+for imports and durable AMQP queue names; see
+[Compatibility identifiers](docs/compatibility.md).
 
-## Documentation
+## License
 
-See the [documentation index](docs/README.md) and the
-[tableinator reference](tableinator/README.md).
+The current tree is available under the [MIT License](LICENSE). Historical revisions
+retain their then-applicable license.
