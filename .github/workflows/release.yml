@@ -5,15 +5,27 @@ on:
     tags: ["v*"]
 
 permissions:
+  attestations: write
   contents: read
   packages: write
   id-token: write
 
 jobs:
-  publish:
-    uses: groovemap-music/.github/.github/workflows/reusable-image-release.yml@main
+  release:
+    uses: groovemap-music/automation/.github/workflows/reusable-release.yml@2f34a4da5c552bc23c75edd3d8d81be0a4b3271c
     with:
-      image-name: discogs-sql-loader
+      repository-name: discogs-sql-loader
+      setup-command: just setup
+      check-command: just check
+      release-command: just release-dry-run
+      artifact-path: |
+        dist/*.whl
+        dist/*.tar.gz
+        dist/provenance.json
+      publish-image: true
       requires-private-library: true
-      prepare-command: just prepare-runtime-wheel
-    secrets: inherit
+      private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}
+      private-library-revision: 28fa329702bc76896cc54ab8d05ec5b1bd3d929e
+      prepare-image-command: just prepare-runtime-wheel
+    secrets:
+      PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}
