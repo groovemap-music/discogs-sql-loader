@@ -1,10 +1,13 @@
 """Pytest configuration for tableinator tests."""
 
-from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @pytest.fixture(autouse=True)
