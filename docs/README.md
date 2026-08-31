@@ -19,5 +19,8 @@ Additional migrated reference material:
 
 - [Database schema](database-schema.md)
 - [Query performance optimizations](query-performance-optimizations.md)
-- [Source-history provenance](extraction.md)
-- [Historical implementation plan](superpowers/plans/2026-03-21-query-perf-opt-v5.md)
+- [Release compliance](release-compliance.md)
+- [History rewrite approval gate](history-rewrite-gate.md)
+
+Private planning records are preserved exclusively in the private `planning-archive`
+repository. They are not active service documentation and must not be copied here.
