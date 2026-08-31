@@ -187,7 +187,7 @@ For "Electronic" (5.6M releases), this produced **180M DB accesses** and allocat
 
 1. **Phase 1 (Opt-2):** Replaced collect+UNWIND with streaming aggregation via CALL {} subqueries. Reduced to ~45M DB hits.
 1. **Phase 2 (Opt-6):** Split into 4 concurrent independent count queries via `asyncio.gather()`. Reduced to ~28M DB hits.
-1. **Phase 3 (Opt-8):** **Pre-computed aggregate properties** on Genre/Style/Label nodes during the graphinator post-import step:
+1. **Phase 3 (Opt-8):** **Pre-computed aggregate properties** on Genre/Style/Label nodes during the `discogs-graph-enricher` post-import step:
    ```cypher
    CALL { } IN TRANSACTIONS OF 1 ROWS
    SET g.release_count = ..., g.artist_count = ..., g.label_count = ..., g.style_count = ...
@@ -448,7 +448,7 @@ WITH g, [(g)<-[:IS]-(r:Release) WHERE r.year > 0 | r.year] AS years
 For queries that aggregate across millions of relationships but whose results change only on data import:
 
 ```cypher
--- At import time (in graphinator post-import step):
+-- At import time (in the discogs-graph-enricher post-import step):
 CALL { } IN TRANSACTIONS OF 1 ROWS
 MATCH (g:Genre)
 SET g.release_count = COUNT { (g)<-[:IS]-(:Release) }

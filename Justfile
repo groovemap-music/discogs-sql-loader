@@ -10,6 +10,9 @@ source-check:
     uvx --from ruff==0.16.4 ruff format --check .
     uvx --from ruff==0.16.4 ruff check .
     python scripts/check-contracts.py
+    just secret-scan
+
+secret-scan:
     gitleaks git --redact --no-banner
     gitleaks dir . --redact --no-banner
 

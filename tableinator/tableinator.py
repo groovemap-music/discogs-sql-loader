@@ -50,13 +50,17 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+SERVICE_NAME = "discogs-sql-loader"
+LOG_PATH = Path("/logs") / f"{SERVICE_NAME}.log"
+# The durable AMQP queues predate the repository split. Changing this consumer key
+# would create a second set of queues and strand deliveries in the existing ones.
+AMQP_CONSUMER_NAME = "tableinator"
+
 STARTUP_BANNER = r"""
-    _ _                                  _     _              _
- __| (_)___ __ ___  __ _ ______ ___ __ _| |___| |___  __ _ __| |___ _ _
-/ _` | (_-</ _/ _ \/ _` (_-<___(_-</ _` | |___| / _ \/ _` / _` / -_) '_|
-\__,_|_/__/\__\___/\__, /__/   /__/\__, |_|   |_\___/\__,_\__,_\___|_|
-                   |___/              |_|
-                             discogs-sql-loader
++--------------------------------------------------+
+| GrooveMap                                        |
+| discogs-sql-loader                               |
++--------------------------------------------------+
 """.strip("\n")
 
 # Config will be initialized in main
@@ -72,7 +76,7 @@ completed_files: set[str] = set()  # Track which files have completed processing
 # outage cannot burn the quorum queue's x-delivery-limit budget and dead-letter
 # valid records. Batch mode gets the same protection from _flush_queue's
 # re-enqueue+backoff, which never nacks (discogsography-rb05).
-outage_backoff = OutageBackoff("tableinator")
+outage_backoff = OutageBackoff(SERVICE_NAME)
 current_task = None
 current_progress = 0.0
 
@@ -164,7 +168,7 @@ def get_health_data() -> dict[str, Any]:
 
     return {
         "status": status,
-        "service": "tableinator",
+        "service": SERVICE_NAME,
         "current_task": active_task,
         "progress": current_progress,
         "message_counts": message_counts.copy(),
@@ -437,7 +441,7 @@ async def _recover_consumers() -> None:
         # Check each queue for pending messages
         queues_with_messages = []
         for data_type in DATA_TYPES:
-            queue_name = catalog_queue_name("tableinator", data_type)
+            queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
 
             # Use queue.declare with passive=True to get message count without affecting the queue
             declared_queue = await temp_channel.declare_queue(name=queue_name, passive=True)
@@ -466,9 +470,9 @@ async def _recover_consumers() -> None:
             queues = {}
             for data_type in DATA_TYPES:
                 exchange_name = catalog_exchange_name("discogs", data_type)
-                queue_name = catalog_queue_name("tableinator", data_type)
-                dlx_name = catalog_dead_letter_exchange_name("tableinator", data_type)
-                dlq_name = catalog_dead_letter_queue_name("tableinator", data_type)
+                queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
+                dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_NAME, data_type)
+                dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_NAME, data_type)
 
                 # Declare fanout exchange (must match extractor)
                 exchange = await active_channel.declare_exchange(
@@ -1072,8 +1076,8 @@ async def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    setup_logging("tableinator", log_file=Path("/logs/tableinator.log"))
-    logger.info("🚀 Starting PostgreSQL tableinator service with connection pooling")
+    setup_logging(SERVICE_NAME, log_file=LOG_PATH)
+    logger.info("🚀 Starting GrooveMap discogs-sql-loader with PostgreSQL connection pooling")
 
     # Add startup delay for dependent services
     startup_delay = int(os.environ.get("STARTUP_DELAY", "5"))
@@ -1214,9 +1218,9 @@ async def main() -> None:
         queues = {}
         for data_type in DATA_TYPES:
             exchange_name = catalog_exchange_name("discogs", data_type)
-            queue_name = catalog_queue_name("tableinator", data_type)
-            dlx_name = catalog_dead_letter_exchange_name("tableinator", data_type)
-            dlq_name = catalog_dead_letter_queue_name("tableinator", data_type)
+            queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
+            dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_NAME, data_type)
+            dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_NAME, data_type)
 
             # Declare fanout exchange (must match extractor)
             exchange = await channel.declare_exchange(exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
@@ -1254,8 +1258,9 @@ async def main() -> None:
             consumer_tags[data_type] = await queues[data_type].consume(handler)
 
         logger.info(
-            f"🚀 Tableinator started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
-            f"Consuming from {len(DATA_TYPES)} queues with connection pool (max 50 connections). "
+            f"🚀 {SERVICE_NAME} started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
+            f"Consuming from {len(DATA_TYPES)} queues with connection pool "
+            f"(max {config.postgres_pool_max_size} connections). "
             "Ready to process messages into PostgreSQL. Press CTRL+C to exit"
         )
 
@@ -1340,7 +1345,7 @@ def cli() -> None:
     except Exception as e:
         logger.error("❌ Application error", error=str(e))
     finally:
-        logger.info("✅ Tableinator service shutdown complete")
+        logger.info(f"✅ {SERVICE_NAME} shutdown complete")
 
 
 if __name__ == "__main__":
