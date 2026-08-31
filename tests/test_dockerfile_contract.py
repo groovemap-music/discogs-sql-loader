@@ -34,7 +34,7 @@ def test_image_metadata_uses_repository_name() -> None:
 
 def test_local_and_published_images_use_repository_name() -> None:
     assert "--tag discogs-sql-loader:local" in BUILD_SCRIPT
-    assert "image-name: discogs-sql-loader" in RELEASE_WORKFLOW
+    assert "repository-name: discogs-sql-loader" in RELEASE_WORKFLOW
 
 
 def test_runtime_user_is_numeric_and_non_root() -> None:
