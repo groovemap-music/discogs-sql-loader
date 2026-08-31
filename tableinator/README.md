@@ -30,6 +30,7 @@ guard refuses suspicious cleanup after a resumed extraction.
 ## Entry points
 
 - Console command: `uv run discogs-sql-loader`
+- Python: 3.14
 - Python entry point: `tableinator.tableinator:cli`
 - Health endpoint: `http://localhost:8002/health`
 - Local image: `discogs-sql-loader:local`

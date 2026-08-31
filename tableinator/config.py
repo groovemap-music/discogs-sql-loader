@@ -25,7 +25,7 @@ class TableinatorConfig:
     postgres_pool_max_size: int = 12
 
     @classmethod
-    def from_env(cls) -> "TableinatorConfig":
+    def from_env(cls) -> TableinatorConfig:
         """Create configuration from environment variables."""
         postgres_username = get_secret("POSTGRES_USERNAME")
         postgres_password = get_secret("POSTGRES_PASSWORD")

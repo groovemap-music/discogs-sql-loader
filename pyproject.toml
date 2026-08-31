@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "Consume Discogs events and build GrooveMap analytical PostgreSQL tables"
 authors = [{name = "Robert Wlodarczyk", email = "robert@simplicityguy.com"}]
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14,<3.15"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -63,7 +63,7 @@ groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries
 [tool.ruff]
 extend-exclude = ["tableinator/catalog_contract.py"]
 line-length = 150
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["ARG", "B", "C4", "E", "F", "I", "PLC", "PTH", "RUF", "S", "SIM", "T20", "TCH", "UP", "W"]
@@ -79,7 +79,7 @@ lines-after-imports = 2
 "scripts/*.py" = ["S108", "T201"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.14"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
