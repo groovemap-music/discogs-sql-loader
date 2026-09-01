@@ -23,9 +23,4 @@ jobs:
         dist/*.tar.gz
         dist/provenance.json
       publish-image: true
-      requires-private-library: true
-      private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}
-      private-library-revision: 28fa329702bc76896cc54ab8d05ec5b1bd3d929e
       prepare-image-command: just prepare-runtime-wheel
-    secrets:
-      PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}
