@@ -50,11 +50,11 @@ image: prepare-runtime-wheel
     test "$(docker run --rm --entrypoint /usr/bin/id discogs-sql-loader:local -u):$(docker run --rm --entrypoint /usr/bin/id discogs-sql-loader:local -g)" = "1000:1000"
 
 bump-preview:
-    uv run cz bump --dry-run --changelog --yes --check-consistency
+    uv run python scripts/check_bump_preview.py
 
 # Update local version metadata and changelog only; do not commit, tag, push, or publish.
 bump:
-    uv run cz bump --version-files-only --changelog --yes --check-consistency
+    uv run cz bump --files-only --changelog --yes --check-consistency
     uv lock
 
 release-dry-run: check

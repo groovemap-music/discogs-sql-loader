@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "groovemap-discogs-sql-loader"
-version = "0.1.0"
+version = "0.1.1"
 description = "Consume Discogs events and build GrooveMap analytical PostgreSQL tables"
 authors = [{name = "Robert Wlodarczyk", email = "robert@simplicityguy.com"}]
 readme = "README.md"
