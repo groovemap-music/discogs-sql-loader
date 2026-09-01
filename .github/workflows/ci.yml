@@ -17,9 +17,6 @@ jobs:
     with:
       runner: ubuntu-24.04
       language: python
-      requires-private-library: true
-      private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}
-      private-library-revision: 28fa329702bc76896cc54ab8d05ec5b1bd3d929e
       setup-command: just setup
       check-command: just check
       coverage-command: just test
@@ -33,5 +30,4 @@ jobs:
       coverage-flags: python,discogs,postgres
       upload-codecov: true
     secrets:
-      PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
