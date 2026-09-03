@@ -717,13 +717,14 @@ class TestPostgreSQLBatchProcessor:
         ]
 
         with patch("tableinator.batch_processor.logger") as mock_logger:
-            await processor._process_batch("artists", messages)
+            unchanged_ids = await processor._process_batch("artists", messages)
 
         # Should log that records were skipped
         mock_logger.debug.assert_called()
 
         # executemany should not be called if all records unchanged
         assert mock_cursor.executemany.call_count == 0
+        assert unchanged_ids == {"1", "2"}
 
     @pytest.mark.asyncio
     async def test_process_batch_with_mixed_records(self) -> None:
@@ -775,12 +776,13 @@ class TestPostgreSQLBatchProcessor:
         ]
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._process_batch("artists", messages)
+            unchanged_ids = await processor._process_batch("artists", messages)
 
         # executemany should be called with only the changed record
         assert mock_cursor.executemany.call_count == 1
         call_args = mock_cursor.executemany.call_args[0]
         assert len(call_args[1]) == 1  # Only one record to upsert
+        assert unchanged_ids == {"1"}
 
     @pytest.mark.asyncio
     async def test_flush_all(self) -> None:

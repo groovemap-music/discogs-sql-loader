@@ -18,6 +18,8 @@ from psycopg import sql
 from psycopg.errors import InterfaceError, OperationalError
 from psycopg.types.json import Jsonb
 
+from tableinator import telemetry
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -53,6 +55,10 @@ class PendingMessage:
     ack_callback: Callable[[], Any]
     nack_callback: Callable[[], Any]
     received_at: float = field(default_factory=time.time)
+    # Monotonic counterpart to received_at, used only for the
+    # groovemap.pipeline.message.duration / messaging.client.operation.duration
+    # telemetry recorded when this message reaches a terminal ack or DLQ nack.
+    telemetry_started_at: float = field(default_factory=time.perf_counter)
 
 
 class PostgreSQLBatchProcessor:
@@ -210,10 +216,26 @@ class PostgreSQLBatchProcessor:
         Returns:
             True if the message was accepted into the queue, False if nacked.
         """
+        started = time.perf_counter()
+
+        def record_immediate_reject(error_type: str) -> None:
+            """Record a terminal rejection that never reaches a flush.
+
+            The per-message handler defers all groovemap.pipeline.messages /
+            messaging.client.* recording to the batch processor (see
+            tableinator.py::on_data_message), so an immediate reject here -- one that
+            never enters the queue and so never reaches _flush_queue_locked -- must
+            record its own terminal disposition, or it would never be counted at all.
+            """
+            duration = time.perf_counter() - started
+            telemetry.record_message(data_type, "failed", duration)
+            telemetry.record_consumed_message(data_type, duration, error_type)
+
         queue = self.queues.get(data_type)
         if queue is None:
             logger.error("❌ Unknown data type", data_type=data_type)
             await nack_callback()
+            record_immediate_reject("unknown_data_type")
             return False
 
         # Extract id and hash before normalization
@@ -222,6 +244,7 @@ class PostgreSQLBatchProcessor:
             logger.error("❌ Message missing 'id' field", data_type=data_type)
             self._had_dlq_nacks[data_type] = True
             await nack_callback()
+            record_immediate_reject("missing_id")
             return False
 
         sha256 = data.get("sha256", "")
@@ -237,6 +260,7 @@ class PostgreSQLBatchProcessor:
             )
             self._had_dlq_nacks[data_type] = True
             await nack_callback()
+            record_immediate_reject(telemetry.error_type_of(e))
             return False
 
         # Add to queue
@@ -248,6 +272,7 @@ class PostgreSQLBatchProcessor:
                 sha256=sha256,
                 ack_callback=ack_callback,
                 nack_callback=nack_callback,
+                telemetry_started_at=started,
             )
         )
 
@@ -340,8 +365,11 @@ class PostgreSQLBatchProcessor:
         if not messages:
             return
 
-        batch_start = time.time()
+        telemetry.record_batch_size(data_type, len(messages))
+
+        batch_start = time.perf_counter()
         success = False
+        unchanged_ids: set[str] = set()
 
         # Limit concurrent PostgreSQL operations to prevent pool exhaustion
         if self._flush_semaphore is None:
@@ -363,7 +391,12 @@ class PostgreSQLBatchProcessor:
 
         try:
             try:
-                await self._process_batch(data_type, messages)
+                # `or set()`: a test double that stands in for _process_batch without
+                # declaring a return value yields None on its success path; treat that
+                # the same as "nothing was unchanged" rather than raising when we
+                # classify messages below (the real implementation always returns a
+                # set[str]).
+                unchanged_ids = await self._process_batch(data_type, messages) or set()
                 success = True
 
             except asyncio.CancelledError:
@@ -443,11 +476,16 @@ class PostgreSQLBatchProcessor:
                         error=str(e),
                     )
                     self._had_dlq_nacks[data_type] = True
+                    poison_error_type = telemetry.error_type_of(e)
                     for msg in messages:
                         try:
                             await msg.nack_callback()
                         except Exception as nack_err:
                             logger.warning("⚠️ Failed to nack message", error=str(nack_err))
+                        msg_duration = time.perf_counter() - msg.telemetry_started_at
+                        telemetry.record_message(data_type, "failed", msg_duration)
+                        telemetry.record_consumed_message(data_type, msg_duration, poison_error_type)
+                    telemetry.record_batch_flush(data_type, time.perf_counter() - batch_start, "failed")
                     # Reset per-data-type state so healthy batches behind the
                     # poison resume normal processing.
                     self._consecutive_failures[data_type] = 0
@@ -484,7 +522,7 @@ class PostgreSQLBatchProcessor:
         finally:
             self._flush_semaphore.release()
 
-        batch_duration = time.time() - batch_start
+        batch_duration = time.perf_counter() - batch_start
 
         if success:
             # Acknowledge all messages
@@ -493,6 +531,15 @@ class PostgreSQLBatchProcessor:
                     await msg.ack_callback()
                 except Exception as e:
                     logger.warning("⚠️ Failed to ack message", error=str(e))
+
+                # "skipped" -- the record's hash matched, so this write refreshed only
+                # updated_at, not the data itself (see _process_batch's unchanged_ids).
+                outcome = "skipped" if msg.data_id in unchanged_ids else "processed"
+                msg_duration = time.perf_counter() - msg.telemetry_started_at
+                telemetry.record_message(data_type, outcome, msg_duration)
+                telemetry.record_consumed_message(data_type, msg_duration)
+
+            telemetry.record_batch_flush(data_type, batch_duration, "success")
 
             self.processed_counts[data_type] += len(messages)
             self.batch_counts[data_type] += 1
@@ -525,13 +572,17 @@ class PostgreSQLBatchProcessor:
                 total_processed=self.processed_counts[data_type],
             )
 
-    async def _process_batch(self, data_type: str, messages: list[PendingMessage]) -> None:
+    async def _process_batch(self, data_type: str, messages: list[PendingMessage]) -> set[str]:
         """Process a batch of records using efficient bulk operations.
 
         Uses async PostgreSQL operations with a single transaction:
         1. Bulk fetch existing hashes using ANY()
         2. Filter to only records that need updating
         3. Bulk upsert using executemany with ON CONFLICT
+
+        Returns:
+            The data_ids whose hash was unchanged (updated_at refreshed, data not
+            rewritten), for the caller's per-message "skipped" vs "processed" telemetry.
         """
         # Get async connection from pool — wrap in explicit transaction for atomicity
         async with self.connection_pool.connection() as conn:
@@ -570,7 +621,7 @@ class PostgreSQLBatchProcessor:
                     )
 
                 if not records_to_upsert:
-                    return
+                    return set(unchanged_ids)
 
                 # Step 3: Bulk upsert using executemany
                 await cursor.executemany(
@@ -589,6 +640,8 @@ class PostgreSQLBatchProcessor:
                     upserted=len(records_to_upsert),
                     skipped=len(unchanged_ids),
                 )
+
+                return set(unchanged_ids)
 
     async def flush_all(self) -> bool:
         """Flush all pending queues, draining each completely.
