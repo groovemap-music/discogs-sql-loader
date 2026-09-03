@@ -586,6 +586,83 @@ class TestMain:
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.setup_logging")
+    @patch("tableinator.tableinator.setup_telemetry")
+    @patch("tableinator.tableinator.shutdown_telemetry")
+    @patch("tableinator.tableinator.telemetry.record_consumer_started")
+    @patch("tableinator.tableinator.HealthServer")
+    @patch("tableinator.tableinator.AsyncResilientRabbitMQ")
+    @patch("tableinator.tableinator.AsyncPostgreSQLPool")
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_main_wires_telemetry_setup_shutdown_and_consumer_start(
+        self,
+        mock_pool_class: Mock,
+        mock_rabbitmq_class: AsyncMock,
+        mock_health_server: Mock,
+        mock_record_consumer_started: Mock,
+        mock_shutdown_telemetry: Mock,
+        mock_setup_telemetry: Mock,
+        _mock_setup_logging: Mock,
+    ) -> None:
+        """gm-discogs-sql-loader-rbt.1: setup_telemetry('tableinator') runs right after
+        setup_logging, shutdown_telemetry runs on shutdown, and one consumer-started is
+        recorded per data type started."""
+        mock_health_instance = MagicMock()
+        mock_health_server.return_value = mock_health_instance
+
+        mock_pool = MagicMock()
+        mock_pool_class.return_value = mock_pool
+        mock_pool.initialize = AsyncMock()
+        mock_pool.close = AsyncMock()
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_connection_cm = AsyncMock()
+        mock_connection_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_connection_cm.__aexit__ = AsyncMock(return_value=None)
+        mock_pool.connection = MagicMock(return_value=mock_connection_cm)
+
+        mock_rabbitmq_instance = AsyncMock()
+        mock_rabbitmq_class.return_value = mock_rabbitmq_instance
+        mock_connection = AsyncMock()
+        mock_rabbitmq_instance.connect.return_value = mock_connection
+        mock_channel = AsyncMock()
+        mock_rabbitmq_instance.channel.return_value = mock_channel
+        mock_queue = AsyncMock()
+        mock_channel.declare_queue.return_value = mock_queue
+
+        created_tasks: list[asyncio.Task[Any]] = []
+        original_create_task = asyncio.create_task
+
+        def mock_create_task(coro: Any) -> asyncio.Task[Any]:
+            task = original_create_task(coro)
+            created_tasks.append(task)
+            return task
+
+        with patch("asyncio.create_task", side_effect=mock_create_task):
+            original_sleep = asyncio.sleep
+
+            async def mock_sleep(delay: float) -> None:  # noqa: ARG001
+                import tableinator.tableinator
+
+                tableinator.tableinator.shutdown_requested = True
+                await original_sleep(0)
+
+            with patch("asyncio.sleep", mock_sleep):
+                await main()
+
+        for task in created_tasks:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        mock_setup_telemetry.assert_called_once_with("tableinator")
+        mock_shutdown_telemetry.assert_called_once_with()
+        assert mock_record_consumer_started.call_count == 4  # one per DATA_TYPES entry
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.setup_logging")
     @patch("tableinator.tableinator.HealthServer")
     @patch("tableinator.tableinator.AsyncPostgreSQLPool")
     async def test_main_pool_initialization_failure(
@@ -1572,14 +1649,16 @@ class TestCancelAfterDelay:
 
         from tableinator.tableinator import schedule_consumer_cancellation
 
-        # Schedule cancellation
-        await schedule_consumer_cancellation("artists", mock_queue)
+        with patch("tableinator.tableinator.telemetry.record_consumer_stopped") as mock_record_stopped:
+            # Schedule cancellation
+            await schedule_consumer_cancellation("artists", mock_queue)
 
-        # Wait for delay
-        await asyncio.sleep(0.15)
+            # Wait for delay
+            await asyncio.sleep(0.15)
 
         # Should have cancelled
         mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=True)
+        mock_record_stopped.assert_called_once_with()
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.CONSUMER_CANCEL_DELAY", 0.1)

@@ -18,12 +18,15 @@ from common import (
     normalize_record,
     parse_postgres_host_port,
     setup_logging,
+    setup_telemetry,
+    shutdown_telemetry,
 )
 from orjson import loads
 from psycopg import sql
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 from psycopg.types.json import Jsonb
 
+from tableinator import telemetry
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
@@ -55,6 +58,10 @@ LOG_PATH = Path("/logs") / f"{SERVICE_NAME}.log"
 # The durable AMQP queues predate the repository split. Changing this consumer key
 # would create a second set of queues and strand deliveries in the existing ones.
 AMQP_CONSUMER_NAME = "tableinator"
+# The docker-compose service key from the GrooveMap OpenTelemetry metrics conventions
+# (design ADR-0006), distinct from SERVICE_NAME above which names logs and the health
+# identity.
+OTEL_SERVICE_NAME = "tableinator"
 
 STARTUP_BANNER = r"""
 +--------------------------------------------------+
@@ -258,6 +265,7 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
 
                 # Remove from tracking
                 del consumer_tags[data_type]
+                telemetry.record_consumer_stopped()
 
                 logger.info(
                     f"✅ Consumer for {data_type} successfully canceled",
@@ -295,10 +303,12 @@ async def cancel_all_consumers() -> None:
         queue = queues.get(data_type)
         if queue is None:
             consumer_tags.pop(data_type, None)
+            telemetry.record_consumer_stopped()
             continue
         try:
             await queue.cancel(consumer_tag, nowait=True)
             consumer_tags.pop(data_type, None)
+            telemetry.record_consumer_stopped()
         except Exception as e:
             logger.warning(
                 "⚠️ Failed to cancel consumer during shutdown",
@@ -526,6 +536,7 @@ async def _recover_consumers() -> None:
                     handler = make_data_handler(data_type)
                     consumer_tag = await queues[data_type].consume(handler)
                     consumer_tags[data_type] = consumer_tag
+                    telemetry.record_consumer_started()
                     # Only un-complete a type that actually has a backlog, so
                     # genuinely-finished types stay marked complete.
                     if data_type in pending_counts:
@@ -568,6 +579,8 @@ async def _recover_consumers() -> None:
         # died with the now-closed connection. Leaving them behind would keep
         # len(consumer_tags) > 0 forever, permanently gating off both recovery
         # routes (stuck-check requires 0 tags) while health still reads healthy.
+        for _ in range(len(consumer_tags)):
+            telemetry.record_consumer_stopped()
         consumer_tags.clear()
 
 
@@ -702,6 +715,22 @@ def make_data_handler(
 
 
 async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> None:
+    message_started = time.perf_counter()
+
+    def record_terminal(outcome: str, error_type: str | None = None) -> None:
+        """Record this delivery's outcome once it reaches a terminal ack/nack.
+
+        Covers both the domain groovemap.pipeline.messages/.message.duration metrics
+        and, since this handler consumes via ``queue.consume`` directly rather than
+        through ``common.process_message_with_retry``, the messaging.client.* metrics
+        that wrapper would otherwise have emitted for free. A message handed to the
+        batch processor (BATCH_MODE) is NOT terminal here — its outcome is recorded by
+        batch_processor.py when the batch it lands in actually flushes.
+        """
+        duration = time.perf_counter() - message_started
+        telemetry.record_message(data_type, outcome, duration)
+        telemetry.record_consumed_message(data_type, duration, error_type)
+
     if shutdown_requested:
         # Leave the delivery UNACKED — never nack(requeue=True) here. The
         # consumer is still subscribed at this point, so a requeue is redelivered
@@ -734,6 +763,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                     data_type=data_type,
                 )
                 await message.nack(requeue=True)
+                record_terminal("failed", "flush_incomplete")
                 return
 
             # Mark complete only after flush to prevent premature idle detection
@@ -744,6 +774,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                 await schedule_consumer_cancellation(data_type, queues[data_type])
 
             await message.ack()
+            record_terminal("processed")
             return
 
         # Check if this is an extraction completion message
@@ -765,6 +796,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                     data_type=data_type,
                 )
                 await message.nack(requeue=True)
+                record_terminal("failed", "flush_incomplete")
                 return
 
             # Purge stale rows from prior extractions. Skip entirely if any message
@@ -816,8 +848,10 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                     await schedule_consumer_cancellation(data_type, queues[data_type])
 
                 await message.ack()
+                record_terminal("processed")
             else:
                 await message.nack(requeue=True)
+                record_terminal("failed", "purge_failed")
             return
 
         # Normal message processing - require a non-empty 'id' field.
@@ -831,6 +865,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         if not data.get("id"):
             logger.error("❌ Message missing 'id' field", data=data)
             await message.nack(requeue=False)
+            record_terminal("failed", "missing_id")
             return
 
         # If batch mode is enabled, delegate to batch processor
@@ -885,6 +920,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
     except Exception as e:
         logger.error("❌ Failed to parse message", error=str(e))
         await message.nack(requeue=False)
+        record_terminal("failed", telemetry.error_type_of(e))
         return
 
     # Process record using async connection pool for concurrent access
@@ -922,6 +958,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             )
 
         await message.ack()
+        record_terminal("processed")
 
         # PostgreSQL answered — clear the outage backoff.
         outage_backoff.reset()
@@ -944,6 +981,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # minutes of a database outage (discogsography-rb05).
         await outage_backoff.wait()
         await message.nack(requeue=True)
+        record_terminal("failed", telemetry.error_type_of(e))
     except (DataError, IntegrityError) as e:
         # Deterministic per-record faults: a failed column cast (DataError) or a
         # violated constraint (IntegrityError, e.g. a NULL data_id). Retrying fails
@@ -960,12 +998,14 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             await message.nack(requeue=False)
         except Exception as nack_error:
             logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+        record_terminal("failed", telemetry.error_type_of(e))
     except Exception as e:
         logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
         try:
             await message.nack(requeue=True)
         except Exception as nack_error:
             logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+        record_terminal("failed", telemetry.error_type_of(e))
 
 
 async def progress_reporter() -> None:
@@ -1077,6 +1117,7 @@ async def main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     setup_logging(SERVICE_NAME, log_file=LOG_PATH)
+    setup_telemetry(OTEL_SERVICE_NAME)
     logger.info("🚀 Starting GrooveMap discogs-sql-loader with PostgreSQL connection pooling")
 
     # Add startup delay for dependent services
@@ -1256,6 +1297,7 @@ async def main() -> None:
         for data_type in DATA_TYPES:
             handler = make_data_handler(data_type)
             consumer_tags[data_type] = await queues[data_type].consume(handler)
+            telemetry.record_consumer_started()
 
         logger.info(
             f"🚀 {SERVICE_NAME} started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
@@ -1334,6 +1376,10 @@ async def main() -> None:
 
         # Stop health server
         health_server.stop()
+
+    # Force-flush and shut down the meter provider last, so any metrics recorded during
+    # the teardown sequence above still land in the final export.
+    shutdown_telemetry()
 
 
 def cli() -> None:

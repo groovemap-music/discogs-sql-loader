@@ -4,10 +4,42 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from common import telemetry as common_telemetry
+from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+from tableinator import telemetry as tableinator_telemetry
 
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from opentelemetry.sdk.metrics.export import Metric
+
+
+# Every standard OpenTelemetry variable that changes what the SDK records or exports.
+# The telemetry suites assert on what an in-memory provider recorded, so the ambient
+# environment (a developer's shell, or CI's own OTEL_SDK_DISABLED=true for its own
+# instrumentation) must never leak in and turn every instrument into a no-op or point
+# it at a real collector.
+OTEL_ENVIRONMENT = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_METRICS_EXEMPLAR_FILTER",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_SDK_DISABLED",
+    "OTEL_SERVICE_NAME",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_otel_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run every test against a known-empty OpenTelemetry configuration."""
+    for name in OTEL_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -139,3 +171,50 @@ def mock_async_pool():
         return mock_pool
 
     return create_pool
+
+
+class MetricsCollector:
+    """An in-memory MeterProvider plus helpers for reading what was recorded."""
+
+    def __init__(self) -> None:
+        self.reader = InMemoryMetricReader()
+        self.provider = SdkMeterProvider(metric_readers=[self.reader])
+
+    def metrics(self) -> dict[str, Metric]:
+        """Collect once and return every recorded metric by name."""
+        data = self.reader.get_metrics_data()
+        if data is None:
+            return {}
+        return {
+            metric.name: metric
+            for resource_metrics in data.resource_metrics
+            for scope_metrics in resource_metrics.scope_metrics
+            for metric in scope_metrics.metrics
+        }
+
+    def points(self, name: str) -> list[Any]:
+        """Return the data points recorded for one metric name."""
+        metric = self.metrics().get(name)
+        return [] if metric is None else list(metric.data.data_points)
+
+    def attributes(self, name: str) -> list[dict[str, Any]]:
+        """Return the attribute dicts recorded for one metric name, in recording order."""
+        return [dict(point.attributes) for point in self.points(name)]
+
+
+@pytest.fixture
+def metrics_collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[MetricsCollector]:
+    """Install an in-memory provider and make tableinator's instruments build against it.
+
+    Mirrors groovemap-runtime's own `collector` fixture (tests/test_runtime_metrics.py)
+    so tableinator's domain instruments and the shared wrappers can be asserted on with
+    the same pattern.
+    """
+    active = MetricsCollector()
+    monkeypatch.setattr(common_telemetry, "_provider", active.provider)
+    monkeypatch.setattr(common_telemetry, "_generation", common_telemetry.provider_generation() + 1)
+    tableinator_telemetry.reset_instruments()
+    assert common_telemetry._active_provider() is active.provider
+    yield active
+    monkeypatch.setattr(common_telemetry, "_provider", None)
+    tableinator_telemetry.reset_instruments()
