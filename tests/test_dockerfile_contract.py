@@ -2,6 +2,7 @@
 
 import re
 import shlex
+import tomllib
 from pathlib import Path
 
 
@@ -54,3 +55,24 @@ def test_image_does_not_persist_credential_placeholders() -> None:
         if instruction.startswith("ENV "):
             keys = (assignment.split("=", 1)[0] for assignment in shlex.split(instruction.removeprefix("ENV ")))
             assert not [key for key in keys if SENSITIVE_ENV.search(key)]
+
+
+def test_runtime_wheel_install_extras_match_pyproject() -> None:
+    """The production image installs the runtime wheel directly, not via pyproject's
+    own dependency resolution — so the extras named on the Dockerfile's `uv pip
+    install` line must be kept in lockstep with pyproject.toml by hand. A drift here
+    silently ships a production image missing a capability (gm-discogs-sql-loader-ce6.1:
+    the otel extra was missing, so no metric in the OTEL-metrics program ever left the
+    container)."""
+    dockerfile_match = re.search(r"-print -quit\)\"\)\[([\w,]+)\]\"", DOCKERFILE)
+    assert dockerfile_match, "could not find the runtime wheel install line's extras in the Dockerfile"
+    dockerfile_extras = set(dockerfile_match.group(1).split(","))
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    dependencies = pyproject["project"]["dependencies"]
+    runtime_dependency = next(dep for dep in dependencies if dep.startswith("groovemap-runtime["))
+    pyproject_match = re.search(r"groovemap-runtime\[([\w,]+)\]", runtime_dependency)
+    assert pyproject_match
+    pyproject_extras = set(pyproject_match.group(1).split(","))
+
+    assert dockerfile_extras == pyproject_extras
