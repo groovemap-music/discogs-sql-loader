@@ -10,10 +10,11 @@
     "package": "groovemap-runtime",
     "required_capabilities": [
       "neo4j",
+      "otel",
       "postgres"
     ],
     "tested_version": "0.1.0",
-    "tested_commit": "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
+    "tested_commit": "3c8309bfb6123b2c85107e949e9d626e3193db6d"
   },
   "contract": "groovemap.persistence",
   "owners": [
