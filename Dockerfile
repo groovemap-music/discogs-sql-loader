@@ -12,7 +12,7 @@ COPY pyproject.toml README.md LICENSE ./
 COPY tableinator/ ./tableinator/
 
 RUN uv venv /app/.venv && \
-    uv pip install --python /app/.venv/bin/python "/wheels/$(basename "$(find /wheels -name '*.whl' -print -quit)")[postgres,rabbitmq]" && \
+    uv pip install --python /app/.venv/bin/python "/wheels/$(basename "$(find /wheels -name '*.whl' -print -quit)")[otel,postgres,rabbitmq]" && \
     uv pip install --python /app/.venv/bin/python --no-deps . && \
     find /app/.venv -type f -name '*.py[co]' -delete && \
     find /app/.venv -type d -name __pycache__ -prune -exec rm -rf '{}' +
