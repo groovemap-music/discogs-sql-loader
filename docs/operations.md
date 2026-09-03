@@ -65,6 +65,38 @@ preferred for deployed containers.
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
 | `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (metrics disabled) | Collector base URL, e.g. `http://otel-collector:4318` |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | falls back to the endpoint above | Metrics-only collector override |
+| `OTEL_METRICS_EXPORTER` | `otlp` | `none` forces metrics export off |
+| `OTEL_METRIC_EXPORT_INTERVAL` | SDK default | Push interval, in milliseconds |
+| `OTEL_SERVICE_NAME` | `tableinator` | Overrides the `service.name` resource attribute |
+| `OTEL_RESOURCE_ATTRIBUTES` | empty | Extra resource attributes, e.g. `service.namespace=groovemap,deployment.environment.name=dev` |
+
+## Telemetry
+
+`setup_telemetry("tableinator")` runs immediately after `setup_logging`; `shutdown_telemetry()`
+runs during graceful shutdown so the final export lands. With `OTEL_EXPORTER_OTLP_ENDPOINT`
+unset (the default), telemetry installs a no-op `MeterProvider` and the service behaves exactly
+as it does without the `otel` extra. The service does not expose a Prometheus `/metrics` scrape
+endpoint for these metrics; the health server's own `/health` route is unaffected.
+
+Instruments recorded from the per-message handler and the batch processor:
+
+| Metric | Attributes |
+| --- | --- |
+| `groovemap.pipeline.messages` | `source=discogs`, `entity`, `outcome=processed\|skipped\|failed` |
+| `groovemap.pipeline.message.duration` | `source`, `entity` |
+| `groovemap.pipeline.batch.size` | `store=postgresql`, `entity` |
+| `groovemap.pipeline.batch.flush.duration` | `store=postgresql`, `entity`, `outcome=success\|failed` |
+| `groovemap.pipeline.consumers.active` | `source=discogs` |
+
+`messaging.client.consumed.messages` and `messaging.client.operation.duration` are recorded
+locally with the same names and attributes the shared `groovemap-runtime` wrappers would emit,
+because this service consumes via `queue.consume(handler)` directly rather than through
+`common.process_message_with_retry`. `db.client.operation.duration` and
+`groovemap.pipeline.reconnects` are emitted for free by `AsyncPostgreSQLPool` and
+`AsyncResilientRabbitMQ`, which every database and broker call in this service already goes
+through.
 
 ## Completion and restart behavior
 
