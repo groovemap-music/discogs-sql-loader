@@ -30,11 +30,13 @@ async def test_shutdown_cancels_every_consumer_before_connection_close() -> None
         patch.object(service, "consumer_tags", dict(tags)),
         patch.object(service, "queues", dict.fromkeys(tags, queue)),
         patch.object(service, "logger"),
+        patch.object(service.telemetry, "record_consumer_stopped") as mock_record_stopped,
     ):
         await service.cancel_all_consumers()
         assert {call.args[0] for call in queue.cancel.call_args_list} == set(tags.values())
         assert all(call.kwargs["nowait"] is True for call in queue.cancel.call_args_list)
         assert service.consumer_tags == {}
+        assert mock_record_stopped.call_count == len(tags)
 
 
 @pytest.mark.asyncio
