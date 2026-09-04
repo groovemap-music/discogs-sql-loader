@@ -30,13 +30,9 @@ from tableinator import telemetry
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
-    DATA_TYPES,
 )
 from tableinator.catalog_contract import (
-    dead_letter_exchange_name as catalog_dead_letter_exchange_name,
-)
-from tableinator.catalog_contract import (
-    dead_letter_queue_name as catalog_dead_letter_queue_name,
+    ENTITY_TYPES as DATA_TYPES,
 )
 from tableinator.catalog_contract import (
     exchange_name as catalog_exchange_name,
@@ -45,6 +41,12 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
+from tableinator.queue_names import (
+    dead_letter_exchange_name as catalog_dead_letter_exchange_name,
+)
+from tableinator.queue_names import (
+    dead_letter_queue_name as catalog_dead_letter_queue_name,
+)
 
 
 if TYPE_CHECKING:
@@ -479,7 +481,7 @@ async def _recover_consumers() -> None:
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
             for data_type in DATA_TYPES:
-                exchange_name = catalog_exchange_name("discogs", data_type)
+                exchange_name = catalog_exchange_name(data_type)
                 queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
                 dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_NAME, data_type)
                 dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_NAME, data_type)
@@ -1258,7 +1260,7 @@ async def main() -> None:
         # Declare per-data-type fanout exchanges and consumer-owned queues
         queues = {}
         for data_type in DATA_TYPES:
-            exchange_name = catalog_exchange_name("discogs", data_type)
+            exchange_name = catalog_exchange_name(data_type)
             queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
             dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_NAME, data_type)
             dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_NAME, data_type)
