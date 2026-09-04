@@ -83,6 +83,21 @@ class TestMediaForRelease:
         assert block["items"] == []
         assert block["unmapped"]["formats"] == []
 
+    def test_mixed_formats_entries_fall_back_to_name_only_mapper(self) -> None:
+        """A `formats` list mixing a mapping entry with a non-mapping entry takes the
+        name-only fallback -- not the structured mapper -- so `qty` is *not* preserved.
+
+        Requiring every entry to be a mapping (not just one) matches the graph-side
+        mapper's routing for the same event; otherwise a mixed list like this would
+        derive `qty: 2` here and `qty: 1` on the graph side for the same input.
+        """
+        data = {"id": "1", "formats": [{"name": "Vinyl", "qty": "2"}, "Album"]}
+
+        block = media_for_release(data)
+
+        assert len(block["items"]) == 1
+        assert block["items"][0]["qty"] == 1
+
     def test_unmapped_only_formats_still_derive_a_block(self) -> None:
         """A format name the vocabulary does not know yields an empty-but-present block."""
         data = {"id": "1", "formats": [{"name": "Zorbatron"}]}
