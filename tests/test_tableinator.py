@@ -2211,6 +2211,12 @@ class TestOnDataMessageReleaseMedia:
     otherwise a best-effort one derived from the raw `formats` list.
     """
 
+    # The releases upsert binds (data_id, hash, data_id, data, media, hash): the
+    # `prior` CTE's lookup key comes first and its hash comparison last, bracketing
+    # the INSERT's own four values.
+    _DATA_PARAM = 3
+    _MEDIA_PARAM = 4
+
     @staticmethod
     def _release_data(**overrides: Any) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -2255,9 +2261,9 @@ class TestOnDataMessageReleaseMedia:
 
         query, params = cursor.execute.call_args[0]
         assert "media" in query.as_string(None)
-        assert params[-1].obj == media_block
+        assert params[self._MEDIA_PARAM].obj == media_block
         # `data` itself is untouched — still carries the event's own media key verbatim.
-        assert params[2].obj["media"] == media_block
+        assert params[self._DATA_PARAM].obj["media"] == media_block
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
@@ -2268,7 +2274,7 @@ class TestOnDataMessageReleaseMedia:
 
         cursor = await self._upsert(data, mock_async_pool)
 
-        derived = cursor.execute.call_args[0][1][-1].obj
+        derived = cursor.execute.call_args[0][1][self._MEDIA_PARAM].obj
         assert derived["families"] == ["vinyl"]
         assert derived["items"][0]["medium"] == "vinyl_12"
         assert derived["items"][0]["source"]["descriptions"] == ["LP"]
@@ -2281,7 +2287,7 @@ class TestOnDataMessageReleaseMedia:
 
         cursor = await self._upsert(data, mock_async_pool)
 
-        derived = cursor.execute.call_args[0][1][-1].obj
+        derived = cursor.execute.call_args[0][1][self._MEDIA_PARAM].obj
         assert derived["items"] == []
         assert derived["families"] == []
         assert "Zorbatron" in derived["unmapped"]["formats"] or "Zorbatron" in derived["unmapped"]["descriptions"]
@@ -2295,8 +2301,8 @@ class TestOnDataMessageReleaseMedia:
         cursor_first = await self._upsert(data, mock_async_pool)
         cursor_second = await self._upsert(data, mock_async_pool)
 
-        media_first = cursor_first.execute.call_args[0][1][-1].obj
-        media_second = cursor_second.execute.call_args[0][1][-1].obj
+        media_first = cursor_first.execute.call_args[0][1][self._MEDIA_PARAM].obj
+        media_second = cursor_second.execute.call_args[0][1][self._MEDIA_PARAM].obj
         assert media_first == media_second
 
     @pytest.mark.asyncio
@@ -2323,6 +2329,136 @@ class TestOnDataMessageReleaseMedia:
         query, params = mock_cursor.execute.call_args[0]
         assert "media" not in query.as_string(None)
         assert len(params) == 3
+
+
+class TestOnDataMessageMediaBackfill:
+    """The non-batch upsert must fill a NULL `media` on a hash-unchanged row.
+
+    `POSTGRES_BATCH_MODE=false` selects this path in production, and it gates the
+    `media` rewrite on hash inequality exactly as the batch path did. A row persisted
+    before the column existed carries a hash its payload already agrees with, so that
+    gate alone would leave the indexed column NULL forever (ADR 0007). The statement
+    therefore also rewrites `media` when it IS NULL, and reads the pre-write state
+    through a CTE so the write can be reported as `media_backfilled`.
+    """
+
+    @staticmethod
+    async def _upsert(data: dict[str, Any], mock_async_pool: Any, prior_state: tuple[bool] | None) -> tuple[MagicMock, list[str]]:
+        """Send one `releases` message through the non-batch path.
+
+        `prior_state` is what the statement's trailing SELECT answers -- `(True,)` for a
+        row whose hash matched and whose `media` was NULL, `(False,)` otherwise, `None`
+        for a release that did not exist yet. Returns the cursor and the outcomes
+        recorded for the delivery.
+        """
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(data).encode()
+        mock_message.routing_key = "releases"
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=prior_state)
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection = MagicMock()
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+
+        pool = mock_async_pool(mock_connection)
+        with (
+            patch("tableinator.tableinator.connection_pool", pool),
+            patch("tableinator.tableinator.telemetry.record_message") as record_message,
+        ):
+            await on_data_message(mock_message, "releases")
+
+        mock_message.ack.assert_called_once()
+        return mock_cursor, [call_args[0][1] for call_args in record_message.call_args_list]
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_media_rewrite_is_no_longer_gated_on_hash_alone(self, mock_async_pool: Any) -> None:
+        """`media` also rewrites when it IS NULL; `hash` and `data` stay hash-gated."""
+        cursor, _outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True,))
+
+        query = cursor.execute.call_args[0][0].as_string(None)
+        assert 'media = CASE WHEN "releases".hash != EXCLUDED.hash OR "releases".media IS NULL' in query
+        assert 'hash = CASE WHEN "releases".hash != EXCLUDED.hash THEN' in query
+        assert 'data = CASE WHEN "releases".hash != EXCLUDED.hash THEN' in query
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_prior_state_is_read_in_the_same_round_trip(self, mock_async_pool: Any) -> None:
+        """One statement, not two: the CTE reads the pre-write row alongside the write."""
+        cursor, _outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True,))
+
+        assert cursor.execute.call_count == 1
+        query = cursor.execute.call_args[0][0].as_string(None)
+        assert query.startswith("WITH prior AS (")
+        assert "media IS NULL AS prior_media_is_null" in query
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_unchanged_hash_with_null_media_is_reported_as_backfilled(self, mock_async_pool: Any) -> None:
+        """Unchanged hash + NULL media reports `media_backfilled`, not `processed`."""
+        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True,))
+
+        assert outcomes == ["media_backfilled"]
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_unchanged_hash_with_media_present_is_reported_as_processed(self, mock_async_pool: Any) -> None:
+        """A row that already has media took no media write, so it is not a backfill."""
+        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(False,))
+
+        assert outcomes == ["processed"]
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_absent_row_is_reported_as_processed(self, mock_async_pool: Any) -> None:
+        """A release that did not exist yet is an ordinary insert."""
+        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=None)
+
+        assert outcomes == ["processed"]
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_backfill_flag_is_read_strictly_as_a_boolean(self, mock_async_pool: Any) -> None:
+        """A truthy non-boolean must not be mistaken for a backfill.
+
+        The trailing SELECT yields a SQL boolean; anything else means the cursor was
+        not answering this query, and reporting it as a backfill would be a lie.
+        """
+        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=("yes",))  # type: ignore[arg-type]
+
+        assert outcomes == ["processed"]
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_non_release_entity_keeps_the_plain_statement(self, sample_artist_data: dict[str, Any], mock_async_pool: Any) -> None:
+        """Only `releases` has a media column, so no other table grows the CTE."""
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(sample_artist_data).encode()
+        mock_message.routing_key = "artists"
+
+        mock_cursor = AsyncMock()
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection = MagicMock()
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+
+        pool = mock_async_pool(mock_connection)
+        with (
+            patch("tableinator.tableinator.connection_pool", pool),
+            patch("tableinator.tableinator.telemetry.record_message") as record_message,
+        ):
+            await on_data_message(mock_message, "artists")
+
+        query = mock_cursor.execute.call_args[0][0].as_string(None)
+        assert "WITH prior" not in query
+        assert "media" not in query
+        assert [call_args[0][1] for call_args in record_message.call_args_list] == ["processed"]
 
 
 class TestOnDataMessageFileCompletion:

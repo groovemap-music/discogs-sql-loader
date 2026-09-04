@@ -55,10 +55,11 @@ connect to live PostgreSQL or RabbitMQ services.
   almost-complete table.
 - A record whose hash is unchanged normally refreshes only `updated_at`. The one
   exception is a `releases` row left with a NULL `media` column by a loader that predates
-  the canonical media taxonomy: the batch path derives the block and writes that column
-  in place. On an upgraded stack, a `force_reprocess` run therefore backfills `media`
-  across the existing catalog without rewriting payloads that have not changed. Those
-  rows are counted and logged as `media_backfilled` rather than `skipped`.
+  the canonical media taxonomy: both write paths derive the block and fill that column in
+  place, leaving `hash` and `data` alone. On an upgraded stack, a `force_reprocess` run
+  therefore backfills `media` across the existing catalog without rewriting payloads that
+  have not changed. Those rows are reported as `media_backfilled` rather than `skipped`
+  or `processed`.
 
 See [Operations](docs/operations.md) for configuration, input and output details,
 completion semantics, health states, and troubleshooting. The
