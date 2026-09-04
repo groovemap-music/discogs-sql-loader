@@ -30,13 +30,9 @@ from tableinator import telemetry
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
-    DATA_TYPES,
 )
 from tableinator.catalog_contract import (
-    dead_letter_exchange_name as catalog_dead_letter_exchange_name,
-)
-from tableinator.catalog_contract import (
-    dead_letter_queue_name as catalog_dead_letter_queue_name,
+    ENTITY_TYPES as DATA_TYPES,
 )
 from tableinator.catalog_contract import (
     exchange_name as catalog_exchange_name,
@@ -45,6 +41,13 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
+from tableinator.media import media_for_release
+from tableinator.queue_names import (
+    dead_letter_exchange_name as catalog_dead_letter_exchange_name,
+)
+from tableinator.queue_names import (
+    dead_letter_queue_name as catalog_dead_letter_queue_name,
+)
 
 
 if TYPE_CHECKING:
@@ -479,7 +482,7 @@ async def _recover_consumers() -> None:
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
             for data_type in DATA_TYPES:
-                exchange_name = catalog_exchange_name("discogs", data_type)
+                exchange_name = catalog_exchange_name(data_type)
                 queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
                 dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_NAME, data_type)
                 dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_NAME, data_type)
@@ -932,23 +935,52 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             # Conditional upsert: only rewrites hash and data when hash differs,
             # but always refreshes updated_at so post-extraction stale row
             # purge does not delete unchanged-but-still-present records.
-            await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                sql.SQL(
-                    "INSERT INTO {table} (hash, data_id, data, updated_at) "
-                    "VALUES (%s, %s, %s, NOW()) "
-                    "ON CONFLICT (data_id) DO UPDATE "
-                    "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
-                    "THEN EXCLUDED.hash ELSE {table}.hash END, "
-                    "data = CASE WHEN {table}.hash != EXCLUDED.hash "
-                    "THEN EXCLUDED.data ELSE {table}.data END, "
-                    "updated_at = NOW();"
-                ).format(table=sql.Identifier(data_type)),
-                (
-                    data.get("sha256", ""),
-                    data_id,
-                    Jsonb(data),
-                ),
-            )
+            #
+            # releases additionally carries the indexed `media` column (ADR 0007):
+            # the API filters on it, not on data->'media'. It follows the same
+            # hash-gated rewrite as `data` so it never drifts from the payload
+            # it was derived from, and it is never NULL for a row this loader
+            # writes — media_for_release() derives a best-effort block from the
+            # raw `formats` list when the event predates the canonical field.
+            if data_type == "releases":
+                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
+                    sql.SQL(
+                        "INSERT INTO {table} (hash, data_id, data, media, updated_at) "
+                        "VALUES (%s, %s, %s, %s, NOW()) "
+                        "ON CONFLICT (data_id) DO UPDATE "
+                        "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
+                        "THEN EXCLUDED.hash ELSE {table}.hash END, "
+                        "data = CASE WHEN {table}.hash != EXCLUDED.hash "
+                        "THEN EXCLUDED.data ELSE {table}.data END, "
+                        "media = CASE WHEN {table}.hash != EXCLUDED.hash "
+                        "THEN EXCLUDED.media ELSE {table}.media END, "
+                        "updated_at = NOW();"
+                    ).format(table=sql.Identifier(data_type)),
+                    (
+                        data.get("sha256", ""),
+                        data_id,
+                        Jsonb(data),
+                        Jsonb(media_for_release(data)),
+                    ),
+                )
+            else:
+                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
+                    sql.SQL(
+                        "INSERT INTO {table} (hash, data_id, data, updated_at) "
+                        "VALUES (%s, %s, %s, NOW()) "
+                        "ON CONFLICT (data_id) DO UPDATE "
+                        "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
+                        "THEN EXCLUDED.hash ELSE {table}.hash END, "
+                        "data = CASE WHEN {table}.hash != EXCLUDED.hash "
+                        "THEN EXCLUDED.data ELSE {table}.data END, "
+                        "updated_at = NOW();"
+                    ).format(table=sql.Identifier(data_type)),
+                    (
+                        data.get("sha256", ""),
+                        data_id,
+                        Jsonb(data),
+                    ),
+                )
 
             # Commit is automatic when exiting the connection context
             logger.debug(
@@ -1258,7 +1290,7 @@ async def main() -> None:
         # Declare per-data-type fanout exchanges and consumer-owned queues
         queues = {}
         for data_type in DATA_TYPES:
-            exchange_name = catalog_exchange_name("discogs", data_type)
+            exchange_name = catalog_exchange_name(data_type)
             queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
             dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_NAME, data_type)
             dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_NAME, data_type)

@@ -790,7 +790,8 @@ Notes:
 
 - `year` is parsed from the `released` date field (`"1969-09-26"` -> `1969`) by `_parse_year_int()`.
 - `master_id` is extracted from the `#text` field of the dict.
-- `formats` is unwrapped into an array with `@`-prefixed keys stripped at the top level (nested objects like `descriptions` are left as-is — the extractor's prefix-stripping does not recurse); `discogs-graph-enricher` then pulls each item's `name` field inline in `process_release()` to produce `["Vinyl"]` for storage on the Release node (not deduplicated).
+- `formats` is unwrapped into an array with `@`-prefixed keys stripped at the top level (nested objects like `descriptions` are left as-is — the extractor's prefix-stripping does not recurse); `discogs-graph-enricher` then pulls each item's `name` field inline in `process_release()` to produce `["Vinyl"]` for storage on the Release node (not deduplicated). Per [ADR 0007](https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md), `formats` is the **raw provenance record** for media: it is never renamed or dropped, but the canonical, queryable representation is the `media` block below and, in PostgreSQL, the [`releases.media` column](#entity-tables-artists-labels-masters-releases).
+- `media` (present on events from a Discogs producer that has adopted ADR 0007) is an additive top-level canonical media block — `taxonomy_version`, `items` (one per medium, with `family`, `medium`, `qty`, and other derived attributes), `families`, `release_kind`, `traits`, `edition`, `packaging`, `container`, `flags`, and `unmapped`. See the [media block JSON Schema](https://github.com/groovemap-music/design/blob/main/taxonomy/media/v1/media-block.schema.json) for the full shape. An event published before that adoption omits `media` entirely; `tableinator/media.py::media_for_release()` derives a best-effort block for it from the raw `formats` list via the vendored `common.media.legacy_format_names_to_media()` helper, so `releases.media` is never NULL for a row this loader writes.
 
 ### XML-to-JSON Conventions
 
@@ -836,6 +837,21 @@ CREATE INDEX IF NOT EXISTS idx_<entity>_updated_at ON <entity> (updated_at);
 The `data` column stores the **full normalized record** from `normalize_record()`, not just the properties written to Neo4j. This means PostgreSQL has access to all fields (profile, tracklist, notes, etc.) while Neo4j only stores the subset needed for graph traversal.
 
 The `updated_at` column is refreshed to `NOW()` on every upsert — even when the row's hash is unchanged — so the [post-extraction cleanup](#post-extraction-cleanup) can correctly identify stale rows. The `hash` and `data` columns are only rewritten when the hash actually differs, avoiding unnecessary WAL traffic for the large JSONB payload.
+
+##### `releases.media`
+
+`releases` additionally carries an indexed `media JSONB NOT NULL` column (the `database-schema` repository's persistence contract, per [ADR 0007](https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md)):
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_releases_media_families ON releases USING GIN ((media->'families'));
+```
+
+Product queries filter on this column — `media->'families'` and the medium ids inside `media->'items'` — not on `data->'media'`, so the API never has to reach into the full JSONB payload for a media lookup. Both `tableinator.py` (the non-batch upsert) and `batch_processor.py` (the bulk upsert) write it alongside `data` for every `releases` message:
+
+- When the event carries its own canonical `media` block (a Discogs producer that has adopted ADR 0007), that block is written verbatim.
+- When the event predates the field, `tableinator/media.py::media_for_release()` derives a best-effort block from the raw `formats` list — see [`formats` is the raw provenance record](#raw-release-message) above.
+
+`media` follows the same hash-gated rewrite as `data`: it is only recomputed and rewritten when the row's `hash` actually changes, and it is never left NULL for a row this loader writes. `data` itself is never rewritten to hold or omit `media` beyond whatever the source event carried — this column is additive, computed separately.
 
 #### Entity-Specific Indexes
 

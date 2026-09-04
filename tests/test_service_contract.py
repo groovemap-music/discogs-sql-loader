@@ -3,7 +3,9 @@
 from pathlib import Path
 
 import tableinator.tableinator as service
-from tableinator.catalog_contract import AMQP_EXCHANGE_TYPE, DATA_TYPES, DISCOGS_EXCHANGE_PREFIX
+from tableinator.catalog_contract import AMQP_EXCHANGE_TYPE
+from tableinator.catalog_contract import ENTITY_TYPES as DATA_TYPES
+from tableinator.catalog_contract import EXCHANGE_PREFIX as DISCOGS_EXCHANGE_PREFIX
 
 
 ROOT = Path(__file__).parent.parent

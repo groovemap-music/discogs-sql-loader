@@ -2203,6 +2203,128 @@ class TestOnDataMessageDatabaseOperations:
         assert any("Failed to nack message" in str(call) for call in mock_logger.warning.call_args_list)
 
 
+class TestOnDataMessageReleaseMedia:
+    """releases.media (ADR 0007): the non-batch upsert must never leave it NULL.
+
+    The API filters on the indexed `releases.media` column, not on `data->'media'`, so every
+    release write carries a `media` parameter: the event's own canonical block when present,
+    otherwise a best-effort one derived from the raw `formats` list.
+    """
+
+    @staticmethod
+    def _release_data(**overrides: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": "123456",
+            "title": "Abbey Road",
+            "sha256": "abc123def456",
+            "formats": [{"name": "Vinyl", "qty": "1", "descriptions": {"description": "LP"}}],
+        }
+        data.update(overrides)
+        return data
+
+    @staticmethod
+    async def _upsert(data: dict[str, Any], mock_async_pool: Any) -> MagicMock:
+        """Send one `releases` message through on_data_message; return the mock cursor."""
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(data).encode()
+        mock_message.routing_key = "releases"
+
+        mock_cursor = AsyncMock()
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection = MagicMock()
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+
+        pool = mock_async_pool(mock_connection)
+        with patch("tableinator.tableinator.connection_pool", pool):
+            await on_data_message(mock_message, "releases")
+
+        mock_message.ack.assert_called_once()
+        return mock_cursor
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_media_present_is_written_verbatim(self, mock_async_pool: Any) -> None:
+        """An event that already carries `media` writes it through unchanged."""
+        media_block = {"taxonomy_version": "1", "items": [], "families": ["vinyl"]}
+        data = self._release_data(media=media_block)
+
+        cursor = await self._upsert(data, mock_async_pool)
+
+        query, params = cursor.execute.call_args[0]
+        assert "media" in query.as_string(None)
+        assert params[-1].obj == media_block
+        # `data` itself is untouched — still carries the event's own media key verbatim.
+        assert params[2].obj["media"] == media_block
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_media_absent_is_derived_from_formats(self, mock_async_pool: Any) -> None:
+        """An event predating `media` derives a block from the raw `formats` list."""
+        data = self._release_data()  # no "media" key; formats: [{"name": "Vinyl", ...}]
+        assert "media" not in data
+
+        cursor = await self._upsert(data, mock_async_pool)
+
+        derived = cursor.execute.call_args[0][1][-1].obj
+        assert derived["families"] == ["vinyl"]
+        assert derived["items"][0]["medium"] == "vinyl_12"
+        assert derived["items"][0]["source"]["descriptions"] == ["LP"]
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_unmapped_only_formats_still_write_a_block(self, mock_async_pool: Any) -> None:
+        """A format the vocabulary does not know still yields a (non-None) block."""
+        data = self._release_data(formats=[{"name": "Zorbatron"}])
+
+        cursor = await self._upsert(data, mock_async_pool)
+
+        derived = cursor.execute.call_args[0][1][-1].obj
+        assert derived["items"] == []
+        assert derived["families"] == []
+        assert "Zorbatron" in derived["unmapped"]["formats"] or "Zorbatron" in derived["unmapped"]["descriptions"]
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_repeated_upsert_is_idempotent(self, mock_async_pool: Any) -> None:
+        """Re-upserting the same event twice derives the same `media` block both times."""
+        data = self._release_data()
+
+        cursor_first = await self._upsert(data, mock_async_pool)
+        cursor_second = await self._upsert(data, mock_async_pool)
+
+        media_first = cursor_first.execute.call_args[0][1][-1].obj
+        media_second = cursor_second.execute.call_args[0][1][-1].obj
+        assert media_first == media_second
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_non_release_entity_gets_no_media_parameter(self, sample_artist_data: dict[str, Any], mock_async_pool: Any) -> None:
+        """Non-release entities keep the original 3-parameter upsert, unchanged."""
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(sample_artist_data).encode()
+        mock_message.routing_key = "artists"
+
+        mock_cursor = AsyncMock()
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection = MagicMock()
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+
+        pool = mock_async_pool(mock_connection)
+        with patch("tableinator.tableinator.connection_pool", pool):
+            await on_data_message(mock_message, "artists")
+
+        mock_message.ack.assert_called_once()
+        query, params = mock_cursor.execute.call_args[0]
+        assert "media" not in query.as_string(None)
+        assert len(params) == 3
+
+
 class TestOnDataMessageFileCompletion:
     """Test file completion handling in on_data_message."""
 
