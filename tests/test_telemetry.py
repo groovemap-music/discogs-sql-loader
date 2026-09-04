@@ -164,7 +164,7 @@ class TestBatchProcessorTelemetry:
     """The batch processor records the domain instruments at each terminal flush."""
 
     @staticmethod
-    def _connection_pool(fetchall_result: list[tuple[str, str]]) -> MagicMock:
+    def _connection_pool(fetchall_result: list[tuple[Any, ...]]) -> MagicMock:
         mock_connection = AsyncMock()
         mock_cursor = AsyncMock()
         mock_cursor.fetchall = AsyncMock(return_value=fetchall_result)
@@ -211,6 +211,24 @@ class TestBatchProcessorTelemetry:
         assert metrics_collector.attributes(telemetry.PIPELINE_BATCH_FLUSH_DURATION) == [
             {"store": "postgresql", "entity": "artists", "outcome": "success"}
         ]
+
+    @pytest.mark.asyncio
+    async def test_media_backfill_is_recorded_apart_from_a_plain_skip(self, metrics_collector: MetricsCollector) -> None:
+        """A hash-unchanged `releases` row whose NULL `media` this flush filled is
+        recorded as `media_backfilled`, not folded into `skipped` (ADR 0007). Both rows
+        match on hash; only "1" still has a NULL media column."""
+        pool = self._connection_pool([("1", "abc", True), ("2", "def", False)])
+        processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
+
+        release = {"id": "1", "formats": [{"name": "Vinyl", "qty": "1"}]}
+        processor.queues["releases"].append(PendingMessage("releases", "1", release, "abc", AsyncMock(), AsyncMock()))
+        processor.queues["releases"].append(PendingMessage("releases", "2", dict(release, id="2"), "def", AsyncMock(), AsyncMock()))
+
+        with patch("tableinator.batch_processor.logger"):
+            await processor._flush_queue("releases")
+
+        outcomes = {attrs["outcome"] for attrs in metrics_collector.attributes(telemetry.PIPELINE_MESSAGES)}
+        assert outcomes == {"media_backfilled", "skipped"}
 
     @pytest.mark.asyncio
     async def test_poison_batch_records_failed_and_flush_failure(self, metrics_collector: MetricsCollector) -> None:

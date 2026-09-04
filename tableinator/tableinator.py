@@ -931,6 +931,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         if connection_pool is None:
             raise RuntimeError("Connection pool not initialized")
 
+        terminal_outcome = "processed"
         async with connection_pool.connection() as conn, conn.cursor() as cursor:
             # Conditional upsert: only rewrites hash and data when hash differs,
             # but always refreshes updated_at so post-extraction stale row
@@ -938,13 +939,26 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             #
             # releases additionally carries the indexed `media` column (ADR 0007):
             # the API filters on it, not on data->'media'. It follows the same
-            # hash-gated rewrite as `data` so it never drifts from the payload
-            # it was derived from, and it is never NULL for a row this loader
-            # writes — media_for_release() derives a best-effort block from the
-            # raw `formats` list when the event predates the canonical field.
+            # hash-gated rewrite as `data` so it never drifts from the payload it
+            # was derived from, with ONE exception: a row persisted before the
+            # column existed has a hash its payload already agrees with, so the
+            # hash gate alone would leave `media` NULL forever. `OR media IS NULL`
+            # backfills exactly those rows, mirroring batch_processor.py's
+            # media-only UPDATE. media_for_release() derives a best-effort block
+            # from the raw `formats` list when the event predates the field, so
+            # the column is never NULL for a row this loader writes.
+            #
+            # The `prior` CTE reads the pre-write state in the SAME round trip --
+            # a WITH sub-statement cannot see the sibling INSERT's effects -- so
+            # this write can be reported as `media_backfilled` rather than
+            # `processed` without a second query per message.
             if data_type == "releases":
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
                     sql.SQL(
+                        "WITH prior AS ("
+                        "SELECT hash AS prior_hash, media IS NULL AS prior_media_is_null "
+                        "FROM {table} WHERE data_id = %s"
+                        "), upserted AS ("
                         "INSERT INTO {table} (hash, data_id, data, media, updated_at) "
                         "VALUES (%s, %s, %s, %s, NOW()) "
                         "ON CONFLICT (data_id) DO UPDATE "
@@ -952,17 +966,30 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                         "THEN EXCLUDED.hash ELSE {table}.hash END, "
                         "data = CASE WHEN {table}.hash != EXCLUDED.hash "
                         "THEN EXCLUDED.data ELSE {table}.data END, "
-                        "media = CASE WHEN {table}.hash != EXCLUDED.hash "
+                        "media = CASE WHEN {table}.hash != EXCLUDED.hash OR {table}.media IS NULL "
                         "THEN EXCLUDED.media ELSE {table}.media END, "
-                        "updated_at = NOW();"
+                        "updated_at = NOW() "
+                        "RETURNING 1"
+                        ") "
+                        "SELECT COALESCE(prior.prior_hash = %s, false) AND prior.prior_media_is_null "
+                        "FROM prior;"
                     ).format(table=sql.Identifier(data_type)),
                     (
+                        data_id,
                         data.get("sha256", ""),
                         data_id,
                         Jsonb(data),
                         Jsonb(media_for_release(data)),
+                        data.get("sha256", ""),
                     ),
                 )
+                # No row means the release did not exist yet, so the INSERT wrote
+                # `media` on the normal path. `is True` rather than truthiness:
+                # the column is a SQL boolean, and a test double's cursor must not
+                # be read as a backfill.
+                prior_state = await cursor.fetchone()
+                if prior_state is not None and prior_state[0] is True:
+                    terminal_outcome = "media_backfilled"
             else:
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
                     sql.SQL(
@@ -990,7 +1017,9 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             )
 
         await message.ack()
-        record_terminal("processed")
+        # "media_backfilled" -- the payload's hash already matched, so nothing was
+        # rewritten except the NULL `media` column this write filled (ADR 0007).
+        record_terminal(terminal_outcome)
 
         # PostgreSQL answered — clear the outage backoff.
         outage_backoff.reset()
