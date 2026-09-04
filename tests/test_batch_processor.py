@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import time
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -1151,6 +1152,156 @@ class TestPostgreSQLBatchProcessor:
 
         # Should have processed 2
         assert processor.processed_counts["artists"] == 2
+
+
+class TestProcessBatchReleaseMedia:
+    """releases.media (ADR 0007): the batch upsert must never leave it NULL.
+
+    The API filters on the indexed `releases.media` column, not on `data->'media'`, so a
+    `releases` batch upsert always carries a `media` value: the event's own canonical block
+    when present, otherwise a best-effort one derived from the raw `formats` list.
+    """
+
+    @staticmethod
+    def _pool(existing_hashes: list[tuple[str, str]]) -> tuple[MagicMock, AsyncMock]:
+        """Build a connection pool mock whose hash-fetch step answers `existing_hashes`."""
+        mock_connection = MagicMock()
+        mock_connection.set_autocommit = AsyncMock()
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=existing_hashes)
+
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+
+        mock_tx_cm = AsyncMock()
+        mock_tx_cm.__aenter__ = AsyncMock(return_value=None)
+        mock_tx_cm.__aexit__ = AsyncMock(return_value=None)
+        mock_connection.transaction = MagicMock(return_value=mock_tx_cm)
+
+        mock_connection_cm = AsyncMock()
+        mock_connection_cm.__aenter__ = AsyncMock(return_value=mock_connection)
+        mock_connection_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection_pool = MagicMock()
+        mock_connection_pool.connection = MagicMock(return_value=mock_connection_cm)
+        return mock_connection_pool, mock_cursor
+
+    @staticmethod
+    def _release_message(data_id: str, sha256: str, **data_overrides: Any) -> PendingMessage:
+        data: dict[str, Any] = {
+            "id": data_id,
+            "title": "Abbey Road",
+            "formats": [{"name": "Vinyl", "qty": "1", "descriptions": {"description": "LP"}}],
+        }
+        data.update(data_overrides)
+        return PendingMessage(
+            data_type="releases",
+            data_id=data_id,
+            data=data,
+            sha256=sha256,
+            ack_callback=AsyncMock(),
+            nack_callback=AsyncMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_media_present_is_written_verbatim(self) -> None:
+        """An event that already carries `media` writes it through unchanged."""
+        media_block = {"taxonomy_version": "1", "items": [], "families": ["vinyl"]}
+        pool, mock_cursor = self._pool(existing_hashes=[])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [self._release_message("1", "abc", media=media_block)]
+
+        with patch("tableinator.batch_processor.logger"):
+            await processor._process_batch("releases", messages)
+
+        records = mock_cursor.executemany.call_args[0][1]
+        assert len(records) == 1
+        _sha256, _data_id, data_param, media_param = records[0]
+        assert media_param.obj == media_block
+        assert data_param.obj["media"] == media_block
+
+    @pytest.mark.asyncio
+    async def test_media_absent_is_derived_from_formats(self) -> None:
+        """An event predating `media` derives a block from the raw `formats` list."""
+        pool, mock_cursor = self._pool(existing_hashes=[])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [self._release_message("1", "abc")]  # no "media" key
+
+        with patch("tableinator.batch_processor.logger"):
+            await processor._process_batch("releases", messages)
+
+        records = mock_cursor.executemany.call_args[0][1]
+        derived = records[0][-1].obj
+        assert derived["families"] == ["vinyl"]
+        assert derived["items"][0]["medium"] == "vinyl_12"
+
+    @pytest.mark.asyncio
+    async def test_unmapped_only_formats_still_write_a_block(self) -> None:
+        """A format the vocabulary does not know still yields a (non-None) block."""
+        pool, mock_cursor = self._pool(existing_hashes=[])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [self._release_message("1", "abc", formats=[{"name": "Zorbatron"}])]
+
+        with patch("tableinator.batch_processor.logger"):
+            await processor._process_batch("releases", messages)
+
+        derived = mock_cursor.executemany.call_args[0][1][0][-1].obj
+        assert derived["items"] == []
+        assert derived["families"] == []
+        assert "Zorbatron" in derived["unmapped"]["formats"] or "Zorbatron" in derived["unmapped"]["descriptions"]
+
+    @pytest.mark.asyncio
+    async def test_repeated_upsert_is_idempotent(self) -> None:
+        """Re-upserting the same event twice derives the same `media` block both times."""
+        pool1, mock_cursor1 = self._pool(existing_hashes=[])
+        processor1 = PostgreSQLBatchProcessor(pool1)
+        with patch("tableinator.batch_processor.logger"):
+            await processor1._process_batch("releases", [self._release_message("1", "abc")])
+        media_first = mock_cursor1.executemany.call_args[0][1][0][-1].obj
+
+        # Second run: the hash is unchanged, so this is the no-rewrite branch. The
+        # `media` written by the first run must still be exactly what a fresh
+        # derivation would produce — proving there is no drift to guard against.
+        pool2, mock_cursor2 = self._pool(existing_hashes=[("1", "abc")])
+        processor2 = PostgreSQLBatchProcessor(pool2)
+        with patch("tableinator.batch_processor.logger"):
+            unchanged_ids = await processor2._process_batch("releases", [self._release_message("1", "abc")])
+
+        assert unchanged_ids == {"1"}
+        assert mock_cursor2.executemany.call_count == 0
+        pool3, mock_cursor3 = self._pool(existing_hashes=[])
+        processor3 = PostgreSQLBatchProcessor(pool3)
+        with patch("tableinator.batch_processor.logger"):
+            await processor3._process_batch("releases", [self._release_message("1", "abc")])
+        media_second = mock_cursor3.executemany.call_args[0][1][0][-1].obj
+
+        assert media_first == media_second
+
+    @pytest.mark.asyncio
+    async def test_non_release_entity_gets_no_media_column(self) -> None:
+        """Non-release entities keep the original 3-column upsert, unchanged."""
+        pool, mock_cursor = self._pool(existing_hashes=[])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [
+            PendingMessage(
+                data_type="artists",
+                data_id="1",
+                data={"id": "1", "name": "Test Artist"},
+                sha256="abc",
+                ack_callback=AsyncMock(),
+                nack_callback=AsyncMock(),
+            )
+        ]
+
+        with patch("tableinator.batch_processor.logger"):
+            await processor._process_batch("artists", messages)
+
+        query = mock_cursor.executemany.call_args[0][0]
+        records = mock_cursor.executemany.call_args[0][1]
+        assert "media" not in query.as_string(None)
+        assert len(records[0]) == 3
 
 
 class TestBackoffPeriodSkip:

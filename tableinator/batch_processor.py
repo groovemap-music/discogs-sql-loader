@@ -19,6 +19,7 @@ from psycopg.errors import InterfaceError, OperationalError
 from psycopg.types.json import Jsonb
 
 from tableinator import telemetry
+from tableinator.media import media_for_release
 
 
 if TYPE_CHECKING:
@@ -597,7 +598,9 @@ class PostgreSQLBatchProcessor:
                 existing_hashes = {row[0]: row[1] for row in await cursor.fetchall()}
 
                 # Step 2: Filter to only records that need updating
-                records_to_upsert = []
+                # releases carries an extra `media` value (see below), so a row is either
+                # 3- or 4-tuple depending on data_type.
+                records_to_upsert: list[tuple[Any, ...]] = []
                 unchanged_ids = []
                 for msg in messages:
                     existing_hash = existing_hashes.get(msg.data_id)
@@ -605,7 +608,16 @@ class PostgreSQLBatchProcessor:
                         # Hash unchanged — skip data write but track for updated_at refresh
                         unchanged_ids.append(msg.data_id)
                         continue
-                    records_to_upsert.append((msg.sha256, msg.data_id, Jsonb(msg.data)))
+                    if data_type == "releases":
+                        # releases additionally carries the indexed `media` column
+                        # (ADR 0007): the API filters on it, not on data->'media'.
+                        # media_for_release() writes the event's own canonical block
+                        # verbatim, or derives a best-effort one from the raw
+                        # `formats` list when the event predates the field, so the
+                        # column is never NULL for a row this loader writes.
+                        records_to_upsert.append((msg.sha256, msg.data_id, Jsonb(msg.data), Jsonb(media_for_release(msg.data))))
+                    else:
+                        records_to_upsert.append((msg.sha256, msg.data_id, Jsonb(msg.data)))
 
                 if unchanged_ids:
                     logger.debug(
@@ -624,15 +636,26 @@ class PostgreSQLBatchProcessor:
                     return set(unchanged_ids)
 
                 # Step 3: Bulk upsert using executemany
-                await cursor.executemany(
-                    sql.SQL(
-                        "INSERT INTO {table} (hash, data_id, data, updated_at) "
-                        "VALUES (%s, %s, %s, NOW()) "
-                        "ON CONFLICT (data_id) DO UPDATE "
-                        "SET hash = EXCLUDED.hash, data = EXCLUDED.data, updated_at = NOW()"
-                    ).format(table=sql.Identifier(data_type)),
-                    records_to_upsert,
-                )
+                if data_type == "releases":
+                    await cursor.executemany(
+                        sql.SQL(
+                            "INSERT INTO {table} (hash, data_id, data, media, updated_at) "
+                            "VALUES (%s, %s, %s, %s, NOW()) "
+                            "ON CONFLICT (data_id) DO UPDATE "
+                            "SET hash = EXCLUDED.hash, data = EXCLUDED.data, media = EXCLUDED.media, updated_at = NOW()"
+                        ).format(table=sql.Identifier(data_type)),
+                        records_to_upsert,
+                    )
+                else:
+                    await cursor.executemany(
+                        sql.SQL(
+                            "INSERT INTO {table} (hash, data_id, data, updated_at) "
+                            "VALUES (%s, %s, %s, NOW()) "
+                            "ON CONFLICT (data_id) DO UPDATE "
+                            "SET hash = EXCLUDED.hash, data = EXCLUDED.data, updated_at = NOW()"
+                        ).format(table=sql.Identifier(data_type)),
+                        records_to_upsert,
+                    )
 
                 logger.debug(
                     "🐘 Batch upserted records",
