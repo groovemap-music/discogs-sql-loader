@@ -53,6 +53,12 @@ connect to live PostgreSQL or RabbitMQ services.
 - Restart does not persist in-memory completion state. The producer may resume an
   extraction, and the large-delete guard prevents a resumed run from purging an
   almost-complete table.
+- A record whose hash is unchanged normally refreshes only `updated_at`. The one
+  exception is a `releases` row left with a NULL `media` column by a loader that predates
+  the canonical media taxonomy: the batch path derives the block and writes that column
+  in place. On an upgraded stack, a `force_reprocess` run therefore backfills `media`
+  across the existing catalog without rewriting payloads that have not changed. Those
+  rows are counted and logged as `media_backfilled` rather than `skipped`.
 
 See [Operations](docs/operations.md) for configuration, input and output details,
 completion semantics, health states, and troubleshooting. The

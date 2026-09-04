@@ -118,11 +118,13 @@ def reset_instruments() -> None:
 def record_message(entity: str, outcome: str, duration_s: float) -> None:
     """Record one terminal disposition of a catalog message.
 
-    ``outcome`` is one of ``processed`` (persisted, or a control signal handled) or
-    ``failed`` (nacked, whether to the DLQ or for broker redelivery). Only terminal
-    dispositions are recorded -- a message still awaiting an in-process batch retry has
-    not concluded yet, so it is not counted here (see ``record_batch_flush`` for the
-    batch-level view of that retry).
+    ``outcome`` is one of ``processed`` (persisted, or a control signal handled),
+    ``skipped`` (the record's hash matched, so only ``updated_at`` was refreshed),
+    ``media_backfilled`` (the hash matched but the `releases` row's NULL ``media``
+    column was filled in place -- ADR 0007), or ``failed`` (nacked, whether to the DLQ
+    or for broker redelivery). Only terminal dispositions are recorded -- a message
+    still awaiting an in-process batch retry has not concluded yet, so it is not counted
+    here (see ``record_batch_flush`` for the batch-level view of that retry).
     """
     try:
         _instrument(PIPELINE_MESSAGES).add(1, {"source": SOURCE, "entity": entity, "outcome": outcome})
