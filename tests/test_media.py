@@ -36,8 +36,8 @@ class TestMediaForRelease:
     def test_absent_media_multi_entry_formats_preserve_order(self) -> None:
         """Each entry's descriptions stay attached to its own format across entries.
 
-        The legacy path flattens to names only, so per-entry `qty` is lost (defaults to
-        1) -- the ADR-documented limitation of this fallback versus the structured mapper.
+        `formats` entries are mappings, so derivation routes through the structured mapper
+        and each entry's `qty` survives -- a `2xLP` yields `qty: 2` on the vinyl item.
         """
         data = {
             "id": "1",
@@ -52,8 +52,36 @@ class TestMediaForRelease:
         assert block["families"] == ["optical", "vinyl"]
         vinyl_item = next(item for item in block["items"] if item["family"] == "vinyl")
         cd_item = next(item for item in block["items"] if item["family"] == "optical")
+        assert vinyl_item["qty"] == 2
+        assert cd_item["qty"] == 1
         assert "Compilation" not in vinyl_item["source"]["descriptions"]
         assert cd_item["source"]["descriptions"] == ["Compilation"]
+
+    def test_2xlp_yields_qty_2(self) -> None:
+        """A `2xLP` release (`formats` entry with `qty: "2"`) preserves `qty` as `2`.
+
+        This is the multi-disc quantity the ADR calls out: the pre-media-field fallback must
+        not silently collapse it to `1`.
+        """
+        data = {"id": "1", "formats": [{"name": "Vinyl", "qty": "2", "descriptions": ["LP"]}]}
+
+        block = media_for_release(data)
+
+        assert len(block["items"]) == 1
+        assert block["items"][0]["qty"] == 2
+
+    def test_malformed_formats_entries_fall_back_to_name_only_mapper(self) -> None:
+        """When no `formats` entry is a mapping, derivation falls back to
+        `common.media.legacy_format_names_to_media` via the name-only flattener -- there is
+        no structured entry to read a `qty` from, so it degrades to an empty block rather
+        than raising.
+        """
+        data = {"id": "1", "formats": ["Vinyl", "LP", 42, None]}
+
+        block = media_for_release(data)
+
+        assert block["items"] == []
+        assert block["unmapped"]["formats"] == []
 
     def test_unmapped_only_formats_still_derive_a_block(self) -> None:
         """A format name the vocabulary does not know yields an empty-but-present block."""
