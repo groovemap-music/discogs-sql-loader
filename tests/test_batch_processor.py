@@ -11,9 +11,11 @@ from psycopg.errors import InterfaceError, OperationalError
 
 from tableinator.batch_processor import (
     BatchConfig,
+    BatchWriteResult,
     PendingMessage,
     PostgreSQLBatchProcessor,
 )
+from tableinator.media import media_for_release
 
 
 class TestBatchConfig:
@@ -725,7 +727,7 @@ class TestPostgreSQLBatchProcessor:
 
         # executemany should not be called if all records unchanged
         assert mock_cursor.executemany.call_count == 0
-        assert unchanged_ids == {"1", "2"}
+        assert unchanged_ids == BatchWriteResult({"1", "2"}, set())
 
     @pytest.mark.asyncio
     async def test_process_batch_with_mixed_records(self) -> None:
@@ -783,7 +785,7 @@ class TestPostgreSQLBatchProcessor:
         assert mock_cursor.executemany.call_count == 1
         call_args = mock_cursor.executemany.call_args[0]
         assert len(call_args[1]) == 1  # Only one record to upsert
-        assert unchanged_ids == {"1"}
+        assert unchanged_ids == BatchWriteResult({"1"}, set())
 
     @pytest.mark.asyncio
     async def test_flush_all(self) -> None:
@@ -1163,8 +1165,12 @@ class TestProcessBatchReleaseMedia:
     """
 
     @staticmethod
-    def _pool(existing_hashes: list[tuple[str, str]]) -> tuple[MagicMock, AsyncMock]:
-        """Build a connection pool mock whose hash-fetch step answers `existing_hashes`."""
+    def _pool(existing_hashes: list[tuple[Any, ...]]) -> tuple[MagicMock, AsyncMock]:
+        """Build a connection pool mock whose hash-fetch step answers `existing_hashes`.
+
+        A `releases` fetch selects a third column -- whether `media` IS NULL -- so rows
+        for that table are `(data_id, hash, media_is_null)`.
+        """
         mock_connection = MagicMock()
         mock_connection.set_autocommit = AsyncMock()
         mock_cursor = AsyncMock()
@@ -1264,12 +1270,12 @@ class TestProcessBatchReleaseMedia:
         # Second run: the hash is unchanged, so this is the no-rewrite branch. The
         # `media` written by the first run must still be exactly what a fresh
         # derivation would produce — proving there is no drift to guard against.
-        pool2, mock_cursor2 = self._pool(existing_hashes=[("1", "abc")])
+        pool2, mock_cursor2 = self._pool(existing_hashes=[("1", "abc", False)])
         processor2 = PostgreSQLBatchProcessor(pool2)
         with patch("tableinator.batch_processor.logger"):
             unchanged_ids = await processor2._process_batch("releases", [self._release_message("1", "abc")])
 
-        assert unchanged_ids == {"1"}
+        assert unchanged_ids == BatchWriteResult({"1"}, set())
         assert mock_cursor2.executemany.call_count == 0
         pool3, mock_cursor3 = self._pool(existing_hashes=[])
         processor3 = PostgreSQLBatchProcessor(pool3)
@@ -1302,6 +1308,160 @@ class TestProcessBatchReleaseMedia:
         records = mock_cursor.executemany.call_args[0][1]
         assert "media" not in query.as_string(None)
         assert len(records[0]) == 3
+
+
+class TestMediaBackfillOnUnchangedHash:
+    """A `releases` row whose hash already matches but whose `media` column is NULL.
+
+    Rows written by a loader that predates ADR 0007 carry the right `data` and the right
+    `hash`, so the hash-gated full-write path never fires for them again and the indexed
+    `media` column the API filters on would stay NULL forever. The hash-unchanged path
+    therefore reads `media IS NULL` alongside the hash and writes just that one column.
+    """
+
+    # Same mock plumbing and payload as the sibling class above; re-wrapped because
+    # reading a staticmethod off a class yields the plain function.
+    _pool = staticmethod(TestProcessBatchReleaseMedia._pool)
+    _release_message = staticmethod(TestProcessBatchReleaseMedia._release_message)
+
+    @staticmethod
+    def _executed_queries(mock_cursor: AsyncMock) -> list[str]:
+        return [call_args[0][0].as_string(None) for call_args in mock_cursor.execute.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_unchanged_hash_with_null_media_backfills_media(self) -> None:
+        """Unchanged hash + NULL media writes the derived block, and only that column."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True)])
+        processor = PostgreSQLBatchProcessor(pool)
+        message = self._release_message("1", "abc")  # no "media" key -> derived block
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("releases", [message])
+
+        assert result == BatchWriteResult({"1"}, {"1"})
+
+        # The hash fetch asks for the media state in the same round trip.
+        assert "media IS NULL" in self._executed_queries(mock_cursor)[0]
+
+        # The write is a media-only UPDATE — hash and data are left alone.
+        assert mock_cursor.executemany.call_count == 1
+        query = mock_cursor.executemany.call_args[0][0].as_string(None)
+        assert "UPDATE" in query
+        assert "SET media = %s, updated_at = NOW()" in query
+        assert "INSERT" not in query
+        assert "hash" not in query
+        assert "data =" not in query
+
+        params = mock_cursor.executemany.call_args[0][1]
+        assert len(params) == 1
+        media_param, data_id = params[0]
+        assert data_id == "1"
+        # Exactly what the full-write path would have written for this payload.
+        assert media_param.obj == media_for_release(message.data)
+        assert media_param.obj["families"] == ["vinyl"]
+
+        # That UPDATE carries its own NOW(), so no separate updated_at refresh is issued.
+        assert len(mock_cursor.execute.call_args_list) == 1
+
+    @pytest.mark.asyncio
+    async def test_unchanged_hash_with_media_present_writes_no_media(self) -> None:
+        """Unchanged hash + media already set stays skipped: updated_at only."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", False)])
+        processor = PostgreSQLBatchProcessor(pool)
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("releases", [self._release_message("1", "abc")])
+
+        assert result == BatchWriteResult({"1"}, set())
+        assert mock_cursor.executemany.call_count == 0
+
+        queries = self._executed_queries(mock_cursor)
+        assert len(queries) == 2
+        assert "SET updated_at = NOW()" in queries[1]
+        assert "media" not in queries[1]
+        assert mock_cursor.execute.call_args_list[1][0][1] == (["1"],)
+
+    @pytest.mark.asyncio
+    async def test_changed_hash_still_takes_the_full_write_path(self) -> None:
+        """A changed hash is untouched by the backfill: one INSERT ... ON CONFLICT."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "stale-hash", True)])
+        processor = PostgreSQLBatchProcessor(pool)
+        message = self._release_message("1", "abc")
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("releases", [message])
+
+        assert result == BatchWriteResult(set(), set())
+
+        assert mock_cursor.executemany.call_count == 1
+        query = mock_cursor.executemany.call_args[0][0].as_string(None)
+        assert "INSERT INTO" in query
+        assert "media = EXCLUDED.media" in query
+
+        records = mock_cursor.executemany.call_args[0][1]
+        assert len(records) == 1
+        sha256, data_id, data_param, media_param = records[0]
+        assert (sha256, data_id) == ("abc", "1")
+        assert data_param.obj == message.data
+        assert media_param.obj == media_for_release(message.data)
+
+        # Only the hash fetch — no updated_at refresh, no media-only UPDATE.
+        assert len(mock_cursor.execute.call_args_list) == 1
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_backfills_only_the_null_media_row(self) -> None:
+        """In one batch, a NULL-media row is backfilled while its neighbour is skipped."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True), ("2", "def", False)])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [self._release_message("1", "abc"), self._release_message("2", "def")]
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("releases", messages)
+
+        assert result == BatchWriteResult({"1", "2"}, {"1"})
+
+        # Row 2 takes the plain updated_at refresh; row 1 is excluded from it because
+        # its media UPDATE already refreshes updated_at.
+        assert mock_cursor.execute.call_args_list[1][0][1] == (["2"],)
+        assert [data_id for _media, data_id in mock_cursor.executemany.call_args[0][1]] == ["1"]
+
+    @pytest.mark.asyncio
+    async def test_non_release_unchanged_row_never_looks_for_media(self) -> None:
+        """Only `releases` has a media column; other tables keep the 2-column fetch."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc")])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [
+            PendingMessage(
+                data_type="artists",
+                data_id="1",
+                data={"id": "1"},
+                sha256="abc",
+                ack_callback=AsyncMock(),
+                nack_callback=AsyncMock(),
+            )
+        ]
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("artists", messages)
+
+        assert result == BatchWriteResult({"1"}, set())
+        assert "media" not in self._executed_queries(mock_cursor)[0]
+        assert mock_cursor.executemany.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_flush_counts_backfills_apart_from_processed_records(self) -> None:
+        """Stats separate a media backfill from an ordinary skip and a real write."""
+        pool, _mock_cursor = self._pool(existing_hashes=[("1", "abc", True), ("2", "def", False)])
+        processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
+        processor.queues["releases"].append(self._release_message("1", "abc"))
+        processor.queues["releases"].append(self._release_message("2", "def"))
+
+        with patch("tableinator.batch_processor.logger"):
+            await processor._flush_queue("releases")
+
+        stats = processor.get_stats()
+        assert stats["media_backfilled"]["releases"] == 1
+        assert stats["processed"]["releases"] == 2
 
 
 class TestBackoffPeriodSkip:
