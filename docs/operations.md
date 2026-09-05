@@ -65,20 +65,28 @@ preferred for deployed containers.
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
 | `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (metrics disabled) | Collector base URL, e.g. `http://otel-collector:4318` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry disabled) | Collector base URL, e.g. `http://otel-collector:4318`; shared by metrics and traces |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | falls back to the endpoint above | Metrics-only collector override |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | falls back to the endpoint above | Traces-only collector override |
 | `OTEL_METRICS_EXPORTER` | `otlp` | `none` forces metrics export off |
+| `OTEL_TRACES_EXPORTER` | `otlp` | `none` forces span export off, leaving metrics untouched |
+| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Sampler name |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Sampling ratio; production turns it down |
 | `OTEL_METRIC_EXPORT_INTERVAL` | SDK default | Push interval, in milliseconds |
 | `OTEL_SERVICE_NAME` | `tableinator` | Overrides the `service.name` resource attribute |
 | `OTEL_RESOURCE_ATTRIBUTES` | empty | Extra resource attributes, e.g. `service.namespace=groovemap,deployment.environment.name=dev` |
 
 ## Telemetry
 
-`setup_telemetry("tableinator")` runs immediately after `setup_logging`; `shutdown_telemetry()`
-runs during graceful shutdown so the final export lands. With `OTEL_EXPORTER_OTLP_ENDPOINT`
-unset (the default), telemetry installs a no-op `MeterProvider` and the service behaves exactly
-as it does without the `otel` extra. The service does not expose a Prometheus `/metrics` scrape
-endpoint for these metrics; the health server's own `/health` route is unaffected.
+`setup_telemetry("tableinator")` runs immediately after `setup_logging` and installs both a
+`MeterProvider` and a `TracerProvider`; `start_event_loop_monitor()` runs on the next line, from
+the service's own running loop. `shutdown_telemetry()` runs during graceful shutdown so the
+final export of both signals lands and the monitor is cancelled. With
+`OTEL_EXPORTER_OTLP_ENDPOINT` unset (the default), both providers are no-ops and the service
+behaves exactly as it does without the `otel` extra. The two signals are independent: either
+exporter can be set to `none` without affecting the other. The service does not expose a
+Prometheus `/metrics` scrape endpoint for these metrics; the health server's own `/health` route
+is unaffected.
 
 Instruments recorded from the per-message handler and the batch processor:
 
@@ -97,6 +105,41 @@ because this service consumes via `queue.consume(handler)` directly rather than 
 `groovemap.pipeline.reconnects` are emitted for free by `AsyncPostgreSQLPool` and
 `AsyncResilientRabbitMQ`, which every database and broker call in this service already goes
 through.
+
+Process-scoped runtime metrics (`process.cpu.time`, `process.cpu.utilization`,
+`process.memory.usage`, `process.memory.virtual`, `process.thread.count`,
+`process.open_file_descriptor.count`, `process.context_switches`, and
+`cpython.gc.collections`) are installed by `setup_telemetry` itself. No `system.*` host metric
+is collected; node-exporter owns the host. `groovemap.runtime.event_loop.lag` is a seconds
+histogram sampled once per second by `start_event_loop_monitor()`, recording how long the loop
+could not run a ready callback.
+
+### Spans
+
+| Span | Kind | Attributes | Opened by |
+| --- | --- | --- | --- |
+| `process {entity}` | `CONSUMER` | `messaging.system=rabbitmq`, `messaging.destination.name`, `messaging.operation.name=process` | `on_data_message`, per delivery |
+| `flush postgresql {entity}` | `INTERNAL` | `db.system.name=postgresql`, `groovemap.entity`, `outcome=success\|failed` | the batch processor, per batch write |
+| `{operation} postgresql` | `CLIENT` | `db.system.name`, `db.operation.name` | `AsyncPostgreSQLPool`, nested in whichever span above is open |
+
+The consumer span is a child of the trace context the producer injected into the AMQP message
+headers, so extraction, publication, and the PostgreSQL write of one record share a trace id.
+Headers with no readable context — absent, or a malformed `traceparent` — start a new trace
+instead of failing the delivery. tableinator consumes via `queue.consume(handler)` and so never
+reaches `common.process_message_with_retry`; the span is opened locally from the runtime's
+`get_tracer` and `extract_context`, with the same name, kind, and attribute keys that wrapper
+would have produced, exactly as the `messaging.client.*` metrics above are.
+
+In batch mode a delivery's consumer span closes when the record is queued, well before the
+batch that writes it. Each flush therefore *links* to the deliveries it carries rather than
+parenting them, capped at 64 links so a large batch cannot flood the collector. The flush span
+covers the same window `groovemap.pipeline.batch.flush.duration` measures, so the pool's client
+spans nest inside it, and it carries an `outcome` attribute drawn from that metric's closed set.
+A flush span with no `outcome` is one that concluded in neither terminal state: the batch was
+re-enqueued for an in-process retry, and its span records the error only.
+
+A failure sets span status `ERROR` and an `error.type` attribute. No statement, record id, file
+name, stack trace, or span event carrying a payload is ever attached to a span.
 
 ## Completion and restart behavior
 

@@ -75,6 +75,10 @@ class PendingMessage:
     # groovemap.pipeline.message.duration / messaging.client.operation.duration
     # telemetry recorded when this message reaches a terminal ack or DLQ nack.
     telemetry_started_at: float = field(default_factory=time.perf_counter)
+    # The SpanContext of the CONSUMER span this delivery was handled in, or None when
+    # tracing is off. It closed when the handler queued the record, so the batch that
+    # eventually writes it LINKS to it rather than nesting under it.
+    span_context: Any = None
 
 
 class PostgreSQLBatchProcessor:
@@ -229,6 +233,7 @@ class PostgreSQLBatchProcessor:
         data: dict[str, Any],
         ack_callback: Callable[[], Any],
         nack_callback: Callable[[], Any],
+        span_context: Any = None,
     ) -> bool:
         """Add a message to the batch queue.
 
@@ -237,6 +242,8 @@ class PostgreSQLBatchProcessor:
             data: The parsed message data
             ack_callback: Callback to acknowledge the message
             nack_callback: Callback to negative-acknowledge the message
+            span_context: SpanContext of the delivery's CONSUMER span, linked from the
+                flush span of whichever batch this record lands in
 
         Returns:
             True if the message was accepted into the queue, False if nacked.
@@ -298,6 +305,7 @@ class PostgreSQLBatchProcessor:
                 ack_callback=ack_callback,
                 nack_callback=nack_callback,
                 telemetry_started_at=started,
+                span_context=span_context,
             )
         )
 
@@ -392,6 +400,30 @@ class PostgreSQLBatchProcessor:
 
         telemetry.record_batch_size(data_type, len(messages))
 
+        # The INTERNAL `flush postgresql {entity}` span covers exactly the window whose
+        # duration groovemap.pipeline.batch.flush.duration measures, so the connection
+        # pool's CLIENT database spans nest inside it. The batch's deliveries were each
+        # processed in their own CONSUMER span, which closed when the handler queued the
+        # record, so they are carried here as span LINKS -- at most 64 of them, capped by
+        # the runtime's flush_span.
+        links = [message.span_context for message in messages if message.span_context is not None]
+        with telemetry.batch_flush_span(data_type, links) as span:
+            await self._flush_batch(data_type, messages, span)
+
+    async def _flush_batch(self, data_type: str, messages: list[PendingMessage], span: Any) -> None:
+        """Write one already-selected batch and settle its messages.
+
+        Split out of :meth:`_flush_queue_locked` only so the flush span can wrap the whole
+        write, from the semaphore acquire through the acks, without re-indenting it. The
+        caller still holds this data type's flush lock, and ``messages`` have already been
+        popped off the deque -- every path here either settles them or puts them back.
+
+        Args:
+            data_type: The data type being flushed
+            messages: The messages popped for this batch
+            span: The enclosing flush span, or None when tracing is off
+        """
+        queue = self.queues[data_type]
         batch_start = time.perf_counter()
         success = False
         unchanged_ids: set[str] = set()
@@ -444,6 +476,12 @@ class PostgreSQLBatchProcessor:
                     batch_size=len(messages),
                     error=str(e),
                 )
+                # The flush failed but did not conclude: the batch goes back on the deque
+                # for an in-process retry, so the span records the error and deliberately
+                # carries NO outcome attribute -- that attribute shares its closed set
+                # with groovemap.pipeline.batch.flush.duration, which is not recorded here
+                # either.
+                telemetry.mark_span_error(span, e)
                 # Put messages back for retry
                 for msg in reversed(messages):
                     queue.appendleft(msg)
@@ -513,6 +551,8 @@ class PostgreSQLBatchProcessor:
                         telemetry.record_message(data_type, "failed", msg_duration)
                         telemetry.record_consumed_message(data_type, msg_duration, poison_error_type)
                     telemetry.record_batch_flush(data_type, time.perf_counter() - batch_start, "failed")
+                    telemetry.set_flush_outcome(span, "failed")
+                    telemetry.mark_span_error(span, e)
                     # Reset per-data-type state so healthy batches behind the
                     # poison resume normal processing.
                     self._consecutive_failures[data_type] = 0
@@ -528,6 +568,8 @@ class PostgreSQLBatchProcessor:
                     consecutive_failures=self._consecutive_failures[data_type],
                     error=str(e),
                 )
+                # Not terminal either — bounded local retry, so error only, no outcome.
+                telemetry.mark_span_error(span, e)
                 # Re-enqueue messages for local retry — bounded by the poison
                 # guard above so a deterministic error can no longer loop forever.
                 for msg in reversed(messages):
@@ -575,6 +617,7 @@ class PostgreSQLBatchProcessor:
                 telemetry.record_consumed_message(data_type, msg_duration)
 
             telemetry.record_batch_flush(data_type, batch_duration, "success")
+            telemetry.set_flush_outcome(span, "success")
 
             self.processed_counts[data_type] += len(messages)
             self.batch_counts[data_type] += 1
