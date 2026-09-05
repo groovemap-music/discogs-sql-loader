@@ -58,7 +58,7 @@ packages = ["tableinator"]
 exclude-newer = "2 days"
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "41805b62520785f412e8f5d0db90f8d83838ec56" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "455523ec388fdb9862d7aca65d9434aa7073dcb5" }
 
 [tool.ruff]
 extend-exclude = ["tableinator/catalog_contract.py"]

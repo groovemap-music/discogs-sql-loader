@@ -66,6 +66,38 @@ completion semantics, health states, and troubleshooting. The
 [documentation index](docs/README.md) links the focused resilience, performance, and
 schema references.
 
+## Telemetry
+
+Metrics and traces are both configured from the standard OpenTelemetry environment
+variables and share `OTEL_EXPORTER_OTLP_ENDPOINT`; with it unset the service installs no-op
+providers and behaves exactly as it does without the `otel` extra. `OTEL_METRICS_EXPORTER`
+and `OTEL_TRACES_EXPORTER` turn either signal off on its own. See
+[Operations](docs/operations.md) for the full variable table.
+
+Spans this service opens:
+
+| Span | Kind | Attributes |
+| --- | --- | --- |
+| `process {entity}` | `CONSUMER` | `messaging.system=rabbitmq`, `messaging.destination.name`, `messaging.operation.name=process` |
+| `flush postgresql {entity}` | `INTERNAL` | `db.system.name=postgresql`, `groovemap.entity`, `outcome=success\|failed` |
+| `{operation} postgresql` | `CLIENT` | from the shared connection pool, nested inside whichever span above is open |
+
+The consumer span is opened from the `traceparent` the producer wrote into the message
+headers, so a record's journey from extraction to its PostgreSQL row is one trace. A
+delivery whose headers carry no readable context starts a new trace rather than failing.
+In batch mode the consumer span closes when the record is queued, so the batch that
+eventually writes it carries the delivery as a span *link* (at most 64 per flush) instead
+of a parent. A flush span with no `outcome` attribute is one that concluded in neither
+terminal state: the batch was re-enqueued for an in-process retry.
+
+Runtime metrics come from `groovemap-runtime` with no code in this repository:
+`process.cpu.time`, `process.cpu.utilization`, `process.memory.usage`,
+`process.memory.virtual`, `process.thread.count`, `process.open_file_descriptor.count`,
+`process.context_switches`, and `cpython.gc.collections`. The one exception is
+`groovemap.runtime.event_loop.lag`, a seconds histogram sampled every second by a monitor
+this service starts from its own event loop; it measures the time the loop could not run a
+ready callback, which is where a coroutine blocking the loop shows up and nowhere else.
+
 ## Contracts and compatibility
 
 The catalog-event contract is promoted from `catalog-ingestion`; persistence

@@ -1,8 +1,9 @@
-"""OpenTelemetry domain instruments for discogs-sql-loader (tableinator).
+"""OpenTelemetry domain instruments and spans for discogs-sql-loader (tableinator).
 
 Metric names, units, and attribute keys follow the GrooveMap OpenTelemetry metrics
 conventions (design ADR-0006; reproduced in the program epic and in
-``groovemap-runtime``'s ``docs/runtime.md``). Instruments are created lazily from
+``groovemap-runtime``'s ``docs/runtime.md``), and the span names, kinds, and attributes
+follow the wave-2 tracing conventions in the same places. Instruments are created lazily from
 ``get_meter("groovemap.tableinator")`` and rebuilt whenever the installed
 ``MeterProvider`` changes (tracked via ``common.telemetry.provider_generation``), so:
 
@@ -15,14 +16,22 @@ conventions (design ADR-0006; reproduced in the program epic and in
 
 Every recording function swallows its own errors: telemetry must never turn a working
 message into a failure (see ``common.runtime_metrics``, which follows the same rule for
-the shared wrappers).
+the shared wrappers). The span helpers at the bottom of this module follow the same rule
+and yield None when tracing is off, so a caller never has to check whether a provider is
+installed.
 """
 
 import logging
+from contextlib import contextmanager
 from threading import RLock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from common import extract_context, flush_span, get_tracer
 from common.telemetry import get_meter, provider_generation
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping, Sequence
 
 
 logger = logging.getLogger(__name__)
@@ -194,3 +203,144 @@ def record_consumed_message(destination: str, duration_s: float, error_type: str
 def error_type_of(exc: BaseException) -> str:
     """Return the closed-set ``error.type`` value for an exception: its class name."""
     return type(exc).__name__
+
+
+# ---------------------------------------------------------------------------------------
+# Spans
+#
+# tableinator consumes via ``queue.consume(handler)`` directly, so it never reaches
+# ``common.process_message_with_retry`` and never gets that wrapper's CONSUMER span for
+# free. ``consume_span`` opens the identical span here -- same name, same kind, same
+# attribute keys -- from the two stable helpers the runtime exports for exactly this case
+# (``get_tracer`` and ``extract_context``), mirroring what ``record_consumed_message``
+# above already does for the wrapper's metrics.
+#
+# The batch flush span comes straight from ``common.flush_span``; only the outcome
+# attribute, which the library cannot know, is set here.
+#
+# Both follow the wave-2 span rules: exception recording and automatic status are OFF, and
+# a failure sets status ERROR with ``error.type`` and nothing else -- no message, no stack
+# trace, no span event carrying a payload.
+# ---------------------------------------------------------------------------------------
+
+# The span attribute that mirrors the ``outcome`` attribute on
+# groovemap.pipeline.batch.flush.duration, and shares its closed set. It is set only where
+# that metric is recorded, so a flush span without it is one that concluded in neither
+# terminal state: the batch was re-enqueued for an in-process retry.
+FLUSH_OUTCOME_ATTRIBUTE = "outcome"
+
+
+def _trace_api() -> Any:
+    """Return the ``opentelemetry.trace`` module, or None without the ``otel`` extra."""
+    try:
+        from opentelemetry import trace  # noqa: PLC0415
+    except Exception:  # pragma: no cover - exercised only without the extra
+        return None
+    return trace
+
+
+def mark_span_error(span: Any, exc: BaseException) -> None:
+    """Fail a span with ``error.type`` only. Never raises, and a no-op for a None span."""
+    if span is None:
+        return
+    trace = _trace_api()
+    if trace is None:  # pragma: no cover - exercised only without the extra
+        return
+    try:
+        span.set_attribute("error.type", error_type_of(exc))
+        span.set_status(trace.Status(trace.StatusCode.ERROR))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not mark a span as failed", exc_info=True)
+
+
+def span_context_of(span: Any) -> Any:
+    """Return a span's context when it is worth linking to, otherwise None.
+
+    A span that is not recording is dropped here rather than being carried through the
+    batch queue and filtered at the flush. That covers both ways a delivery can produce
+    nothing worth linking: tracing is off, or the sampler dropped this span. In the second
+    case the non-recording span still carries the REMOTE parent's context, which belongs
+    to the extractor's publish and not to this delivery, so linking it would attach a
+    stranger's span to the batch.
+    """
+    if span is None:
+        return None
+    try:
+        if not span.is_recording():
+            return None
+        context = span.get_span_context()
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not read a span context", exc_info=True)
+        return None
+    return context if getattr(context, "is_valid", False) else None
+
+
+@contextmanager
+def consume_span(destination: str, headers: Mapping[str, Any] | None = None) -> Iterator[Any]:
+    """Open the CONSUMER span for one delivery: ``process {destination}``.
+
+    The span is a child of the trace context carried in ``headers``, which is what puts
+    the extractor's ``publish`` span and this service's processing in one trace. Headers
+    with no readable context -- absent, or a malformed ``traceparent`` -- simply start a
+    new trace rather than failing the message that delivered them.
+
+    ``destination`` is the entity name, the same closed-set value
+    ``record_consumed_message`` records as ``messaging.destination.name``, so the span and
+    the metric describe one destination rather than two.
+
+    Yields None when tracing is off, so every caller must tolerate a None span.
+    """
+    trace = _trace_api()
+    if trace is None:  # pragma: no cover - exercised only without the extra
+        yield None
+        return
+
+    attributes = {
+        "messaging.system": MESSAGING_SYSTEM,
+        "messaging.destination.name": destination,
+        "messaging.operation.name": "process",
+    }
+    try:
+        manager = get_tracer(INSTRUMENTATION_SCOPE).start_as_current_span(
+            f"process {destination}",
+            context=extract_context(headers) if headers else None,
+            kind=trace.SpanKind.CONSUMER,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not start the consume span for %s", destination, exc_info=True)
+        yield None
+        return
+
+    with manager as span:
+        try:
+            yield span
+        except BaseException as exc:
+            mark_span_error(span, exc)
+            raise
+
+
+@contextmanager
+def batch_flush_span(entity: str, links: Sequence[Any] | None = None) -> Iterator[Any]:
+    """Open the INTERNAL span for one batch flush: ``flush postgresql {entity}``.
+
+    ``links`` are the span contexts of the deliveries the batch carries; the runtime
+    attaches at most ``common.tracing.MAX_FLUSH_LINKS`` (64) of them. The span stays open
+    across ``_process_batch``, so the connection pool's CLIENT database spans nest inside
+    it, and it covers exactly the window
+    ``groovemap.pipeline.batch.flush.duration`` measures.
+    """
+    with flush_span(STORE, entity, links) as span:
+        yield span
+
+
+def set_flush_outcome(span: Any, outcome: str) -> None:
+    """Record a flush span's terminal outcome, alongside the flush-duration metric."""
+    if span is None:
+        return
+    try:
+        span.set_attribute(FLUSH_OUTCOME_ATTRIBUTE, outcome)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not record the flush outcome on a span", exc_info=True)
