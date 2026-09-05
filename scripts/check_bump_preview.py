@@ -21,6 +21,8 @@ RELEASE_GAP_MARKERS = (
     "increment detected: ",
     "No tag found to do an incremental changelog",
 )
+NOT_ELIGIBLE_EXIT = 21
+NOT_ELIGIBLE_MARKERS = ("[NO_COMMITS_TO_BUMP]", "The commits found are not eligible to be bumped")
 
 
 def accepted_result(returncode: int, output: str) -> bool:
@@ -29,6 +31,7 @@ def accepted_result(returncode: int, output: str) -> bool:
         returncode == 0
         or (returncode == NO_COMMITS_EXIT and all(marker in output for marker in NO_COMMITS_MARKERS))
         or (returncode == RELEASE_GAP_EXIT and all(marker in output for marker in RELEASE_GAP_MARKERS))
+        or (returncode == NOT_ELIGIBLE_EXIT and all(marker in output for marker in NOT_ELIGIBLE_MARKERS))
     )
 
 

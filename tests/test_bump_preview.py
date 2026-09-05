@@ -27,6 +27,19 @@ No tag found to do an incremental changelog
     assert not check_bump_preview.accepted_result(16, "No tag found to do an incremental changelog")
 
 
+def test_accepts_only_the_explicit_not_eligible_result() -> None:
+    output = """bump: version 0.2.1 -> 0.2.1
+tag to create: v0.2.1
+
+[NO_COMMITS_TO_BUMP]
+The commits found are not eligible to be bumped
+"""
+    assert check_bump_preview.accepted_result(21, output)
+    assert not check_bump_preview.accepted_result(20, output)
+    assert not check_bump_preview.accepted_result(21, "The commits found are not eligible to be bumped")
+    assert not check_bump_preview.accepted_result(21, "[NO_COMMITS_TO_BUMP]")
+
+
 def test_propagates_unexpected_commitizen_failure(monkeypatch) -> None:
     result = subprocess.CompletedProcess(check_bump_preview.COMMAND, 7, stdout="", stderr="invalid config\n")
     monkeypatch.setattr(check_bump_preview.subprocess, "run", lambda *_args, **_kwargs: result)
