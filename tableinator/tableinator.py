@@ -20,6 +20,7 @@ from common import (
     setup_logging,
     setup_telemetry,
     shutdown_telemetry,
+    start_event_loop_monitor,
 )
 from orjson import loads
 from psycopg import sql
@@ -718,6 +719,22 @@ def make_data_handler(
 
 
 async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> None:
+    """Process one delivery inside its CONSUMER span.
+
+    The span is opened from the message's own ``traceparent`` header, so this service's
+    work continues the trace the extractor started when it published the record rather
+    than starting a fresh one. A delivery that carries no readable context starts a new
+    trace instead of failing (see tableinator.telemetry.consume_span).
+
+    In batch mode the span closes as soon as the record is queued -- the write happens
+    later, in whatever batch it lands in -- so the delivery is carried forward as a span
+    LINK on that batch's ``flush postgresql {entity}`` span rather than as a parent.
+    """
+    with telemetry.consume_span(data_type, getattr(message, "headers", None)) as span:
+        await _process_data_message(message, data_type, span)
+
+
+async def _process_data_message(message: AbstractIncomingMessage, data_type: str, span: Any) -> None:
     message_started = time.perf_counter()
 
     def record_terminal(outcome: str, error_type: str | None = None) -> None:
@@ -877,6 +894,10 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                 data_type=data_type,
                 data=data,
                 ack_callback=message.ack,
+                # This delivery's CONSUMER span closes when the handler returns, long
+                # before the batch it joined is written, so the flush span links back to
+                # it instead of nesting under it.
+                span_context=telemetry.span_context_of(span),
                 # requeue=False: this callback nacks permanently-invalid input
                 # (unknown data_type, missing 'id', normalize failure, poison
                 # batch) — send it straight to the DLQ instead of cycling
@@ -1179,6 +1200,11 @@ async def main() -> None:
 
     setup_logging(SERVICE_NAME, log_file=LOG_PATH)
     setup_telemetry(OTEL_SERVICE_NAME)
+    # Sample this loop's scheduling delay into groovemap.runtime.event_loop.lag. It has to
+    # be started from the running loop, so it belongs here and not next to setup_telemetry
+    # in a module-level bootstrap; shutdown_telemetry() cancels it. Returns None -- and
+    # logs one line -- whenever there is nothing to sample into, so no result to check.
+    start_event_loop_monitor()
     logger.info("🚀 Starting GrooveMap discogs-sql-loader with PostgreSQL connection pooling")
 
     # Add startup delay for dependent services

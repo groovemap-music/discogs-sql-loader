@@ -7,6 +7,9 @@ import pytest
 from common import telemetry as common_telemetry
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from tableinator import telemetry as tableinator_telemetry
 
@@ -15,6 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from opentelemetry.sdk.metrics.export import Metric
+    from opentelemetry.sdk.trace import ReadableSpan
 
 
 # Every standard OpenTelemetry variable that changes what the SDK records or exports.
@@ -25,12 +29,17 @@ if TYPE_CHECKING:
 OTEL_ENVIRONMENT = (
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_METRICS_EXEMPLAR_FILTER",
     "OTEL_METRICS_EXPORTER",
     "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_PROPAGATORS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_SDK_DISABLED",
     "OTEL_SERVICE_NAME",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_TRACES_SAMPLER",
+    "OTEL_TRACES_SAMPLER_ARG",
 )
 
 
@@ -218,3 +227,42 @@ def metrics_collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[MetricsCollec
     yield active
     monkeypatch.setattr(common_telemetry, "_provider", None)
     tableinator_telemetry.reset_instruments()
+
+
+class SpanCollector:
+    """An in-memory TracerProvider plus helpers for reading what was recorded."""
+
+    def __init__(self) -> None:
+        self.exporter = InMemorySpanExporter()
+        self.provider = SdkTracerProvider()
+        self.provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+
+    def spans(self) -> list[ReadableSpan]:
+        """Return every finished span, in the order they ended."""
+        return list(self.exporter.get_finished_spans())
+
+    def named(self, name: str) -> list[ReadableSpan]:
+        """Return the finished spans with one name."""
+        return [span for span in self.spans() if span.name == name]
+
+    def one(self, name: str) -> ReadableSpan:
+        """Return the single finished span with one name, asserting there is exactly one."""
+        matches = self.named(name)
+        assert len(matches) == 1, f"expected exactly one {name!r} span, found {len(matches)}: {[s.name for s in self.spans()]}"
+        return matches[0]
+
+
+@pytest.fixture
+def span_collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[SpanCollector]:
+    """Install an in-memory TracerProvider as the one `common.get_tracer` hands out.
+
+    The metrics counterpart (`metrics_collector`) patches `common.telemetry._provider`;
+    this patches its tracing half, so a test can assert on the spans a code path opened
+    without running the real `setup_telemetry` bootstrap or an exporter.
+    """
+    active = SpanCollector()
+    monkeypatch.setattr(common_telemetry, "_tracer_provider", active.provider)
+    assert common_telemetry.tracer_provider() is active.provider
+    yield active
+    monkeypatch.setattr(common_telemetry, "_tracer_provider", None)
+    active.provider.shutdown()
