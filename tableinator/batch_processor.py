@@ -9,16 +9,15 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from common import normalize_record
 from common.db_resilience import DatabaseUnavailableError
-from psycopg import sql
 from psycopg.errors import InterfaceError, OperationalError
-from psycopg.types.json import Jsonb
 
 from tableinator import telemetry
+from tableinator.batch_writer import BatchWriteResult, PostgreSQLBatchWriter
 from tableinator.media import media_for_release
 
 
@@ -27,21 +26,6 @@ if TYPE_CHECKING:
 
 
 logger = structlog.get_logger(__name__)
-
-
-class BatchWriteResult(NamedTuple):
-    """How one batch's records were dispositioned, for the caller's telemetry.
-
-    ``unchanged_ids`` are the records whose stored hash matched the message, so the data
-    write was skipped and only ``updated_at`` was refreshed. ``media_backfilled_ids`` is
-    the subset of those that still took a write: a `releases` row persisted before
-    ADR 0007 has a hash the payload already agrees with but a NULL `media` column, so the
-    derived block is written in place rather than waiting for the payload to change.
-    ``media_backfilled_ids`` is always a subset of ``unchanged_ids``.
-    """
-
-    unchanged_ids: set[str]
-    media_backfilled_ids: set[str]
 
 
 @dataclass
@@ -653,142 +637,13 @@ class PostgreSQLBatchProcessor:
             )
 
     async def _process_batch(self, data_type: str, messages: list[PendingMessage]) -> BatchWriteResult:
-        """Process a batch of records using efficient bulk operations.
-
-        Uses async PostgreSQL operations with a single transaction:
-        1. Bulk fetch existing hashes using ANY() -- plus, for `releases`, whether the
-           indexed `media` column is still NULL
-        2. Filter to only records that need updating
-        3. Backfill `media` on hash-unchanged `releases` rows that lack it
-        4. Bulk upsert using executemany with ON CONFLICT
-
-        Returns:
-            A :class:`BatchWriteResult` naming the data_ids whose hash was unchanged
-            (updated_at refreshed, data not rewritten) and the subset of those whose
-            NULL `media` column was backfilled, for the caller's per-message
-            "skipped" / "media_backfilled" / "processed" telemetry.
-        """
-        # Get async connection from pool — wrap in explicit transaction for atomicity
-        async with self.connection_pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                # Step 1: Fetch all existing hashes in one query. `releases` also
-                # reports whether the indexed `media` column is still NULL, so the
-                # hash-unchanged branch below can backfill rows written by a loader
-                # that predates ADR 0007 (they carry a matching hash and no media).
-                data_ids = [msg.data_id for msg in messages]
-                hash_query = (
-                    "SELECT data_id, hash, media IS NULL FROM {table} WHERE data_id = ANY(%s)"
-                    if data_type == "releases"
-                    else "SELECT data_id, hash FROM {table} WHERE data_id = ANY(%s)"
-                )
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL(hash_query).format(
-                        table=sql.Identifier(data_type)
-                    ),  # nosemgrep  # safe: hash_query is one of two literals above; only the identifier is interpolated
-                    (data_ids,),
-                )
-                existing_rows = await cursor.fetchall()
-                existing_hashes = {row[0]: row[1] for row in existing_rows}
-                # Only populated for `releases`; every other table has no media column.
-                media_is_null_ids = {row[0] for row in existing_rows if row[2]} if data_type == "releases" else set()
-
-                # Step 2: Filter to only records that need updating
-                # releases carries an extra `media` value (see below), so a row is either
-                # 3- or 4-tuple depending on data_type.
-                records_to_upsert: list[tuple[Any, ...]] = []
-                unchanged_ids: list[str] = []
-                # (media, data_id) pairs for the media-only UPDATE below.
-                media_backfills: list[tuple[Jsonb, str]] = []
-                for msg in messages:
-                    existing_hash = existing_hashes.get(msg.data_id)
-                    if existing_hash == msg.sha256:
-                        # Hash unchanged — skip data write but track for updated_at refresh
-                        unchanged_ids.append(msg.data_id)
-                        if msg.data_id in media_is_null_ids:
-                            # The payload has not changed, so the full-write path below
-                            # will never run for this row — but its indexed `media` is
-                            # still NULL because the row predates ADR 0007. Derive the
-                            # same block that path would write and update only that
-                            # column, leaving `hash` and `data` untouched.
-                            media_backfills.append((Jsonb(media_for_release(msg.data)), msg.data_id))
-                        continue
-                    if data_type == "releases":
-                        # releases additionally carries the indexed `media` column
-                        # (ADR 0007): the API filters on it, not on data->'media'.
-                        # media_for_release() writes the event's own canonical block
-                        # verbatim, or derives a best-effort one from the raw
-                        # `formats` list when the event predates the field, so the
-                        # column is never NULL for a row this loader writes.
-                        records_to_upsert.append((msg.sha256, msg.data_id, Jsonb(msg.data), Jsonb(media_for_release(msg.data))))
-                    else:
-                        records_to_upsert.append((msg.sha256, msg.data_id, Jsonb(msg.data)))
-
-                media_backfilled_ids = {data_id for _media, data_id in media_backfills}
-
-                if unchanged_ids:
-                    logger.debug(
-                        "🔄 Skipped unchanged records",
-                        data_type=data_type,
-                        skipped=len(unchanged_ids) - len(media_backfills),
-                        media_backfilled=len(media_backfills),
-                    )
-                    # Refresh updated_at so post-extraction stale row purge
-                    # does not delete unchanged-but-still-present records.
-                    # Backfilled rows are excluded — their media UPDATE below
-                    # carries its own NOW() rather than being written twice.
-                    refresh_ids = [data_id for data_id in unchanged_ids if data_id not in media_backfilled_ids]
-                    if refresh_ids:
-                        await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                            sql.SQL("UPDATE {table} SET updated_at = NOW() WHERE data_id = ANY(%s)").format(table=sql.Identifier(data_type)),
-                            (refresh_ids,),
-                        )
-
-                if media_backfills:
-                    logger.info(
-                        "🎚️ Backfilled media on hash-unchanged rows",
-                        data_type=data_type,
-                        media_backfilled=len(media_backfills),
-                    )
-                    await cursor.executemany(
-                        sql.SQL("UPDATE {table} SET media = %s, updated_at = NOW() WHERE data_id = %s").format(table=sql.Identifier(data_type)),
-                        media_backfills,
-                    )
-
-                if not records_to_upsert:
-                    return BatchWriteResult(set(unchanged_ids), media_backfilled_ids)
-
-                # Step 3: Bulk upsert using executemany
-                if data_type == "releases":
-                    await cursor.executemany(
-                        sql.SQL(
-                            "INSERT INTO {table} (hash, data_id, data, media, updated_at) "
-                            "VALUES (%s, %s, %s, %s, NOW()) "
-                            "ON CONFLICT (data_id) DO UPDATE "
-                            "SET hash = EXCLUDED.hash, data = EXCLUDED.data, media = EXCLUDED.media, updated_at = NOW()"
-                        ).format(table=sql.Identifier(data_type)),
-                        records_to_upsert,
-                    )
-                else:
-                    await cursor.executemany(
-                        sql.SQL(
-                            "INSERT INTO {table} (hash, data_id, data, updated_at) "
-                            "VALUES (%s, %s, %s, NOW()) "
-                            "ON CONFLICT (data_id) DO UPDATE "
-                            "SET hash = EXCLUDED.hash, data = EXCLUDED.data, updated_at = NOW()"
-                        ).format(table=sql.Identifier(data_type)),
-                        records_to_upsert,
-                    )
-
-                logger.debug(
-                    "🐘 Batch upserted records",
-                    data_type=data_type,
-                    upserted=len(records_to_upsert),
-                    skipped=len(unchanged_ids) - len(media_backfills),
-                    media_backfilled=len(media_backfills),
-                )
-
-                return BatchWriteResult(set(unchanged_ids), media_backfilled_ids)
+        """Write one batch through the entity-specific persistence boundary."""
+        writer = PostgreSQLBatchWriter(
+            self.connection_pool,
+            logger,
+            media_for_release,
+        )
+        return await writer.process_batch(data_type, messages)
 
     async def flush_all(self) -> bool:
         """Flush all pending queues, draining each completely.
