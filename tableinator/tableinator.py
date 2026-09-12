@@ -23,9 +23,7 @@ from common import (
     start_event_loop_monitor,
 )
 from orjson import loads
-from psycopg import sql
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
-from psycopg.types.json import Jsonb
 
 from tableinator import telemetry
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
@@ -49,6 +47,7 @@ from tableinator.queue_names import (
 from tableinator.queue_names import (
     dead_letter_queue_name as catalog_dead_letter_queue_name,
 )
+from tableinator.record_persistence import PostgreSQLRecordPersistence
 
 
 if TYPE_CHECKING:
@@ -589,122 +588,16 @@ async def _recover_consumers() -> None:
 
 
 async def purge_stale_rows(data_type: str, started_at: str, record_count: int | None = None) -> None:
-    """Delete rows from prior extractions that were not updated in the current run.
-
-    The extraction_complete message includes started_at — the time the extraction
-    began. Any row with updated_at < started_at was not touched by the current
-    extraction and is stale (removed from the Discogs dump or from a prior run).
-
-    Defense-in-depth against resumed extractions (see PURGE_MAX_DELETE_FRACTION): a
-    restarted extractor skips files completed in an earlier session, so this data type
-    can receive an extraction_complete signal while zero records were streamed this run.
-    Purging blindly would then delete every row written before the restart. Two guards
-    prevent that mass data loss:
-
-    1. If the extractor reported zero records for this type this session, skip entirely —
-       nothing this run could have refreshed, so there is no safe basis to purge.
-    2. If the purge would delete at least PURGE_MAX_DELETE_FRACTION of a non-empty table,
-       veto it — a near-total wipe is the resumed-extraction signature, not a real dump
-       shrink.
-    """
+    """Delete rows not refreshed by the current extraction when safe."""
     if connection_pool is None:
         return
-
-    if not started_at:
-        logger.warning(
-            "⚠️ No started_at in extraction_complete, skipping stale row purge",
-            data_type=data_type,
-        )
-        return
-
-    # Guard 1: the extractor streamed zero records for this type this session. On a
-    # resumed run this means the type's file was already completed earlier and not
-    # re-sent, so every current row predates started_at — purging would wipe the table.
-    if record_count == 0:
-        logger.warning(
-            "⚠️ Skipping stale row purge — extractor reported 0 records this session (resumed extraction?)",
-            data_type=data_type,
-        )
-        return
-
-    # Parse started_at as a timezone-aware UTC datetime to ensure correct comparison
-    started_at_dt = datetime.fromisoformat(started_at)
-    if started_at_dt.tzinfo is None:
-        started_at_dt = started_at_dt.replace(tzinfo=UTC)
-
-    try:
-        async with connection_pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                # Count the table and the would-be-deleted rows BEFORE deleting so a
-                # near-total wipe can be vetoed inside the same transaction.
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL("SELECT count(*) FROM {table}").format(table=sql.Identifier(data_type))
-                )
-                total_row = await cursor.fetchone()
-                total_count = total_row[0] if total_row else 0
-
-                if total_count == 0:
-                    logger.info(
-                        f"✅ No {data_type} rows to purge (table empty)",
-                        data_type=data_type,
-                    )
-                    return
-
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL("SELECT count(*) FROM {table} WHERE updated_at < %s").format(table=sql.Identifier(data_type)),
-                    (started_at_dt,),
-                )
-                stale_row = await cursor.fetchone()
-                stale_count = stale_row[0] if stale_row else 0
-
-                if stale_count == 0:
-                    logger.info(
-                        f"✅ No stale {data_type} rows to purge",
-                        data_type=data_type,
-                    )
-                    return
-
-                # Guard 2: veto near-total wipes — the resumed-extraction signature.
-                delete_fraction = stale_count / total_count
-                if delete_fraction >= PURGE_MAX_DELETE_FRACTION:
-                    logger.error(
-                        f"🛡️ Refusing to purge {stale_count}/{total_count} "
-                        f"{data_type} rows ({delete_fraction:.1%} of table) — exceeds "
-                        f"safety cap, likely a resumed extraction not a dump shrink",
-                        data_type=data_type,
-                        stale=stale_count,
-                        total=total_count,
-                        fraction=round(delete_fraction, 4),
-                    )
-                    return
-
-                # No RETURNING/fetchall here — the only past use of the
-                # deleted rows was len(), a count already known exactly from
-                # cursor.rowcount (the DELETE's own affected-row count,
-                # available with O(1) memory regardless of table size).
-                # RETURNING data_id would stream every deleted id back over
-                # the wire and buffer it into one Python list purely to
-                # discard it after counting — a multi-GB allocation on a
-                # large purge (discogsography-6u1o).
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL("DELETE FROM {table} WHERE updated_at < %s").format(table=sql.Identifier(data_type)),
-                    (started_at_dt,),
-                )
-                deleted_count = cursor.rowcount
-
-                logger.info(
-                    f"🧹 Purged {deleted_count} stale {data_type} rows (not updated since extraction started)",
-                    data_type=data_type,
-                    deleted=deleted_count,
-                )
-    except Exception as e:
-        logger.error(
-            f"❌ Failed to purge stale {data_type} rows",
-            data_type=data_type,
-            error=str(e),
-        )
-        raise
+    persistence = PostgreSQLRecordPersistence(
+        connection_pool,
+        logger,
+        PURGE_MAX_DELETE_FRACTION,
+        media_for_release,
+    )
+    await persistence.purge_stale_rows(data_type, started_at, record_count)
 
 
 def make_data_handler(
@@ -952,90 +845,13 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
         if connection_pool is None:
             raise RuntimeError("Connection pool not initialized")
 
-        terminal_outcome = "processed"
-        async with connection_pool.connection() as conn, conn.cursor() as cursor:
-            # Conditional upsert: only rewrites hash and data when hash differs,
-            # but always refreshes updated_at so post-extraction stale row
-            # purge does not delete unchanged-but-still-present records.
-            #
-            # releases additionally carries the indexed `media` column (ADR 0007):
-            # the API filters on it, not on data->'media'. It follows the same
-            # hash-gated rewrite as `data` so it never drifts from the payload it
-            # was derived from, with ONE exception: a row persisted before the
-            # column existed has a hash its payload already agrees with, so the
-            # hash gate alone would leave `media` NULL forever. `OR media IS NULL`
-            # backfills exactly those rows, mirroring batch_processor.py's
-            # media-only UPDATE. media_for_release() derives a best-effort block
-            # from the raw `formats` list when the event predates the field, so
-            # the column is never NULL for a row this loader writes.
-            #
-            # The `prior` CTE reads the pre-write state in the SAME round trip --
-            # a WITH sub-statement cannot see the sibling INSERT's effects -- so
-            # this write can be reported as `media_backfilled` rather than
-            # `processed` without a second query per message.
-            if data_type == "releases":
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL(
-                        "WITH prior AS ("
-                        "SELECT hash AS prior_hash, media IS NULL AS prior_media_is_null "
-                        "FROM {table} WHERE data_id = %s"
-                        "), upserted AS ("
-                        "INSERT INTO {table} (hash, data_id, data, media, updated_at) "
-                        "VALUES (%s, %s, %s, %s, NOW()) "
-                        "ON CONFLICT (data_id) DO UPDATE "
-                        "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.hash ELSE {table}.hash END, "
-                        "data = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.data ELSE {table}.data END, "
-                        "media = CASE WHEN {table}.hash != EXCLUDED.hash OR {table}.media IS NULL "
-                        "THEN EXCLUDED.media ELSE {table}.media END, "
-                        "updated_at = NOW() "
-                        "RETURNING 1"
-                        ") "
-                        "SELECT COALESCE(prior.prior_hash = %s, false) AND prior.prior_media_is_null "
-                        "FROM prior;"
-                    ).format(table=sql.Identifier(data_type)),
-                    (
-                        data_id,
-                        data.get("sha256", ""),
-                        data_id,
-                        Jsonb(data),
-                        Jsonb(media_for_release(data)),
-                        data.get("sha256", ""),
-                    ),
-                )
-                # No row means the release did not exist yet, so the INSERT wrote
-                # `media` on the normal path. `is True` rather than truthiness:
-                # the column is a SQL boolean, and a test double's cursor must not
-                # be read as a backfill.
-                prior_state = await cursor.fetchone()
-                if prior_state is not None and prior_state[0] is True:
-                    terminal_outcome = "media_backfilled"
-            else:
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query  # safe: psycopg2 sql.Identifier parameterizes the identifier, not user input
-                    sql.SQL(
-                        "INSERT INTO {table} (hash, data_id, data, updated_at) "
-                        "VALUES (%s, %s, %s, NOW()) "
-                        "ON CONFLICT (data_id) DO UPDATE "
-                        "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.hash ELSE {table}.hash END, "
-                        "data = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.data ELSE {table}.data END, "
-                        "updated_at = NOW();"
-                    ).format(table=sql.Identifier(data_type)),
-                    (
-                        data.get("sha256", ""),
-                        data_id,
-                        Jsonb(data),
-                    ),
-                )
-
-            # Commit is automatic when exiting the connection context
-            logger.debug(
-                "🐘 Updated record in PostgreSQL",
-                data_type=data_type[:-1],
-                data_id=data_id,
-            )
+        persistence = PostgreSQLRecordPersistence(
+            connection_pool,
+            logger,
+            PURGE_MAX_DELETE_FRACTION,
+            media_for_release,
+        )
+        terminal_outcome = await persistence.persist_record(data_type, data_id, data)
 
         await message.ack()
         # "media_backfilled" -- the payload's hash already matched, so nothing was
