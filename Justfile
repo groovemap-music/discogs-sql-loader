@@ -31,9 +31,14 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest --cov=tableinator --cov-report=term-missing --cov-report=xml
+    uv run pytest -m "not integration" --cov=tableinator --cov-report=term-missing --cov-report=xml
 
 coverage: test
+
+# Starts a pinned disposable PostgreSQL container unless TEST_DATABASE_URL points
+# at an existing disposable database. This lane is intentionally outside `check`.
+test-integration:
+    bash scripts/test-integration.sh
 
 build:
     uv build --out-dir dist --clear
