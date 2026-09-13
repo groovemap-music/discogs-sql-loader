@@ -13,8 +13,8 @@ flowchart LR
     broker --> loader[discogs-sql-loader]
     schema[database-schema] -->|creates and migrates| postgres[(PostgreSQL)]
     loader -->|upserts Discogs documents| postgres
-    loader -. does not write .-> graph[(Neo4j)]
-    graph_owner[discogs-graph-enricher] -->|owns Discogs graph projection| graph
+    loader -.->|does not write| neo4j[(Neo4j)]
+    graph_owner[discogs-graph-enricher] -->|owns Discogs graph projection| neo4j
 ```
 
 ## Tables this service writes
