@@ -11,14 +11,17 @@ Start with these repository-specific guides:
 - [File completion tracking](file-completion-tracking.md) — file and extraction
   completion semantics.
 - [Database resilience](database-resilience.md) — outage and recovery behavior.
-- [Performance](performance-guide.md) — batching and PostgreSQL tuning guidance.
-- [PostgreSQL pool exhaustion analysis](postgres-pool-exhaustion-analysis.md) — why
-  non-batch concurrency is bounded by the pool.
+- [Performance](performance-guide.md) — batching and PostgreSQL tuning within this
+  consumer.
+- [PostgreSQL pool protection](postgres-pool-exhaustion-analysis.md) — how batch and
+  non-batch modes bound connection demand.
+- [PostgreSQL persistence boundary](database-schema.md) — tables and write invariants
+  this consumer relies on, with links to the owning schema repository.
+- [Query performance ownership](query-performance-optimizations.md) — pointers to the
+  API, graph, schema, and deployment owners.
 
-Additional migrated reference material:
+Additional repository governance:
 
-- [Database schema](database-schema.md)
-- [Query performance optimizations](query-performance-optimizations.md)
 - [Release compliance](release-compliance.md)
 - [History rewrite approval gate](history-rewrite-gate.md)
 

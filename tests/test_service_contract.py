@@ -41,14 +41,13 @@ def test_public_documentation_uses_mermaid_and_records_compatibility() -> None:
 def test_documented_defaults_and_schema_ownership_match_promoted_contracts() -> None:
     performance = (ROOT / "docs/performance-guide.md").read_text()
     schema = (ROOT / "docs/database-schema.md").read_text()
-    assert "POSTGRES_BATCH_SIZE = 100  # Records per batch" in performance
-    assert "POSTGRES_BATCH_FLUSH_INTERVAL = 5.0  # Seconds between flushes" in performance
-    assert "repository owns every schema definition" in schema
-    assert "`src/groovemap_schema/neo4j.py`" in schema
-    assert "`src/groovemap_schema/postgres.py`" in schema
-    assert "`schema-init` is only the one-shot service name" in schema
-    assert "schema-init/neo4j_schema.py" not in schema
-    assert "schema-init/postgres_schema.py" not in schema
+    assert "| `POSTGRES_BATCH_SIZE` | `100` |" in performance
+    assert "| `POSTGRES_BATCH_FLUSH_INTERVAL` | `5.0` seconds |" in performance
+    assert "does not create or migrate database objects" in schema
+    assert "database-schema/blob/main/src/groovemap_schema/postgres.py" in schema
+    assert "groovemap-music/discogs-graph-enricher" in schema
+    assert "producer[discogs-ingestion]" in schema
+    assert "CREATE TABLE" not in schema
 
 
 def test_catalog_contract_matches_discogs_stream() -> None:
