@@ -6,7 +6,7 @@ and releases tables used for structured queries and downstream enrichment.
 
 ```mermaid
 flowchart LR
-    ingestion[catalog-ingestion] -->|Discogs catalog events| rabbit[(RabbitMQ)]
+    ingestion[discogs-ingestion] -->|Discogs catalog events| rabbit[(RabbitMQ)]
     rabbit --> loader[discogs-sql-loader]
     loader -->|batched idempotent upserts| postgres[(PostgreSQL)]
     loader -->|status on port 8002| health[Health endpoint]
@@ -64,7 +64,7 @@ connect to live PostgreSQL or RabbitMQ services.
 See [Operations](docs/operations.md) for configuration, input and output details,
 completion semantics, health states, and troubleshooting. The
 [documentation index](docs/README.md) links the focused resilience, performance, and
-schema references.
+persistence-boundary references.
 
 ## Telemetry
 
@@ -100,7 +100,7 @@ ready callback, which is where a coroutine blocking the loop shows up and nowher
 
 ## Contracts and compatibility
 
-The catalog-event contract is promoted from `catalog-ingestion`; persistence
+The catalog-event contract is promoted from `discogs-ingestion`; persistence
 compatibility is promoted from `database-schema`. `just source-check` verifies both
 boundaries and their generated binding.
 
