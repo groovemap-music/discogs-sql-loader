@@ -43,7 +43,7 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
         "language: python",
         "setup-command: just setup",
         "check-command: just check",
-        "coverage-command: just test",
+        "coverage-command: just coverage",
         "audit-command: just audit",
         "license-command: just license-check",
         "secret-scan-command: just secret-scan",

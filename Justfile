@@ -6,17 +6,22 @@ default:
 setup:
     uv sync --dev --frozen
 
-source-check:
-    uvx --from ruff==0.16.4 ruff format --check .
-    uvx --from ruff==0.16.4 ruff check .
-    python scripts/check-contracts.py
-    just secret-scan
+source-check: format-check lint contract-check
+
+format-check:
+    uv run ruff format --check .
+
+lint:
+    uv run ruff check .
+
+contract-check:
+    uv run python scripts/check-contracts.py
 
 secret-scan:
     gitleaks git --redact --no-banner
     gitleaks dir . --redact --no-banner
 
-check: source-check typecheck test build install-check license-check bump-preview
+check: source-check typecheck coverage secret-scan build install-check license-check bump-preview
 
 format:
     uv run ruff format .
@@ -27,6 +32,8 @@ typecheck:
 
 test:
     uv run pytest --cov=tableinator --cov-report=term-missing --cov-report=xml
+
+coverage: test
 
 build:
     uv build --out-dir dist --clear
@@ -54,7 +61,7 @@ bump-preview:
 
 # Update local version metadata and changelog only; do not commit, tag, push, or publish.
 bump:
-    uv run cz bump --files-only --changelog --yes --check-consistency
+    uv run cz bump --version-files-only --changelog --yes --check-consistency
     uv lock
 
 release-dry-run: check
