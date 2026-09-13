@@ -4,7 +4,7 @@
 
 ```mermaid
 sequenceDiagram
-    participant I as catalog-ingestion
+    participant I as discogs-ingestion
     participant R as RabbitMQ
     participant L as discogs-sql-loader
     participant P as PostgreSQL
@@ -84,9 +84,13 @@ the service's own running loop. `shutdown_telemetry()` runs during graceful shut
 final export of both signals lands and the monitor is cancelled. With
 `OTEL_EXPORTER_OTLP_ENDPOINT` unset (the default), both providers are no-ops and the service
 behaves exactly as it does without the `otel` extra. The two signals are independent: either
-exporter can be set to `none` without affecting the other. The service does not expose a
-Prometheus `/metrics` scrape endpoint for these metrics; the health server's own `/health` route
-is unaffected.
+exporter can be set to `none` without affecting the other.
+
+The service pushes application metrics over OTLP to the deployment-owned collector; the
+collector remote-writes them to VictoriaMetrics. This service does not expose a Prometheus
+scrape endpoint for OpenTelemetry metrics, and the health server's `/health` route is
+unaffected. The collector, VictoriaMetrics, Grafana data source, and retention settings belong
+to [deployment observability](https://github.com/groovemap-music/deployment/blob/main/docs/observability.md).
 
 Instruments recorded from the per-message handler and the batch processor:
 

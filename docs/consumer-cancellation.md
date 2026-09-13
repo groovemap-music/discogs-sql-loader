@@ -5,7 +5,7 @@ its entity file is complete and the loader has drained that entity's accepted ba
 
 ```mermaid
 sequenceDiagram
-    participant I as catalog-ingestion
+    participant I as discogs-ingestion
     participant R as RabbitMQ
     participant L as discogs-sql-loader
     participant P as PostgreSQL
