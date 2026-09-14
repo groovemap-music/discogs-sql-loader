@@ -50,6 +50,7 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
         "package-command: just build",
         "install-command: just install-check",
         "image-command: just image",
+        "integration-command: just test-integration",
         "coverage-files: coverage.xml",
         "upload-codecov: true",
         "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}",
