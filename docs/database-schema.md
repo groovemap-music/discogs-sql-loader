@@ -24,10 +24,10 @@ Each name maps directly to one public PostgreSQL table:
 
 | Table | Key supplied by the event | Columns maintained by this service |
 | --- | --- | --- |
-| `artists` | Discogs artist ID | `hash`, `data_id`, `data`, `updated_at` |
-| `labels` | Discogs label ID | `hash`, `data_id`, `data`, `updated_at` |
-| `masters` | Discogs master ID | `hash`, `data_id`, `data`, `updated_at` |
-| `releases` | Discogs release ID | `hash`, `data_id`, `data`, `media`, `updated_at` |
+| `artists` | Discogs artist ID | `hash`, `data_id`, `data`, `gm_item_id`, `updated_at` |
+| `labels` | Discogs label ID | `hash`, `data_id`, `data`, `gm_item_id`, `updated_at` |
+| `masters` | Discogs master ID | `hash`, `data_id`, `data`, `gm_item_id`, `updated_at` |
+| `releases` | Discogs release ID | `hash`, `data_id`, `data`, `media`, `gm_item_id`, `updated_at` |
 
 `data` preserves the complete normalized event payload as JSONB. `hash` is the
 producer-supplied SHA-256 value used to avoid rewriting an unchanged document.
@@ -42,12 +42,40 @@ The media shape is owned by
 [ADR 0007](https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md),
 while the column and index remain owned by `database-schema`.
 
+## Native identity
+
+`gm_item_id` is the GrooveMap catalog item the row's Discogs identifier maps to. The
+Discogs `data_id` remains the primary key and the conflict target; `gm_item_id` is an
+additive nullable column beside it, so a provider identifier is evidence rather than
+identity ([ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity.md)).
+
+The minting rule:
+
+- The loader resolves `(discogs, <entity kind>, data_id)` through
+  `common.identity.resolve_aliases`, which looks the alias up and mints a `catalog_items`
+  row and a `provider_aliases` row for a miss. The entity kind is the singular table
+  name: `artist`, `label`, `master`, `release`.
+- Batch mode resolves the whole batch in one call, on the batch's own connection and
+  inside the batch's transaction, before any write. A batch is therefore either fully
+  identified or rolled back whole, and a Discogs identifier the resolve does not answer
+  fails the batch rather than writing an unidentified row.
+- Every upsert, batch and non-batch, writes `gm_item_id` on insert and on conflict.
+- A hash-unchanged row whose `gm_item_id` is still NULL predates minting. It receives an
+  identity-only backfill in the same transaction, the way a NULL `media` column is
+  backfilled; its `hash` and `data` remain unchanged. An unchanged row that already
+  carries a `gm_item_id` is left alone.
+
+The table, the column, and its index remain owned by `database-schema`; the alias tables
+`catalog_items` and `provider_aliases` are owned there too and read through the shared
+`groovemap-runtime` implementation rather than any SQL in this repository.
+
 ## Write and cleanup invariants
 
 - `data_id` is the conflict key for idempotent upserts.
 - Batch mode writes each entity batch in one PostgreSQL transaction and acknowledges
   its deliveries only after commit.
-- Non-batch mode preserves the same hash-gated update and media-backfill behavior.
+- Non-batch mode preserves the same hash-gated update, media-backfill, and native-identity
+  behavior, resolving its single alias on the connection that performs the upsert.
 - `file_complete` drains the pending batch for its entity before acknowledgement.
 - `extraction_complete` can delete rows whose `updated_at` predates the extraction,
   but only when no record for that entity was dead-lettered and the configured

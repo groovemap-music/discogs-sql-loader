@@ -2328,7 +2328,7 @@ class TestOnDataMessageReleaseMedia:
         mock_message.ack.assert_called_once()
         query, params = mock_cursor.execute.call_args[0]
         assert "media" not in query.as_string(None)
-        assert len(params) == 3
+        assert len(params) == 4  # hash, data_id, data, gm_item_id
 
 
 class TestOnDataMessageMediaBackfill:

@@ -1,8 +1,11 @@
 from datetime import UTC, datetime
 from typing import Any
 
+from common.identity import resolve_aliases
 from psycopg import sql
 from psycopg.types.json import Jsonb
+
+from tableinator.identity import alias_ref
 
 
 class PostgreSQLRecordPersistence:
@@ -117,6 +120,17 @@ class PostgreSQLRecordPersistence:
         """Persist one normalized record and return its telemetry outcome."""
         terminal_outcome = "processed"
         async with self.connection_pool.connection() as conn, conn.cursor() as cursor:
+            # Native identity (ADR 0009): resolve before the upsert, on the same connection
+            # and therefore inside the same transaction, so the row is written with the
+            # native item it maps to or not written at all.
+            ref = alias_ref(data_type, data_id)
+            native_ids = await resolve_aliases(conn, [ref])
+            if ref not in native_ids:
+                # Every Discogs entity kind is a catalog kind, so a miss is a broken
+                # assumption rather than a retryable outage.
+                raise RuntimeError(f"resolve_aliases returned no native id for {data_type}: {data_id}")
+            gm_item_id = native_ids[ref]
+
             if data_type == "releases":
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
                     sql.SQL(
@@ -124,8 +138,8 @@ class PostgreSQLRecordPersistence:
                         "SELECT hash AS prior_hash, media IS NULL AS prior_media_is_null "
                         "FROM {table} WHERE data_id = %s"
                         "), upserted AS ("
-                        "INSERT INTO {table} (hash, data_id, data, media, updated_at) "
-                        "VALUES (%s, %s, %s, %s, NOW()) "
+                        "INSERT INTO {table} (hash, data_id, data, media, gm_item_id, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, NOW()) "
                         "ON CONFLICT (data_id) DO UPDATE "
                         "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
                         "THEN EXCLUDED.hash ELSE {table}.hash END, "
@@ -133,6 +147,7 @@ class PostgreSQLRecordPersistence:
                         "THEN EXCLUDED.data ELSE {table}.data END, "
                         "media = CASE WHEN {table}.hash != EXCLUDED.hash OR {table}.media IS NULL "
                         "THEN EXCLUDED.media ELSE {table}.media END, "
+                        "gm_item_id = EXCLUDED.gm_item_id, "
                         "updated_at = NOW() "
                         "RETURNING 1"
                         ") "
@@ -145,6 +160,7 @@ class PostgreSQLRecordPersistence:
                         data_id,
                         Jsonb(data),
                         Jsonb(self.media_resolver(data)),
+                        gm_item_id,
                         data.get("sha256", ""),
                     ),
                 )
@@ -154,16 +170,17 @@ class PostgreSQLRecordPersistence:
             else:
                 await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
                     sql.SQL(
-                        "INSERT INTO {table} (hash, data_id, data, updated_at) "
-                        "VALUES (%s, %s, %s, NOW()) "
+                        "INSERT INTO {table} (hash, data_id, data, gm_item_id, updated_at) "
+                        "VALUES (%s, %s, %s, %s, NOW()) "
                         "ON CONFLICT (data_id) DO UPDATE "
                         "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
                         "THEN EXCLUDED.hash ELSE {table}.hash END, "
                         "data = CASE WHEN {table}.hash != EXCLUDED.hash "
                         "THEN EXCLUDED.data ELSE {table}.data END, "
+                        "gm_item_id = EXCLUDED.gm_item_id, "
                         "updated_at = NOW();"
                     ).format(table=sql.Identifier(data_type)),
-                    (data.get("sha256", ""), data_id, Jsonb(data)),
+                    (data.get("sha256", ""), data_id, Jsonb(data), gm_item_id),
                 )
 
             self.logger.debug(
