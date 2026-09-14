@@ -17,6 +17,7 @@ def digest(path: Path) -> str:
 catalog_source = json.loads((ROOT / "contracts/catalog-events/v1/source.json").read_text())
 persistence_source = json.loads((ROOT / "contracts/persistence/v1/source.json").read_text())
 compatibility = json.loads((ROOT / "contracts/persistence/v1/compatibility.json").read_text())
+runtime_source = json.loads((ROOT / "contracts/runtime/v1/source.json").read_text())
 with (ROOT / "pyproject.toml").open("rb") as source:
     pyproject = tomllib.load(source)
 
@@ -26,5 +27,7 @@ assert digest(ROOT / "contracts/persistence/v1/compatibility.json") == persisten
 assert compatibility["contract"] == "groovemap.persistence"
 assert compatibility["version"] == 1
 assert compatibility["application_runtime"]["tested_version"] == "0.1.0"
-runtime_source = pyproject["tool"]["uv"]["sources"]["groovemap-runtime"]
-assert runtime_source["rev"] == compatibility["application_runtime"]["tested_commit"]
+runtime_dependency = pyproject["tool"]["uv"]["sources"]["groovemap-runtime"]
+assert runtime_source["package"] == "groovemap-runtime"
+assert runtime_source["version"] == compatibility["application_runtime"]["tested_version"]
+assert runtime_dependency["rev"] == runtime_source["source_commit"]

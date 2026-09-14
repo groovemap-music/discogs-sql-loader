@@ -24,6 +24,7 @@ from opentelemetry.trace import NoOpTracerProvider, SpanKind, StatusCode
 
 from tableinator import telemetry
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
+from tableinator.batch_writer import BatchWriteResult
 from tableinator.tableinator import main, make_data_handler
 
 
@@ -277,7 +278,7 @@ class TestFlushSpan:
                 )
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("artists")
+            await processor.flush_queue("artists")
 
         span = span_collector.one("flush postgresql artists")
         assert span.kind is SpanKind.INTERNAL
@@ -308,7 +309,7 @@ class TestFlushSpan:
                 )
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("releases")
+            await processor.flush_queue("releases")
 
         assert MAX_FLUSH_LINKS == 64
         assert len(span_collector.one("flush postgresql releases").links) == MAX_FLUSH_LINKS
@@ -318,10 +319,11 @@ class TestFlushSpan:
         """_process_batch's pool calls run inside the flush span, so their spans are children."""
         processor = PostgreSQLBatchProcessor(MagicMock(), BatchConfig(batch_size=10))
 
-        async def process_batch(*_args: Any) -> None:
+        async def process_batch(*_args: Any) -> BatchWriteResult:
             tracer = common_telemetry.tracer_provider().get_tracer("test")
             with tracer.start_as_current_span("execute postgresql", kind=SpanKind.CLIENT):
                 pass
+            return BatchWriteResult(set(), set(), set())
 
         processor._process_batch = process_batch  # type: ignore[method-assign]
         await processor.add_message(
@@ -332,7 +334,7 @@ class TestFlushSpan:
         )
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("artists")
+            await processor.flush_queue("artists")
 
         flush = span_collector.one("flush postgresql artists")
         db_span = span_collector.one("execute postgresql")
@@ -341,7 +343,7 @@ class TestFlushSpan:
 
     @pytest.mark.asyncio
     async def test_a_poison_batch_fails_the_span_with_error_type_only(self, span_collector: SpanCollector) -> None:
-        config = BatchConfig(batch_size=5, max_poison_retries=1, backoff_initial=0.0, min_batch_size=1)
+        config = BatchConfig(batch_size=5, max_poison_retries=1, backoff_initial=0.001, min_batch_size=1)
         processor = PostgreSQLBatchProcessor(MagicMock(), config=config)
         processor._process_batch = AsyncMock(side_effect=ValueError("invalid jsonb"))  # type: ignore[method-assign]
 
@@ -353,7 +355,7 @@ class TestFlushSpan:
         )
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("artists")
+            await processor.flush_queue("artists")
 
         span = span_collector.one("flush postgresql artists")
         assert span.attributes["outcome"] == "failed"
@@ -373,7 +375,7 @@ class TestFlushSpan:
         metric, which is not recorded here either."""
         from common.db_resilience import DatabaseUnavailableError
 
-        processor = PostgreSQLBatchProcessor(MagicMock(), BatchConfig(batch_size=5, backoff_initial=0.0))
+        processor = PostgreSQLBatchProcessor(MagicMock(), BatchConfig(batch_size=5, backoff_initial=0.001))
         processor._process_batch = AsyncMock(side_effect=DatabaseUnavailableError("db down"))  # type: ignore[method-assign]
 
         await processor.add_message(
@@ -384,7 +386,7 @@ class TestFlushSpan:
         )
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("artists")
+            await processor._engine.flush("artists")
 
         span = span_collector.one("flush postgresql artists")
         assert "outcome" not in span.attributes

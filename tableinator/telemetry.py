@@ -241,13 +241,18 @@ def _trace_api() -> Any:
 
 def mark_span_error(span: Any, exc: BaseException) -> None:
     """Fail a span with ``error.type`` only. Never raises, and a no-op for a None span."""
+    mark_span_error_type(span, error_type_of(exc))
+
+
+def mark_span_error_type(span: Any, error_type: str) -> None:
+    """Fail a span using the closed-set exception name retained by the runtime."""
     if span is None:
         return
     trace = _trace_api()
     if trace is None:  # pragma: no cover - exercised only without the extra
         return
     try:
-        span.set_attribute("error.type", error_type_of(exc))
+        span.set_attribute("error.type", error_type)
         span.set_status(trace.Status(trace.StatusCode.ERROR))
     except Exception:  # pragma: no cover - defensive
         logger.debug("Could not mark a span as failed", exc_info=True)

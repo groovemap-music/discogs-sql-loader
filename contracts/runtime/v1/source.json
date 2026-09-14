@@ -1,0 +1,14 @@
+{
+  "capabilities": [
+    "batch",
+    "delivery",
+    "otel",
+    "postgres",
+    "rabbitmq"
+  ],
+  "package": "groovemap-runtime",
+  "source_commit": "24704f5fd48d3ef4fff29398585e9924e225b0c5",
+  "source_repository": "https://github.com/groovemap-music/python-libraries",
+  "source_tree": "c5b96bdeab082057480a26784ad6065497aaae9a",
+  "version": "0.1.0"
+}
