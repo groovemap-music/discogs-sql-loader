@@ -4,12 +4,14 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from common import AsyncPostgreSQLPool
 from common import telemetry as common_telemetry
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from psycopg import AsyncConnection, AsyncCursor, AsyncTransaction
 
 from tableinator import telemetry as tableinator_telemetry
 
@@ -70,12 +72,20 @@ def service_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def mock_postgres_connection() -> MagicMock:
-    """Return a PostgreSQL connection boundary suitable for unit tests."""
-    connection = MagicMock()
-    cursor = MagicMock()
-    connection.cursor.return_value.__enter__.return_value = cursor
+def mock_postgres_connection() -> AsyncMock:
+    """Return an async psycopg connection with faithful cursor/transaction contexts."""
+    connection = AsyncMock(spec_set=AsyncConnection)
+    cursor = AsyncMock(spec_set=AsyncCursor)
+    cursor.__aenter__.return_value = cursor
+    cursor.__aexit__.return_value = None
     cursor.fetchone.return_value = None
+    cursor.fetchall.return_value = []
+    connection.cursor.return_value = cursor
+
+    transaction = AsyncMock(spec_set=AsyncTransaction)
+    transaction.__aenter__.return_value = transaction
+    transaction.__aexit__.return_value = None
+    connection.transaction.return_value = transaction
     return connection
 
 
@@ -145,14 +155,15 @@ def disable_batch_mode() -> Iterator[None]:
 
 @pytest.fixture
 def mock_async_pool():
-    """Mock AsyncPostgreSQLPool with async context manager support.
+    """Build a spec-checked async pool that yields one configured connection.
 
-    Returns a function that creates a mock pool with a given connection mock.
-    This allows tests to configure the connection's behavior before creating the pool.
+    The real ``AsyncPostgreSQLPool.connection()`` method is an async context
+    manager, not a coroutine. The local context-manager function deliberately
+    preserves that distinction so unit tests cannot accidentally ``await`` it.
 
     Usage:
-        mock_conn = MagicMock()
-        mock_cursor = mock_conn.cursor.return_value.__enter__.return_value
+        mock_conn = AsyncMock(spec_set=AsyncConnection)
+        mock_cursor = mock_conn.cursor.return_value.__aenter__.return_value
         mock_cursor.fetchone.return_value = None
 
         pool = mock_async_pool(mock_conn)
@@ -163,11 +174,10 @@ def mock_async_pool():
     def create_pool(mock_connection: Any = None) -> MagicMock:
         """Create a mock pool that returns the given connection."""
         if mock_connection is None:
-            mock_connection = MagicMock()
+            mock_connection = AsyncMock(spec_set=AsyncConnection)
 
-        mock_pool = MagicMock()
+        mock_pool = MagicMock(spec_set=AsyncPostgreSQLPool)
 
-        # Create async context manager for connection
         mock_connection_cm = AsyncMock()
         mock_connection_cm.__aenter__ = AsyncMock(return_value=mock_connection)
         mock_connection_cm.__aexit__ = AsyncMock(return_value=None)
@@ -175,7 +185,7 @@ def mock_async_pool():
         # For async with connection_pool.connection() pattern:
         # connection() should return the context manager directly (not a coroutine)
         mock_pool.connection = MagicMock(return_value=mock_connection_cm)
-        mock_pool.close = AsyncMock()
+        mock_pool.close.return_value = None
 
         return mock_pool
 

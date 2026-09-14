@@ -39,6 +39,13 @@ secrets, type-checks, runs the mocked unit and regression suite with coverage, b
 and installs the wheel, checks licenses, and previews the next version. Tests do not
 connect to live PostgreSQL or RabbitMQ services.
 
+Run `just test-integration` to exercise representative single-record and batch upserts
+against a pinned, disposable PostgreSQL 18 container. The test creates a unique
+synthetic schema, verifies JSONB round trips and `ON CONFLICT` updates, and removes the
+container when complete. To use an already-running disposable database instead, set
+`TEST_DATABASE_URL`; the command never prints that value. CI invokes this separate
+service-backed lane after the credential-free required checks.
+
 ## Operational behavior
 
 - Batch mode is on by default. Messages are acknowledged only after their PostgreSQL
