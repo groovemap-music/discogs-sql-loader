@@ -412,6 +412,7 @@ class PostgreSQLBatchProcessor:
         success = False
         unchanged_ids: set[str] = set()
         media_backfilled_ids: set[str] = set()
+        identity_backfilled_ids: set[str] = set()
 
         # Limit concurrent PostgreSQL operations to prevent pool exhaustion
         if self._flush_semaphore is None:
@@ -439,7 +440,7 @@ class PostgreSQLBatchProcessor:
                 # below (the real implementation always returns a BatchWriteResult).
                 batch_result = await self._process_batch(data_type, messages)
                 if batch_result is not None:
-                    unchanged_ids, media_backfilled_ids = batch_result
+                    unchanged_ids, media_backfilled_ids, identity_backfilled_ids = batch_result
                 success = True
 
             except asyncio.CancelledError:
@@ -634,6 +635,7 @@ class PostgreSQLBatchProcessor:
                 records_per_sec=round(len(messages) / batch_duration) if batch_duration > 0 else 0,
                 total_processed=self.processed_counts[data_type],
                 media_backfilled=len(media_backfilled_ids),
+                identity_backfilled=len(identity_backfilled_ids),
             )
 
     async def _process_batch(self, data_type: str, messages: list[PendingMessage]) -> BatchWriteResult:

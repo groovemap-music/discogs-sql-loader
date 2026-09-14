@@ -1,5 +1,6 @@
 """Pytest configuration for tableinator tests."""
 
+import uuid
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +20,7 @@ from tableinator import telemetry as tableinator_telemetry
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from common.identity import AliasRef
     from opentelemetry.sdk.metrics.export import Metric
     from opentelemetry.sdk.trace import ReadableSpan
 
@@ -69,6 +71,39 @@ def service_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+
+
+NATIVE_ID_NAMESPACE = uuid.UUID("6f6d2a7e-2f1e-4f2c-9f4a-0f3f6b1d9c21")
+
+
+def native_id_for(ref: AliasRef) -> uuid.UUID:
+    """Return the deterministic stand-in native id the offline suites resolve to."""
+    return uuid.uuid5(NATIVE_ID_NAMESPACE, f"{ref.provider}/{ref.entity_kind}/{ref.external_id}")
+
+
+@pytest.fixture(autouse=True)
+def stub_resolve_aliases(request: pytest.FixtureRequest) -> Iterator[AsyncMock | None]:
+    """Answer every native-id resolve offline with a deterministic id per alias ref.
+
+    ``common.identity.resolve_aliases`` is three PostgreSQL round trips, and the default
+    lanes must not reach a database, so both write paths get a stub that derives a stable
+    id from the ref itself. Integration tests keep the real function: they own a live
+    schema and are the place the minting statements are actually exercised. A test that
+    asserts on how the loader resolves takes this fixture and reads or reconfigures it.
+    """
+    if request.node.get_closest_marker("integration"):
+        yield None
+        return
+
+    async def resolve(_conn: Any, refs: Any, **_options: Any) -> dict[AliasRef, uuid.UUID]:
+        return {ref: native_id_for(ref) for ref in refs}
+
+    resolver = AsyncMock(side_effect=resolve)
+    with (
+        patch("tableinator.batch_writer.resolve_aliases", resolver),
+        patch("tableinator.record_persistence.resolve_aliases", resolver),
+    ):
+        yield resolver
 
 
 @pytest.fixture

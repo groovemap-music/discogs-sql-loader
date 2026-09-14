@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from common.identity import AliasRef
 from psycopg.errors import InterfaceError, OperationalError
 
 from tableinator.batch_processor import (
@@ -16,6 +17,8 @@ from tableinator.batch_processor import (
     PostgreSQLBatchProcessor,
 )
 from tableinator.media import media_for_release
+from tableinator.record_persistence import PostgreSQLRecordPersistence
+from tests.conftest import native_id_for
 
 
 class TestBatchConfig:
@@ -308,7 +311,7 @@ class TestPostgreSQLBatchProcessor:
         mock_connection = MagicMock()
         mock_connection.set_autocommit = AsyncMock()
         mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[("1", "abc")])  # ID 1 unchanged
+        mock_cursor.fetchall = AsyncMock(return_value=[("1", "abc", False)])  # ID 1 unchanged, already minted
 
         # Setup async cursor context manager
         mock_cursor_cm = AsyncMock()
@@ -676,7 +679,7 @@ class TestPostgreSQLBatchProcessor:
         """Test batch processing skips unchanged records."""
         mock_connection = AsyncMock()
         mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[("1", "abc"), ("2", "def")])
+        mock_cursor.fetchall = AsyncMock(return_value=[("1", "abc", False), ("2", "def", False)])
 
         # Setup async cursor context manager
         mock_cursor_cm = AsyncMock()
@@ -727,7 +730,7 @@ class TestPostgreSQLBatchProcessor:
 
         # executemany should not be called if all records unchanged
         assert mock_cursor.executemany.call_count == 0
-        assert unchanged_ids == BatchWriteResult({"1", "2"}, set())
+        assert unchanged_ids == BatchWriteResult({"1", "2"}, set(), set())
 
     @pytest.mark.asyncio
     async def test_process_batch_with_mixed_records(self) -> None:
@@ -735,7 +738,7 @@ class TestPostgreSQLBatchProcessor:
         mock_connection = MagicMock()
         mock_connection.set_autocommit = AsyncMock()
         mock_cursor = AsyncMock()
-        mock_cursor.fetchall = AsyncMock(return_value=[("1", "abc"), ("2", "def_old")])
+        mock_cursor.fetchall = AsyncMock(return_value=[("1", "abc", False), ("2", "def_old", False)])
 
         # Setup async cursor context manager
         mock_cursor_cm = AsyncMock()
@@ -785,7 +788,7 @@ class TestPostgreSQLBatchProcessor:
         assert mock_cursor.executemany.call_count == 1
         call_args = mock_cursor.executemany.call_args[0]
         assert len(call_args[1]) == 1  # Only one record to upsert
-        assert unchanged_ids == BatchWriteResult({"1"}, set())
+        assert unchanged_ids == BatchWriteResult({"1"}, set(), set())
 
     @pytest.mark.asyncio
     async def test_flush_all(self) -> None:
@@ -1168,8 +1171,10 @@ class TestProcessBatchReleaseMedia:
     def _pool(existing_hashes: list[tuple[Any, ...]]) -> tuple[MagicMock, AsyncMock]:
         """Build a connection pool mock whose hash-fetch step answers `existing_hashes`.
 
-        A `releases` fetch selects a third column -- whether `media` IS NULL -- so rows
-        for that table are `(data_id, hash, media_is_null)`.
+        Every fetch selects whether `gm_item_id` IS NULL as its last column, and a
+        `releases` fetch selects whether `media` IS NULL before it, so rows are
+        `(data_id, hash, media_is_null, identity_is_null)` for that table and
+        `(data_id, hash, identity_is_null)` for the others.
         """
         mock_connection = MagicMock()
         mock_connection.set_autocommit = AsyncMock()
@@ -1224,7 +1229,7 @@ class TestProcessBatchReleaseMedia:
 
         records = mock_cursor.executemany.call_args[0][1]
         assert len(records) == 1
-        _sha256, _data_id, data_param, media_param = records[0]
+        _sha256, _data_id, data_param, media_param, _gm_item_id = records[0]
         assert media_param.obj == media_block
         assert data_param.obj["media"] == media_block
 
@@ -1239,7 +1244,7 @@ class TestProcessBatchReleaseMedia:
             await processor._process_batch("releases", messages)
 
         records = mock_cursor.executemany.call_args[0][1]
-        derived = records[0][-1].obj
+        derived = records[0][3].obj
         assert derived["families"] == ["vinyl"]
         assert derived["items"][0]["medium"] == "vinyl_12"
 
@@ -1253,7 +1258,7 @@ class TestProcessBatchReleaseMedia:
         with patch("tableinator.batch_processor.logger"):
             await processor._process_batch("releases", messages)
 
-        derived = mock_cursor.executemany.call_args[0][1][0][-1].obj
+        derived = mock_cursor.executemany.call_args[0][1][0][3].obj
         assert derived["items"] == []
         assert derived["families"] == []
         assert "Zorbatron" in derived["unmapped"]["formats"] or "Zorbatron" in derived["unmapped"]["descriptions"]
@@ -1265,29 +1270,29 @@ class TestProcessBatchReleaseMedia:
         processor1 = PostgreSQLBatchProcessor(pool1)
         with patch("tableinator.batch_processor.logger"):
             await processor1._process_batch("releases", [self._release_message("1", "abc")])
-        media_first = mock_cursor1.executemany.call_args[0][1][0][-1].obj
+        media_first = mock_cursor1.executemany.call_args[0][1][0][3].obj
 
         # Second run: the hash is unchanged, so this is the no-rewrite branch. The
         # `media` written by the first run must still be exactly what a fresh
         # derivation would produce — proving there is no drift to guard against.
-        pool2, mock_cursor2 = self._pool(existing_hashes=[("1", "abc", False)])
+        pool2, mock_cursor2 = self._pool(existing_hashes=[("1", "abc", False, False)])
         processor2 = PostgreSQLBatchProcessor(pool2)
         with patch("tableinator.batch_processor.logger"):
             unchanged_ids = await processor2._process_batch("releases", [self._release_message("1", "abc")])
 
-        assert unchanged_ids == BatchWriteResult({"1"}, set())
+        assert unchanged_ids == BatchWriteResult({"1"}, set(), set())
         assert mock_cursor2.executemany.call_count == 0
         pool3, mock_cursor3 = self._pool(existing_hashes=[])
         processor3 = PostgreSQLBatchProcessor(pool3)
         with patch("tableinator.batch_processor.logger"):
             await processor3._process_batch("releases", [self._release_message("1", "abc")])
-        media_second = mock_cursor3.executemany.call_args[0][1][0][-1].obj
+        media_second = mock_cursor3.executemany.call_args[0][1][0][3].obj
 
         assert media_first == media_second
 
     @pytest.mark.asyncio
     async def test_non_release_entity_gets_no_media_column(self) -> None:
-        """Non-release entities keep the original 3-column upsert, unchanged."""
+        """Non-release entities keep a media-free upsert: hash, data_id, data, gm_item_id."""
         pool, mock_cursor = self._pool(existing_hashes=[])
         processor = PostgreSQLBatchProcessor(pool)
         messages = [
@@ -1307,7 +1312,7 @@ class TestProcessBatchReleaseMedia:
         query = mock_cursor.executemany.call_args[0][0]
         records = mock_cursor.executemany.call_args[0][1]
         assert "media" not in query.as_string(None)
-        assert len(records[0]) == 3
+        assert len(records[0]) == 4
 
 
 class TestMediaBackfillOnUnchangedHash:
@@ -1331,14 +1336,14 @@ class TestMediaBackfillOnUnchangedHash:
     @pytest.mark.asyncio
     async def test_unchanged_hash_with_null_media_backfills_media(self) -> None:
         """Unchanged hash + NULL media writes the derived block, and only that column."""
-        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True)])
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True, False)])
         processor = PostgreSQLBatchProcessor(pool)
         message = self._release_message("1", "abc")  # no "media" key -> derived block
 
         with patch("tableinator.batch_processor.logger"):
             result = await processor._process_batch("releases", [message])
 
-        assert result == BatchWriteResult({"1"}, {"1"})
+        assert result == BatchWriteResult({"1"}, {"1"}, set())
 
         # The hash fetch asks for the media state in the same round trip.
         assert "media IS NULL" in self._executed_queries(mock_cursor)[0]
@@ -1366,13 +1371,13 @@ class TestMediaBackfillOnUnchangedHash:
     @pytest.mark.asyncio
     async def test_unchanged_hash_with_media_present_writes_no_media(self) -> None:
         """Unchanged hash + media already set stays skipped: updated_at only."""
-        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", False)])
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", False, False)])
         processor = PostgreSQLBatchProcessor(pool)
 
         with patch("tableinator.batch_processor.logger"):
             result = await processor._process_batch("releases", [self._release_message("1", "abc")])
 
-        assert result == BatchWriteResult({"1"}, set())
+        assert result == BatchWriteResult({"1"}, set(), set())
         assert mock_cursor.executemany.call_count == 0
 
         queries = self._executed_queries(mock_cursor)
@@ -1384,14 +1389,14 @@ class TestMediaBackfillOnUnchangedHash:
     @pytest.mark.asyncio
     async def test_changed_hash_still_takes_the_full_write_path(self) -> None:
         """A changed hash is untouched by the backfill: one INSERT ... ON CONFLICT."""
-        pool, mock_cursor = self._pool(existing_hashes=[("1", "stale-hash", True)])
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "stale-hash", True, False)])
         processor = PostgreSQLBatchProcessor(pool)
         message = self._release_message("1", "abc")
 
         with patch("tableinator.batch_processor.logger"):
             result = await processor._process_batch("releases", [message])
 
-        assert result == BatchWriteResult(set(), set())
+        assert result == BatchWriteResult(set(), set(), set())
 
         assert mock_cursor.executemany.call_count == 1
         query = mock_cursor.executemany.call_args[0][0].as_string(None)
@@ -1400,7 +1405,7 @@ class TestMediaBackfillOnUnchangedHash:
 
         records = mock_cursor.executemany.call_args[0][1]
         assert len(records) == 1
-        sha256, data_id, data_param, media_param = records[0]
+        sha256, data_id, data_param, media_param, _gm_item_id = records[0]
         assert (sha256, data_id) == ("abc", "1")
         assert data_param.obj == message.data
         assert media_param.obj == media_for_release(message.data)
@@ -1411,14 +1416,14 @@ class TestMediaBackfillOnUnchangedHash:
     @pytest.mark.asyncio
     async def test_mixed_batch_backfills_only_the_null_media_row(self) -> None:
         """In one batch, a NULL-media row is backfilled while its neighbour is skipped."""
-        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True), ("2", "def", False)])
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True, False), ("2", "def", False, False)])
         processor = PostgreSQLBatchProcessor(pool)
         messages = [self._release_message("1", "abc"), self._release_message("2", "def")]
 
         with patch("tableinator.batch_processor.logger"):
             result = await processor._process_batch("releases", messages)
 
-        assert result == BatchWriteResult({"1", "2"}, {"1"})
+        assert result == BatchWriteResult({"1", "2"}, {"1"}, set())
 
         # Row 2 takes the plain updated_at refresh; row 1 is excluded from it because
         # its media UPDATE already refreshes updated_at.
@@ -1428,7 +1433,7 @@ class TestMediaBackfillOnUnchangedHash:
     @pytest.mark.asyncio
     async def test_non_release_unchanged_row_never_looks_for_media(self) -> None:
         """Only `releases` has a media column; other tables keep the 2-column fetch."""
-        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc")])
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", False)])
         processor = PostgreSQLBatchProcessor(pool)
         messages = [
             PendingMessage(
@@ -1444,14 +1449,14 @@ class TestMediaBackfillOnUnchangedHash:
         with patch("tableinator.batch_processor.logger"):
             result = await processor._process_batch("artists", messages)
 
-        assert result == BatchWriteResult({"1"}, set())
+        assert result == BatchWriteResult({"1"}, set(), set())
         assert "media" not in self._executed_queries(mock_cursor)[0]
         assert mock_cursor.executemany.call_count == 0
 
     @pytest.mark.asyncio
     async def test_flush_counts_backfills_apart_from_processed_records(self) -> None:
         """Stats separate a media backfill from an ordinary skip and a real write."""
-        pool, _mock_cursor = self._pool(existing_hashes=[("1", "abc", True), ("2", "def", False)])
+        pool, _mock_cursor = self._pool(existing_hashes=[("1", "abc", True, False), ("2", "def", False, False)])
         processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
         processor.queues["releases"].append(self._release_message("1", "abc"))
         processor.queues["releases"].append(self._release_message("2", "def"))
@@ -2187,3 +2192,232 @@ class TestDrainWaitsForInFlight:
         assert await asyncio.wait_for(drain, timeout=1.0) is True
         await asyncio.wait_for(in_flight_flush, timeout=1.0)
         assert completed == ["write"], "the write must complete before the drain returns"
+
+
+class TestNativeIdentityMinting:
+    """Every Discogs row carries the native catalog item its `data_id` maps to (ADR 0009).
+
+    `common.identity.resolve_aliases` is the one lookup-or-create both loaders share. The
+    batch path calls it once per batch, on the batch's own connection and inside the batch's
+    transaction, so a batch is either fully identified or rolled back whole; the non-batch
+    path resolves the single ref the same way. Rows written before minting existed keep a
+    matching hash forever, so the hash-unchanged path backfills `gm_item_id` in place the
+    way ADR 0007's `media` column was backfilled.
+    """
+
+    _pool = staticmethod(TestProcessBatchReleaseMedia._pool)
+    _release_message = staticmethod(TestProcessBatchReleaseMedia._release_message)
+
+    @staticmethod
+    def _artist_message(data_id: str, sha256: str) -> PendingMessage:
+        return PendingMessage(
+            data_type="artists",
+            data_id=data_id,
+            data={"id": data_id, "name": f"Artist {data_id}"},
+            sha256=sha256,
+            ack_callback=AsyncMock(),
+            nack_callback=AsyncMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_rows_resolve_once_and_carry_the_native_id_into_the_upsert(
+        self,
+        stub_resolve_aliases: AsyncMock,
+    ) -> None:
+        """One resolve for the whole batch, and every minted id reaches the INSERT."""
+        pool, mock_cursor = self._pool(existing_hashes=[])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [self._artist_message("1", "abc"), self._artist_message("2", "def")]
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("artists", messages)
+
+        assert result == BatchWriteResult(set(), set(), set())
+
+        # One call, carrying one ref per message, keyed by the singular entity kind.
+        stub_resolve_aliases.assert_awaited_once()
+        connection, refs = stub_resolve_aliases.await_args[0]
+        assert connection is pool.connection.return_value.__aenter__.return_value
+        assert refs == [AliasRef("discogs", "artist", "1"), AliasRef("discogs", "artist", "2")]
+
+        query = mock_cursor.executemany.call_args[0][0].as_string(None)
+        assert "(hash, data_id, data, gm_item_id, updated_at)" in query
+        assert "gm_item_id = EXCLUDED.gm_item_id" in query
+
+        records = mock_cursor.executemany.call_args[0][1]
+        assert [(record[1], record[3]) for record in records] == [
+            ("1", native_id_for(AliasRef("discogs", "artist", "1"))),
+            ("2", native_id_for(AliasRef("discogs", "artist", "2"))),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_releases_carry_the_native_id_beside_the_media_column(self) -> None:
+        """The release statement keeps `media` and gains `gm_item_id` next to it."""
+        pool, mock_cursor = self._pool(existing_hashes=[])
+        processor = PostgreSQLBatchProcessor(pool)
+
+        with patch("tableinator.batch_processor.logger"):
+            await processor._process_batch("releases", [self._release_message("1", "abc")])
+
+        query = mock_cursor.executemany.call_args[0][0].as_string(None)
+        assert "(hash, data_id, data, media, gm_item_id, updated_at)" in query
+        assert "media = EXCLUDED.media" in query
+        assert "gm_item_id = EXCLUDED.gm_item_id" in query
+
+        record = mock_cursor.executemany.call_args[0][1][0]
+        assert record[4] == native_id_for(AliasRef("discogs", "release", "1"))
+
+    @pytest.mark.asyncio
+    async def test_unchanged_row_with_a_null_native_id_is_backfilled(self) -> None:
+        """A hash-unchanged row that predates minting gets `gm_item_id` and nothing else."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True)])
+        processor = PostgreSQLBatchProcessor(pool)
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("artists", [self._artist_message("1", "abc")])
+
+        assert result == BatchWriteResult({"1"}, set(), {"1"})
+
+        # The hash fetch asks for the identity state in the same round trip.
+        assert "gm_item_id IS NULL" in mock_cursor.execute.call_args_list[0][0][0].as_string(None)
+
+        assert mock_cursor.executemany.call_count == 1
+        query = mock_cursor.executemany.call_args[0][0].as_string(None)
+        assert "SET gm_item_id = %s, updated_at = NOW()" in query
+        assert "INSERT" not in query
+        assert "hash" not in query
+        assert "data =" not in query
+        assert mock_cursor.executemany.call_args[0][1] == [(native_id_for(AliasRef("discogs", "artist", "1")), "1")]
+
+        # That UPDATE carries its own NOW(), so no separate updated_at refresh is issued.
+        assert len(mock_cursor.execute.call_args_list) == 1
+
+    @pytest.mark.asyncio
+    async def test_unchanged_row_already_minted_is_left_alone(self) -> None:
+        """An unchanged row whose `gm_item_id` is set takes the plain updated_at refresh."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", False)])
+        processor = PostgreSQLBatchProcessor(pool)
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("artists", [self._artist_message("1", "abc")])
+
+        assert result == BatchWriteResult({"1"}, set(), set())
+        assert mock_cursor.executemany.call_count == 0
+
+        queries = [call_args[0][0].as_string(None) for call_args in mock_cursor.execute.call_args_list]
+        assert len(queries) == 2
+        assert "SET updated_at = NOW()" in queries[1]
+        assert "gm_item_id" not in queries[1]
+        assert mock_cursor.execute.call_args_list[1][0][1] == (["1"],)
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_batch_backfills_only_the_null_identity_row(self) -> None:
+        """One executemany UPDATE covers every unchanged row still missing a native id."""
+        pool, mock_cursor = self._pool(existing_hashes=[("1", "abc", True), ("2", "def", False)])
+        processor = PostgreSQLBatchProcessor(pool)
+        messages = [self._artist_message("1", "abc"), self._artist_message("2", "def")]
+
+        with patch("tableinator.batch_processor.logger"):
+            result = await processor._process_batch("artists", messages)
+
+        assert result == BatchWriteResult({"1", "2"}, set(), {"1"})
+        assert mock_cursor.executemany.call_count == 1
+        assert [data_id for _native_id, data_id in mock_cursor.executemany.call_args[0][1]] == ["1"]
+        # Row 2 takes the plain refresh; row 1 is excluded because its UPDATE carries NOW().
+        assert mock_cursor.execute.call_args_list[1][0][1] == (["2"],)
+
+    @pytest.mark.asyncio
+    async def test_an_unresolved_ref_fails_the_batch(self, stub_resolve_aliases: AsyncMock) -> None:
+        """A ref the resolve does not answer is poison, not a transient outage."""
+        stub_resolve_aliases.side_effect = None
+        stub_resolve_aliases.return_value = {}
+        pool, mock_cursor = self._pool(existing_hashes=[])
+        processor = PostgreSQLBatchProcessor(pool)
+
+        with patch("tableinator.batch_processor.logger"), pytest.raises(RuntimeError, match="no native id for artists"):
+            await processor._process_batch("artists", [self._artist_message("1", "abc")])
+
+        # Nothing was written: the batch fails before the upsert.
+        assert mock_cursor.executemany.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_the_non_batch_path_resolves_and_writes_the_native_id(
+        self,
+        stub_resolve_aliases: AsyncMock,
+    ) -> None:
+        """`persist_record` resolves its single ref on the same connection and writes it."""
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=None)
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection = MagicMock()
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+        mock_connection_cm = AsyncMock()
+        mock_connection_cm.__aenter__ = AsyncMock(return_value=mock_connection)
+        mock_connection_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.connection = MagicMock(return_value=mock_connection_cm)
+
+        persistence = PostgreSQLRecordPersistence(pool, MagicMock(), 0.9, media_for_release)
+        await persistence.persist_record("labels", "42", {"id": "42", "sha256": "abc"})
+
+        stub_resolve_aliases.assert_awaited_once()
+        connection, refs = stub_resolve_aliases.await_args[0]
+        assert connection is mock_connection
+        assert refs == [AliasRef("discogs", "label", "42")]
+
+        query, params = mock_cursor.execute.call_args[0]
+        assert "(hash, data_id, data, gm_item_id, updated_at)" in query.as_string(None)
+        assert "gm_item_id = EXCLUDED.gm_item_id" in query.as_string(None)
+        assert params[3] == native_id_for(AliasRef("discogs", "label", "42"))
+
+    @pytest.mark.asyncio
+    async def test_the_non_batch_release_statement_writes_the_native_id(self) -> None:
+        """The release CTE keeps its hash-gated media rule and adds `gm_item_id`."""
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=(False,))
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection = MagicMock()
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+        mock_connection_cm = AsyncMock()
+        mock_connection_cm.__aenter__ = AsyncMock(return_value=mock_connection)
+        mock_connection_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.connection = MagicMock(return_value=mock_connection_cm)
+
+        persistence = PostgreSQLRecordPersistence(pool, MagicMock(), 0.9, media_for_release)
+        await persistence.persist_record("releases", "7", {"id": "7", "sha256": "abc", "formats": []})
+
+        query, params = mock_cursor.execute.call_args[0]
+        assert "(hash, data_id, data, media, gm_item_id, updated_at)" in query.as_string(None)
+        assert "gm_item_id = EXCLUDED.gm_item_id" in query.as_string(None)
+        assert params[5] == native_id_for(AliasRef("discogs", "release", "7"))
+
+    @pytest.mark.asyncio
+    async def test_the_non_batch_path_fails_on_an_unresolved_ref(self, stub_resolve_aliases: AsyncMock) -> None:
+        """A ref the resolve does not answer stops the single-record write too."""
+        stub_resolve_aliases.side_effect = None
+        stub_resolve_aliases.return_value = {}
+        mock_cursor = AsyncMock()
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_connection = MagicMock()
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+        mock_connection_cm = AsyncMock()
+        mock_connection_cm.__aenter__ = AsyncMock(return_value=mock_connection)
+        mock_connection_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.connection = MagicMock(return_value=mock_connection_cm)
+
+        persistence = PostgreSQLRecordPersistence(pool, MagicMock(), 0.9, media_for_release)
+        with pytest.raises(RuntimeError, match="no native id for masters"):
+            await persistence.persist_record("masters", "9", {"id": "9", "sha256": "abc"})
+
+        mock_cursor.execute.assert_not_called()
