@@ -191,7 +191,7 @@ class TestBatchProcessorTelemetry:
     async def test_successful_flush_records_processed_skipped_and_batch_metrics(self, metrics_collector: MetricsCollector) -> None:
         # data_id "1" already has the same hash on record (unchanged -> skipped);
         # "2" has a different hash on record (changed -> processed).
-        pool = self._connection_pool([("1", "abc"), ("2", "old-hash")])
+        pool = self._connection_pool([("1", "abc", False), ("2", "old-hash", False)])
         processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
 
         processor.queues["artists"].append(PendingMessage("artists", "1", {"id": "1"}, "abc", AsyncMock(), AsyncMock()))
@@ -217,7 +217,7 @@ class TestBatchProcessorTelemetry:
         """A hash-unchanged `releases` row whose NULL `media` this flush filled is
         recorded as `media_backfilled`, not folded into `skipped` (ADR 0007). Both rows
         match on hash; only "1" still has a NULL media column."""
-        pool = self._connection_pool([("1", "abc", True), ("2", "def", False)])
+        pool = self._connection_pool([("1", "abc", True, False), ("2", "def", False, False)])
         processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
 
         release = {"id": "1", "formats": [{"name": "Vinyl", "qty": "1"}]}
