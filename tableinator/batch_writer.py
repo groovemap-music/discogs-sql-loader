@@ -6,7 +6,7 @@ from common.identity import resolve_aliases
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from tableinator.identity import alias_ref
+from tableinator.identity import alias_ref, alias_targets, attach_alias_targets
 
 
 if TYPE_CHECKING:
@@ -80,6 +80,14 @@ class PostgreSQLBatchWriter:
                     # assumption rather than a retryable outage: fail the batch as poison.
                     raise RuntimeError(f"resolve_aliases returned no native id for {data_type}: {unresolved}")
 
+                # Identifier aliases (ADR 0011): every release in the batch contributes, not
+                # only the ones whose hash changed. The existing-rows SELECT reads the entity
+                # table and cannot see whether a row's aliases were ever attached, so a row
+                # skipped by hash is exactly the row whose aliases are most likely missing.
+                # Attaching is idempotent, so re-attaching a present alias costs one conflicted
+                # INSERT row and nothing else.
+                alias_attachments = alias_targets(data_type, [(msg.data, native_ids[refs[msg.data_id]]) for msg in messages])
+
                 records_to_upsert: list[tuple[Any, ...]] = []
                 unchanged_ids: list[str] = []
                 media_backfills: list[tuple[Jsonb, str]] = []
@@ -150,39 +158,42 @@ class PostgreSQLBatchWriter:
                         identity_backfills,
                     )
 
-                if not records_to_upsert:
-                    return BatchWriteResult(set(unchanged_ids), media_backfilled_ids, identity_backfilled_ids)
+                if records_to_upsert:
+                    if data_type == "releases":
+                        await cursor.executemany(
+                            sql.SQL(
+                                "INSERT INTO {table} (hash, data_id, data, media, gm_item_id, updated_at) "
+                                "VALUES (%s, %s, %s, %s, %s, NOW()) "
+                                "ON CONFLICT (data_id) DO UPDATE "
+                                "SET hash = EXCLUDED.hash, data = EXCLUDED.data, media = EXCLUDED.media, "
+                                "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
+                            ).format(table=sql.Identifier(data_type)),
+                            records_to_upsert,
+                        )
+                    else:
+                        await cursor.executemany(
+                            sql.SQL(
+                                "INSERT INTO {table} (hash, data_id, data, gm_item_id, updated_at) "
+                                "VALUES (%s, %s, %s, %s, NOW()) "
+                                "ON CONFLICT (data_id) DO UPDATE "
+                                "SET hash = EXCLUDED.hash, data = EXCLUDED.data, "
+                                "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
+                            ).format(table=sql.Identifier(data_type)),
+                            records_to_upsert,
+                        )
 
-                if data_type == "releases":
-                    await cursor.executemany(
-                        sql.SQL(
-                            "INSERT INTO {table} (hash, data_id, data, media, gm_item_id, updated_at) "
-                            "VALUES (%s, %s, %s, %s, %s, NOW()) "
-                            "ON CONFLICT (data_id) DO UPDATE "
-                            "SET hash = EXCLUDED.hash, data = EXCLUDED.data, media = EXCLUDED.media, "
-                            "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
-                        ).format(table=sql.Identifier(data_type)),
-                        records_to_upsert,
-                    )
-                else:
-                    await cursor.executemany(
-                        sql.SQL(
-                            "INSERT INTO {table} (hash, data_id, data, gm_item_id, updated_at) "
-                            "VALUES (%s, %s, %s, %s, NOW()) "
-                            "ON CONFLICT (data_id) DO UPDATE "
-                            "SET hash = EXCLUDED.hash, data = EXCLUDED.data, "
-                            "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
-                        ).format(table=sql.Identifier(data_type)),
-                        records_to_upsert,
+                    self.logger.debug(
+                        "🐘 Batch upserted records",
+                        data_type=data_type,
+                        upserted=len(records_to_upsert),
+                        skipped=len(unchanged_ids) - len(media_backfills),
+                        media_backfilled=len(media_backfills),
+                        identity_backfilled=len(identity_backfills),
                     )
 
-                self.logger.debug(
-                    "🐘 Batch upserted records",
-                    data_type=data_type,
-                    upserted=len(records_to_upsert),
-                    skipped=len(unchanged_ids) - len(media_backfills),
-                    media_backfilled=len(media_backfills),
-                    identity_backfilled=len(identity_backfills),
-                )
+                # One attach per batch, after the upsert and on this transaction's own
+                # connection, so the aliases and the rows they point at commit or roll back
+                # together.
+                await attach_alias_targets(conn, alias_attachments, self.logger, data_type)
 
                 return BatchWriteResult(set(unchanged_ids), media_backfilled_ids, identity_backfilled_ids)

@@ -1,8 +1,8 @@
 # Shared delivery runtime attestation
 
 Discogs SQL delivery lifecycle behavior is pinned to `groovemap-runtime` source revision
-`24704f5fd48d3ef4fff29398585e9924e225b0c5`, whose Git tree is
-`c5b96bdeab082057480a26784ad6065497aaae9a`. Both `pyproject.toml` and `uv.lock` resolve that
+`e372b6a7598ae31ee6578fdff39bc920bedd7136`, whose Git tree is
+`5dfee55fd070deb3463e5eb54944561dc969ec40`. Both `pyproject.toml` and `uv.lock` resolve that
 immutable revision; the container wheel preparation guard requires the same revision.
 
 `common.delivery.run_delivery` is the single settlement authority for the non-batch persistence

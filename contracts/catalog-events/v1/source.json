@@ -1,7 +1,7 @@
 {
   "binding_sha256": "cfcd98aa02612889cb3e9c8eab5eb495b58ed7091dd10bca02fac0629c038e7f",
-  "contract_sha256": "d530ff04ee33224ed044db8d52c3870d97e5a69d7aa991eab41d8d8b579f5dd7",
-  "migration_transform": "Switched the promoted producer from the retired multi-source catalog-ingestion repository to the Discogs-only discogs-ingestion repository; the contract now carries the canonical media block in release fixtures and drops the musicbrainz source, its consumers, and its exchange-prefix vocabulary.",
-  "producer_commit": "c1bf1b4ada3ee88e1e6768a0be7fa6ed1b921831",
+  "contract_sha256": "7d5a70024272a61c520512444cd06c4a0e548a3f6bbe988a298843347fdc502a",
+  "migration_transform": "Additive within v1: the release fixture payload now carries the canonical identifiers and companies blocks beside the media block it already had, so the binding is byte-identical and no consumer field was removed or renamed; the loader reads the identifiers block to mint barcode, catalogue-number, and matrix aliases.",
+  "producer_commit": "4fec8dd08370dea0e1b54dbf53e920793a22cb3c",
   "producer_repository": "https://github.com/groovemap-music/discogs-ingestion"
 }

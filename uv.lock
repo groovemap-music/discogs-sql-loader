@@ -456,7 +456,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aio-pika", specifier = ">=10.0.1" },
-    { name = "groovemap-runtime", extras = ["otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=24704f5fd48d3ef4fff29398585e9924e225b0c5" },
+    { name = "groovemap-runtime", extras = ["otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=e372b6a7598ae31ee6578fdff39bc920bedd7136" },
     { name = "orjson", specifier = ">=3.12.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.5" },
     { name = "structlog", specifier = ">=26.1.0" },
@@ -481,7 +481,7 @@ dev = [
 [[package]]
 name = "groovemap-runtime"
 version = "0.1.0"
-source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=24704f5fd48d3ef4fff29398585e9924e225b0c5#24704f5fd48d3ef4fff29398585e9924e225b0c5" }
+source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=e372b6a7598ae31ee6578fdff39bc920bedd7136#e372b6a7598ae31ee6578fdff39bc920bedd7136" }
 dependencies = [
     { name = "orjson" },
     { name = "structlog" },
