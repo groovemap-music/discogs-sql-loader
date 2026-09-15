@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
-PYTHON_LIBRARIES_REVISION = "2d7b1a5b8766ff915a39e66a3e70013d092c1bc1"
+PYTHON_LIBRARIES_REVISION = "24704f5fd48d3ef4fff29398585e9924e225b0c5"
 
 
 def test_reusable_workflows_are_immutably_pinned() -> None:
@@ -113,8 +113,8 @@ def test_required_regression_suites_remain_in_the_full_gate() -> None:
             "test_mocked_throughput_remains_above_500_records_per_second",
         ),
         "tests/test_batch_processor.py": (
-            "test_drain_blocks_on_in_flight_batch",
-            "test_transient_failures_increment_on_operational_error",
+            "test_cancellation_restores_the_unsettled_batch_in_order",
+            "test_transient_retry_never_charges_poison_or_nacks",
         ),
     }
     for relative_path, test_names in expected_tests.items():

@@ -11,6 +11,8 @@ Start with these repository-specific guides:
 - [File completion tracking](file-completion-tracking.md) — file and extraction
   completion semantics.
 - [Database resilience](database-resilience.md) — outage and recovery behavior.
+- [Shared delivery runtime](shared-delivery-runtime.md) — immutable runtime revision,
+  owner/runtime boundary, and migration attestation.
 - [Performance](performance-guide.md) — batching and PostgreSQL tuning within this
   consumer.
 - [PostgreSQL pool protection](postgres-pool-exhaustion-analysis.md) — how batch and

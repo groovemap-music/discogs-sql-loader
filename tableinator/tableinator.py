@@ -13,20 +13,22 @@ from common import (
     AsyncPostgreSQLPool,
     AsyncResilientRabbitMQ,
     DatabaseUnavailableError,
+    DeliveryResult,
     HealthServer,
     OutageBackoff,
+    Settlement,
     normalize_record,
     parse_postgres_host_port,
+    run_delivery,
     setup_logging,
     setup_telemetry,
     shutdown_telemetry,
     start_event_loop_monitor,
 )
 from orjson import loads
-from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 
 from tableinator import telemetry
-from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
+from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor, PostgreSQLFailureClassifier
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
 )
@@ -840,10 +842,11 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
         record_terminal("failed", telemetry.error_type_of(e))
         return
 
-    # Process record using async connection pool for concurrent access
-    try:
+    # Process record through the shared delivery runner. PostgreSQL policy stays
+    # local; the runtime owns the single terminal ack/requeue/reject decision.
+    async def persist_record() -> DeliveryResult:
         if connection_pool is None:
-            raise RuntimeError("Connection pool not initialized")
+            raise DatabaseUnavailableError("Connection pool not initialized")
 
         persistence = PostgreSQLRecordPersistence(
             connection_pool,
@@ -852,12 +855,36 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             media_for_release,
         )
         terminal_outcome = await persistence.persist_record(data_type, data_id, data)
+        return DeliveryResult(Settlement.ACK, terminal_outcome)
 
-        await message.ack()
-        # "media_backfilled" -- the payload's hash already matched, so nothing was
-        # rewritten except the NULL `media` column this write filled (ADR 0007).
-        record_terminal(terminal_outcome)
+    class DeliveryTelemetryObserver:
+        """Bridge the current consumer span and metrics to ``run_delivery``."""
 
+        @contextlib.contextmanager
+        def consume(self, _destination: str, _headers: object | None) -> Any:
+            yield span
+
+        def settled(self, *, entity: str, result: DeliveryResult, duration_s: float, span: Any) -> None:
+            outcome = result.outcome if result.settlement is Settlement.ACK else "failed"
+            telemetry.record_message(entity, outcome, duration_s)
+            telemetry.record_consumed_message(entity, duration_s, result.error_type)
+            if result.error_type is not None:
+                telemetry.mark_span_error_type(span, result.error_type)
+
+    async def wait_before_requeue() -> None:
+        await outage_backoff.wait()
+
+    result = await run_delivery(
+        message,
+        persist_record,
+        classifier=PostgreSQLFailureClassifier(),
+        observer=DeliveryTelemetryObserver(),
+        destination=data_type,
+        entity=data_type,
+        wait_before_requeue=wait_before_requeue,
+    )
+
+    if result.settlement is Settlement.ACK:
         # PostgreSQL answered — clear the outage backoff.
         outage_backoff.reset()
 
@@ -871,39 +898,18 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     count=message_counts[data_type],
                     data_type=data_type,
                 )
-
-    except (InterfaceError, OperationalError, DatabaseUnavailableError) as e:
-        logger.warning("⚠️ Database connection issue, will retry", error=str(e))
-        # Pause before requeueing — x-delivery-limit=20 is a budget with no time
-        # dimension, so unthrottled requeues dead-letter valid records within
-        # minutes of a database outage (discogsography-rb05).
-        await outage_backoff.wait()
-        await message.nack(requeue=True)
-        record_terminal("failed", telemetry.error_type_of(e))
-    except (DataError, IntegrityError) as e:
-        # Deterministic per-record faults: a failed column cast (DataError) or a
-        # violated constraint (IntegrityError, e.g. a NULL data_id). Retrying fails
-        # identically every time, so nack straight to the DLQ instead of spending all
-        # 20 of the quorum queue's redeliveries — each one opening a pooled connection
-        # and rolling back — before the broker dead-letters it anyway. Mirrors
-        # brainztableinator's branch (discogsography-yuyg).
+    elif result.settlement is Settlement.REQUEUE:
+        logger.warning(
+            "⚠️ Database connection issue, delivery requeued",
+            data_type=data_type,
+            error_type=result.error_type,
+        )
+    else:
         logger.error(
             "❌ Non-retryable data error, nacking without requeue",
             data_type=data_type,
-            error=str(e),
+            error_type=result.error_type,
         )
-        try:
-            await message.nack(requeue=False)
-        except Exception as nack_error:
-            logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-        record_terminal("failed", telemetry.error_type_of(e))
-    except Exception as e:
-        logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
-        try:
-            await message.nack(requeue=True)
-        except Exception as nack_error:
-            logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-        record_terminal("failed", telemetry.error_type_of(e))
 
 
 async def progress_reporter() -> None:

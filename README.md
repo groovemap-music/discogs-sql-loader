@@ -73,6 +73,10 @@ completion semantics, health states, and troubleshooting. The
 [documentation index](docs/README.md) links the focused resilience, performance, and
 persistence-boundary references.
 
+Delivery settlement and asynchronous batch lifecycle behavior come from the pinned shared
+runtime. See the [shared delivery runtime attestation](docs/shared-delivery-runtime.md) for the
+owner/runtime boundary, immutable revision, and verification commands.
+
 ## Telemetry
 
 Metrics and traces are both configured from the standard OpenTelemetry environment

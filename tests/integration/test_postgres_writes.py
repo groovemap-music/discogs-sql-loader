@@ -5,16 +5,20 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import psycopg
 import pytest
 import pytest_asyncio
+from orjson import dumps
 from psycopg import sql
+from psycopg.errors import OperationalError
 from psycopg.types.json import Jsonb
 
-from tableinator.batch_writer import PostgreSQLBatchWriter
+from tableinator.batch_processor import BatchConfig, PendingMessage, PostgreSQLBatchProcessor
+from tableinator.batch_writer import BatchWriteResult, PostgreSQLBatchWriter
 from tableinator.record_persistence import PostgreSQLRecordPersistence
+from tableinator.tableinator import on_data_message
 
 
 if TYPE_CHECKING:
@@ -211,3 +215,182 @@ async def test_persist_record_writes_the_native_id_on_the_non_batch_path(
     assert row[0] is not None
     kind = await (await postgres_connection.execute("SELECT kind FROM catalog_items WHERE id = %s", (row[0],))).fetchone()
     assert kind == ("label",)
+
+
+def engine_config(**overrides: Any) -> BatchConfig:
+    values: dict[str, Any] = {
+        "batch_size": 10,
+        "flush_interval": 0.01,
+        "max_pending": 20,
+        "max_concurrent_flushes": 2,
+        "min_batch_size": 1,
+        "backoff_initial": 0.001,
+        "backoff_max": 0.002,
+        "backoff_multiplier": 2.0,
+        "max_flush_retries": 3,
+        "max_poison_retries": 2,
+    }
+    values.update(overrides)
+    return BatchConfig(**values)
+
+
+@pytest.mark.asyncio
+async def test_shared_batch_engine_writes_real_postgres_and_settles_each_delivery_once(
+    postgres_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    pool = SingleConnectionPool(postgres_connection)
+    processor = PostgreSQLBatchProcessor(pool, engine_config(batch_size=2))
+    acks = [AsyncMock(), AsyncMock()]
+    nacks = [AsyncMock(), AsyncMock()]
+
+    await processor.add_message("artists", {"id": "201", "name": "First", "sha256": "h-201"}, acks[0], nacks[0])
+    await processor.add_message("artists", {"id": "202", "name": "Second", "sha256": "h-202"}, acks[1], nacks[1])
+
+    rows = await (await postgres_connection.execute("SELECT data_id, data->>'name' FROM artists ORDER BY data_id")).fetchall()
+    assert rows == [("201", "First"), ("202", "Second")]
+    assert all(callback.await_count == 1 for callback in acks)
+    assert all(callback.await_count == 0 for callback in nacks)
+    assert processor.get_stats()["processed"]["artists"] == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_batch_engine_preserves_real_unchanged_media_and_identity_results(
+    postgres_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    pool = SingleConnectionPool(postgres_connection)
+    processor = PostgreSQLBatchProcessor(pool, engine_config(batch_size=3))
+    writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]})
+
+    await writer.process_batch("artists", [BatchRecord("301", {"id": "301", "name": "Stable"}, "same")])
+    await postgres_connection.execute(
+        "INSERT INTO artists (hash, data_id, data, gm_item_id) VALUES (%s, %s, %s, NULL)",
+        ("legacy", "302", Jsonb({"id": "302", "name": "Legacy"})),
+    )
+    await postgres_connection.execute(
+        "INSERT INTO releases (hash, data_id, data, media, gm_item_id) VALUES (%s, %s, %s, NULL, NULL)",
+        ("release", "303", Jsonb({"id": "303", "title": "Legacy release"})),
+    )
+    await postgres_connection.commit()
+
+    artist_acks = [AsyncMock(), AsyncMock()]
+    await processor.add_message("artists", {"id": "301", "name": "Ignored", "sha256": "same"}, artist_acks[0], AsyncMock())
+    await processor.add_message("artists", {"id": "302", "name": "Legacy", "sha256": "legacy"}, artist_acks[1], AsyncMock())
+    await processor.flush_queue("artists")
+    release_ack = AsyncMock()
+    await processor.add_message(
+        "releases",
+        {"id": "303", "title": "Legacy release", "sha256": "release", "formats": [{"name": "Vinyl", "qty": "1"}]},
+        release_ack,
+        AsyncMock(),
+    )
+    await processor.flush_queue("releases")
+
+    assert all(callback.await_count == 1 for callback in artist_acks)
+    release_ack.assert_awaited_once()
+    stats = processor.get_stats()
+    assert stats["identity_backfilled"]["artists"] == 1
+    assert stats["media_backfilled"]["releases"] == 1
+    rows = await (
+        await postgres_connection.execute(
+            "SELECT (SELECT gm_item_id IS NOT NULL FROM artists WHERE data_id = '302'), "
+            "(SELECT media IS NOT NULL FROM releases WHERE data_id = '303')"
+        )
+    ).fetchone()
+    assert rows == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_shared_engine_retries_a_transient_before_real_postgres_commit(
+    postgres_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    processor = PostgreSQLBatchProcessor(SingleConnectionPool(postgres_connection), engine_config(batch_size=1))
+    real_write = processor._process_batch
+    attempts = 0
+
+    async def fail_once(data_type: str, messages: list[PendingMessage]) -> BatchWriteResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError("temporary outage")
+        return await real_write(data_type, messages)
+
+    processor._process_batch = fail_once  # type: ignore[method-assign]
+    ack = AsyncMock()
+    nack = AsyncMock()
+    await processor.add_message("labels", {"id": "401", "name": "Recovered", "sha256": "h"}, ack, nack)
+    assert await processor.flush_queue("labels")
+
+    assert attempts == 2
+    ack.assert_awaited_once()
+    nack.assert_not_awaited()
+    row = await (await postgres_connection.execute("SELECT data->>'name' FROM labels WHERE data_id = '401'")).fetchone()
+    assert row == ("Recovered",)
+
+
+@pytest.mark.asyncio
+async def test_shared_engine_isolates_poison_vetoes_purge_and_commits_healthy_tail(
+    postgres_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    processor = PostgreSQLBatchProcessor(
+        SingleConnectionPool(postgres_connection),
+        engine_config(batch_size=2, max_poison_retries=2),
+    )
+    real_write = processor._process_batch
+
+    async def reject_poison(data_type: str, messages: list[PendingMessage]) -> BatchWriteResult:
+        if any(message.data_id == "poison" for message in messages):
+            raise ValueError("deterministic poison")
+        return await real_write(data_type, messages)
+
+    processor._process_batch = reject_poison  # type: ignore[method-assign]
+    poison_ack = AsyncMock()
+    poison_nack = AsyncMock()
+    healthy_ack = AsyncMock()
+    healthy_nack = AsyncMock()
+    await processor.add_message("masters", {"id": "poison", "title": "Bad", "sha256": "bad"}, poison_ack, poison_nack)
+    await processor.add_message("masters", {"id": "healthy", "title": "Good", "sha256": "good"}, healthy_ack, healthy_nack)
+
+    poison_ack.assert_not_awaited()
+    poison_nack.assert_awaited_once()
+    healthy_ack.assert_awaited_once()
+    healthy_nack.assert_not_awaited()
+    assert processor.had_dlq_nacks("masters")
+    row = await (await postgres_connection.execute("SELECT data->>'title' FROM masters WHERE data_id = 'healthy'")).fetchone()
+    assert row == ("Good",)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drain_commits_pending_shared_engine_work(
+    postgres_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    processor = PostgreSQLBatchProcessor(SingleConnectionPool(postgres_connection), engine_config(batch_size=10))
+    acks = [AsyncMock(), AsyncMock()]
+    await processor.add_message("labels", {"id": "501", "name": "One", "sha256": "one"}, acks[0], AsyncMock())
+    await processor.add_message("labels", {"id": "502", "name": "Two", "sha256": "two"}, acks[1], AsyncMock())
+    processor.shutdown()
+
+    assert await processor.flush_all()
+    assert all(callback.await_count == 1 for callback in acks)
+    count = await (await postgres_connection.execute("SELECT count(*) FROM labels WHERE data_id IN ('501', '502')")).fetchone()
+    assert count == (2,)
+
+
+@pytest.mark.asyncio
+async def test_non_batch_handler_uses_shared_delivery_runner_against_real_postgres(
+    postgres_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    incoming = AsyncMock()
+    incoming.body = dumps({"id": "601", "name": "Direct", "sha256": "direct"})
+    incoming.headers = None
+
+    with (
+        patch("tableinator.tableinator.BATCH_MODE", False),
+        patch("tableinator.tableinator.shutdown_requested", False),
+        patch("tableinator.tableinator.connection_pool", SingleConnectionPool(postgres_connection)),
+    ):
+        await on_data_message(incoming, "artists")
+
+    incoming.ack.assert_awaited_once()
+    incoming.nack.assert_not_awaited()
+    row = await (await postgres_connection.execute("SELECT data->>'name' FROM artists WHERE data_id = '601'")).fetchone()
+    assert row == ("Direct",)
