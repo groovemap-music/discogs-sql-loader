@@ -69,13 +69,48 @@ The table, the column, and its index remain owned by `database-schema`; the alia
 `catalog_items` and `provider_aliases` are owned there too and read through the shared
 `groovemap-runtime` implementation rather than any SQL in this repository.
 
+## Identifier aliases
+
+A release event carries a canonical `identifiers` block beside its `data`
+([ADR 0011](https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md)).
+The block is persisted verbatim inside `data`, and its alias-bearing identifiers also
+become `provider_aliases` rows on the release's `gm_item_id`, so a lookup by a printed
+barcode or catalogue number resolves to the same catalog item as the Discogs release id.
+
+The minting rule:
+
+- `common.identifiers.alias_refs_for_release` reads the block and returns one alias per
+  alias-bearing identifier: `barcode` normalized to its digits, `catalog_number`
+  upper-cased with whitespace collapsed, and `matrix` with its case preserved, because
+  the characters stamped into the disc are the evidence. Every other identifier type is
+  carried on the block and mints nothing.
+- The loader calls `common.identity.attach_aliases` once per batch, on the batch's own
+  connection and inside the batch's transaction after the upsert, so the aliases and the
+  rows they point at commit or roll back together. Non-batch mode makes the same call per
+  record on the connection that performed its upsert.
+- Hash-unchanged rows attach too. The existing-rows SELECT reads the entity table and
+  cannot see whether a row's aliases were ever written, and attaching is idempotent, so a
+  row skipped by hash is attached rather than assumed complete.
+- The block is additive within catalog-events v1. A release produced before it existed,
+  or one whose block carries no alias-bearing identifier, attaches nothing and still
+  loads.
+- `attach_aliases` never overwrites an alias that is already present: it returns the
+  native id the existing alias points at. When that id differs from the release's own, two
+  items print one value; the batch counts the collision, logs it with the entity type and
+  the alias count, and commits. It is never raised, because failing the batch would strand
+  every other row over a duplicate barcode.
+- A block that does not match the promoted contract is rejected by the shared validator.
+  That is a producer defect, and the `ValueError` it raises is classified as a
+  deterministic failure, so the batch is dead-lettered rather than retried as an outage.
+
 ## Write and cleanup invariants
 
 - `data_id` is the conflict key for idempotent upserts.
 - Batch mode writes each entity batch in one PostgreSQL transaction and acknowledges
   its deliveries only after commit.
-- Non-batch mode preserves the same hash-gated update, media-backfill, and native-identity
-  behavior, resolving its single alias on the connection that performs the upsert.
+- Non-batch mode preserves the same hash-gated update, media-backfill, native-identity,
+  and identifier-alias behavior, resolving and attaching its aliases on the connection
+  that performs the upsert.
 - `file_complete` drains the pending batch for its entity before acknowledgement.
 - `extraction_complete` can delete rows whose `updated_at` predates the extraction,
   but only when no record for that entity was dead-lettered and the configured

@@ -28,6 +28,52 @@
         "year": 2000
       },
       "releases": {
+        "companies": {
+          "companies_version": "1",
+          "items": [
+            {
+              "catno": null,
+              "discogs_id": 12345,
+              "name": "Damont",
+              "role": "Pressed By",
+              "role_category": "pressing",
+              "source": {
+                "entity_type": "17",
+                "provider": "discogs"
+              }
+            },
+            {
+              "catno": null,
+              "discogs_id": 266218,
+              "name": "Utopia Studios",
+              "role": "Lacquer Cut At",
+              "role_category": "lacquer",
+              "source": {
+                "entity_type": "30",
+                "provider": "discogs"
+              }
+            },
+            {
+              "catno": null,
+              "discogs_id": 82835,
+              "name": "BMG Records (UK) Ltd.",
+              "role": "Phonographic Copyright (p)",
+              "role_category": "rights",
+              "source": {
+                "entity_type": "13",
+                "provider": "discogs"
+              }
+            }
+          ],
+          "role_categories": [
+            "lacquer",
+            "pressing",
+            "rights"
+          ],
+          "unmapped": {
+            "roles": []
+          }
+        },
         "formats": [
           {
             "descriptions": {
@@ -39,6 +85,72 @@
             },
             "name": "Vinyl",
             "qty": "1"
+          }
+        ],
+        "identifiers": {
+          "aliases": [
+            {
+              "external_id": "5012394144777",
+              "provider": "barcode"
+            },
+            {
+              "external_id": "PB 41447",
+              "provider": "catalog_number"
+            },
+            {
+              "external_id": "PB 41447-A2 UTOPIA MS",
+              "provider": "matrix"
+            }
+          ],
+          "identifiers_version": "1",
+          "items": [
+            {
+              "description": null,
+              "source": {
+                "field": "identifiers",
+                "provider": "discogs",
+                "type": "Barcode"
+              },
+              "type": "barcode",
+              "value": "5 012394 144777"
+            },
+            {
+              "description": "A side runout",
+              "source": {
+                "field": "identifiers",
+                "provider": "discogs",
+                "type": "Matrix / Runout"
+              },
+              "type": "matrix_runout",
+              "value": "PB 41447-A2 UTOPIA MS"
+            },
+            {
+              "description": null,
+              "source": {
+                "field": "labels[].catno",
+                "provider": "discogs",
+                "type": null
+              },
+              "type": "catalog_number",
+              "value": "PB 41447"
+            }
+          ],
+          "types": [
+            "barcode",
+            "catalog_number",
+            "matrix_runout"
+          ],
+          "unmapped": {
+            "types": []
+          }
+        },
+        "labels": [
+          {
+            "catno": "PB 41447",
+            "entity_type": "1",
+            "entity_type_name": "Label",
+            "id": 895,
+            "name": "Contract Label"
           }
         ],
         "media": {
