@@ -16,7 +16,7 @@ import pytest
 from aio_pika.abc import AbstractIncomingMessage
 
 from tableinator import telemetry
-from tableinator.batch_processor import BatchConfig, PendingMessage, PostgreSQLBatchProcessor
+from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
 from tableinator.tableinator import on_data_message
 
 
@@ -194,11 +194,11 @@ class TestBatchProcessorTelemetry:
         pool = self._connection_pool([("1", "abc", False), ("2", "old-hash", False)])
         processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
 
-        processor.queues["artists"].append(PendingMessage("artists", "1", {"id": "1"}, "abc", AsyncMock(), AsyncMock()))
-        processor.queues["artists"].append(PendingMessage("artists", "2", {"id": "2"}, "new-hash", AsyncMock(), AsyncMock()))
+        await processor.add_message("artists", {"id": "1", "sha256": "abc"}, AsyncMock(), AsyncMock())
+        await processor.add_message("artists", {"id": "2", "sha256": "new-hash"}, AsyncMock(), AsyncMock())
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("artists")
+            await processor.flush_queue("artists")
 
         message_attrs = metrics_collector.attributes(telemetry.PIPELINE_MESSAGES)
         outcomes = {attrs["outcome"] for attrs in message_attrs}
@@ -221,25 +221,25 @@ class TestBatchProcessorTelemetry:
         processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
 
         release = {"id": "1", "formats": [{"name": "Vinyl", "qty": "1"}]}
-        processor.queues["releases"].append(PendingMessage("releases", "1", release, "abc", AsyncMock(), AsyncMock()))
-        processor.queues["releases"].append(PendingMessage("releases", "2", dict(release, id="2"), "def", AsyncMock(), AsyncMock()))
+        await processor.add_message("releases", dict(release, sha256="abc"), AsyncMock(), AsyncMock())
+        await processor.add_message("releases", dict(release, id="2", sha256="def"), AsyncMock(), AsyncMock())
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("releases")
+            await processor.flush_queue("releases")
 
         outcomes = {attrs["outcome"] for attrs in metrics_collector.attributes(telemetry.PIPELINE_MESSAGES)}
         assert outcomes == {"media_backfilled", "skipped"}
 
     @pytest.mark.asyncio
     async def test_poison_batch_records_failed_and_flush_failure(self, metrics_collector: MetricsCollector) -> None:
-        config = BatchConfig(batch_size=5, max_poison_retries=1, backoff_initial=0.0, min_batch_size=1)
+        config = BatchConfig(batch_size=5, max_poison_retries=1, backoff_initial=0.001, min_batch_size=1)
         processor = PostgreSQLBatchProcessor(MagicMock(), config=config)
         processor._process_batch = AsyncMock(side_effect=ValueError("invalid jsonb"))  # type: ignore[method-assign]
 
-        processor.queues["artists"].append(PendingMessage("artists", "1", {"id": "1"}, "abc", AsyncMock(), AsyncMock()))
+        await processor.add_message("artists", {"id": "1", "sha256": "abc"}, AsyncMock(), AsyncMock())
 
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("artists")
+            await processor.flush_queue("artists")
 
         assert metrics_collector.attributes(telemetry.PIPELINE_MESSAGES) == [{"source": "discogs", "entity": "artists", "outcome": "failed"}]
         consumed_attrs = metrics_collector.attributes(telemetry.MESSAGING_CONSUMED_MESSAGES)[0]
@@ -256,14 +256,12 @@ class TestBatchProcessorTelemetry:
         (only the batch-size gauge, which fires per attempt)."""
         from common.db_resilience import DatabaseUnavailableError
 
-        config = BatchConfig(batch_size=5, backoff_initial=0.0)
+        config = BatchConfig(batch_size=1, backoff_initial=0.001)
         processor = PostgreSQLBatchProcessor(MagicMock(), config=config)
         processor._process_batch = AsyncMock(side_effect=DatabaseUnavailableError("db down"))  # type: ignore[method-assign]
 
-        processor.queues["artists"].append(PendingMessage("artists", "1", {"id": "1"}, "abc", AsyncMock(), AsyncMock()))
-
         with patch("tableinator.batch_processor.logger"):
-            await processor._flush_queue("artists")
+            await processor.add_message("artists", {"id": "1", "sha256": "abc"}, AsyncMock(), AsyncMock())
 
         assert metrics_collector.metrics().get(telemetry.PIPELINE_MESSAGES) is None
         assert metrics_collector.metrics().get(telemetry.PIPELINE_BATCH_FLUSH_DURATION) is None

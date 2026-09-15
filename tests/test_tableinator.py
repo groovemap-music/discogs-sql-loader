@@ -2184,7 +2184,7 @@ class TestOnDataMessageDatabaseOperations:
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_handles_nack_failure(self, sample_artist_data: dict[str, Any]) -> None:
-        """Test handling failure during nack operation."""
+        """The shared runner surfaces a failed broker settlement for recovery."""
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps(sample_artist_data).encode()
         mock_message.routing_key = "artists"
@@ -2193,14 +2193,8 @@ class TestOnDataMessageDatabaseOperations:
         mock_pool = MagicMock()
         mock_pool.connection.side_effect = Exception("Connection failed")
 
-        with (
-            patch("tableinator.tableinator.connection_pool", mock_pool),
-            patch("tableinator.tableinator.logger") as mock_logger,
-        ):
+        with patch("tableinator.tableinator.connection_pool", mock_pool), pytest.raises(Exception, match="Nack failed"):
             await on_data_message(mock_message, "artists")
-
-        # Should log warning about nack failure
-        assert any("Failed to nack message" in str(call) for call in mock_logger.warning.call_args_list)
 
 
 class TestOnDataMessageReleaseMedia:
