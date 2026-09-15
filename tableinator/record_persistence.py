@@ -5,7 +5,7 @@ from common.identity import resolve_aliases
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from tableinator.identity import alias_ref
+from tableinator.identity import alias_ref, alias_targets, attach_alias_targets
 
 
 class PostgreSQLRecordPersistence:
@@ -182,6 +182,12 @@ class PostgreSQLRecordPersistence:
                     ).format(table=sql.Identifier(data_type)),
                     (data.get("sha256", ""), data_id, Jsonb(data), gm_item_id),
                 )
+
+            # Identifier aliases (ADR 0011): the same attach the batch path makes, one
+            # record at a time, after the upsert and on this connection, so the aliases and
+            # the row they point at commit together. A record whose hash did not change is
+            # attached too, because the upsert above cannot report whether its aliases exist.
+            await attach_alias_targets(conn, alias_targets(data_type, [(data, gm_item_id)]), self.logger, data_type)
 
             self.logger.debug(
                 "🐘 Updated record in PostgreSQL",

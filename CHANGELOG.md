@@ -8,6 +8,7 @@ Conventional Commits.
 ### Feat
 
 - **loader**: resolve native catalog ids per batch and write gm_item_id
+- **loader**: attach identifier aliases per batch and per record
 
 ## v0.2.0 (2026-09-04)
 
