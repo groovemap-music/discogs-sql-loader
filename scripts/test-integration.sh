@@ -45,4 +45,5 @@ if [[ -z "${TEST_DATABASE_URL:-}" ]]; then
     export TEST_DATABASE_URL
 fi
 
-uv run pytest -m integration
+# `parity` needs a Neo4j this script does not start; `just test-parity` owns that lane.
+uv run pytest -m "integration and not parity"

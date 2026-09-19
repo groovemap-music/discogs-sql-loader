@@ -37,8 +37,19 @@ coverage: test
 
 # Starts a pinned disposable PostgreSQL container unless TEST_DATABASE_URL points
 # at an existing disposable database. This lane is intentionally outside `check`.
+# It deselects `parity`, which needs a second engine.
+# PostgreSQL integration suites, in a disposable database.
 test-integration:
     bash scripts/test-integration.sh
+
+# Cross-store parity against discogs-graph-enricher: the same fixture events into this
+# loader's PostgreSQL and the enricher's Neo4j, then a per-label comparison of the two
+# graphs. Starts both pinned containers and removes them, and their anonymous volumes,
+# on the way out. Opt-in and outside `check` because it is the one lane that needs Neo4j.
+# Documented in docs/store-parity.md.
+# Cross-store parity with discogs-graph-enricher, in disposable PostgreSQL and Neo4j.
+test-parity:
+    bash scripts/test-parity.sh
 
 build:
     uv build --out-dir dist --clear
