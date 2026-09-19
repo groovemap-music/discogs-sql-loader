@@ -19,6 +19,8 @@ Start with these repository-specific guides:
   non-batch modes bound connection demand.
 - [PostgreSQL persistence boundary](database-schema.md) — tables and write invariants
   this consumer relies on, with links to the owning schema repository.
+- [Cross-store parity](store-parity.md) — the opt-in lane that holds this loader's graph
+  to the graph enricher's, and the differences on record between them.
 - [Query performance ownership](query-performance-optimizations.md) — pointers to the
   API, graph, schema, and deployment owners.
 
