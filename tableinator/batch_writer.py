@@ -6,6 +6,7 @@ from common.identity import resolve_aliases
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from tableinator.graph_writer import write_document_graph
 from tableinator.identity import alias_ref, alias_targets, attach_alias_targets
 
 
@@ -89,6 +90,9 @@ class PostgreSQLBatchWriter:
                 alias_attachments = alias_targets(data_type, [(msg.data, native_ids[refs[msg.data_id]]) for msg in messages])
 
                 records_to_upsert: list[tuple[Any, ...]] = []
+                # The documents the hash gate let through, in the same order, so the graph
+                # rows derived below are exactly the rows of the entity rows written above.
+                changed_documents: list[tuple[str, dict[str, Any]]] = []
                 unchanged_ids: list[str] = []
                 media_backfills: list[tuple[Jsonb, str]] = []
                 identity_backfills: list[tuple[uuid.UUID, str]] = []
@@ -102,6 +106,7 @@ class PostgreSQLBatchWriter:
                         if msg.data_id in identity_is_null_ids:
                             identity_backfills.append((native_id, msg.data_id))
                         continue
+                    changed_documents.append((msg.data_id, msg.data))
                     if data_type == "releases":
                         records_to_upsert.append(
                             (
@@ -195,5 +200,10 @@ class PostgreSQLBatchWriter:
                 # connection, so the aliases and the rows they point at commit or roll back
                 # together.
                 await attach_alias_targets(conn, alias_attachments, self.logger, data_type)
+
+                # The graph vertices and edges each changed document asserts, on this same
+                # transaction, so a document and the edges derived from it commit or roll
+                # back together. A document the hash gate skipped is skipped here too.
+                await write_document_graph(cursor, data_type, changed_documents)
 
                 return BatchWriteResult(set(unchanged_ids), media_backfilled_ids, identity_backfilled_ids)
