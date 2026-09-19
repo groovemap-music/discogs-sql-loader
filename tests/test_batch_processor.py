@@ -65,7 +65,7 @@ class TestPolicyAdapters:
     def test_runtime_is_pinned_to_the_reviewed_revision(self) -> None:
         pyproject = Path("pyproject.toml").read_text()
         lock = Path("uv.lock").read_text()
-        revision = "e372b6a7598ae31ee6578fdff39bc920bedd7136"
+        revision = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
         assert revision in pyproject
         assert f"#{revision}" in lock
 
