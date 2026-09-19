@@ -6,7 +6,7 @@ conformance fixtures, copied in by name so the two derivations can be compared o
 same bytes without this repository depending on a sibling checkout.
 """
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -175,7 +175,7 @@ class TestLabelDerivesNothing:
 class TestCredits:
     """The `extraartists` block of `entity_projection.process_release`."""
 
-    _CREDITS = {
+    _CREDITS: ClassVar[dict[str, Any]] = {
         "extraartists": [
             {"id": "5", "name": "Geoff Emerick", "role": "Engineer"},
             {"id": "5", "name": "Geoff Emerick", "role": "Mixed By"},

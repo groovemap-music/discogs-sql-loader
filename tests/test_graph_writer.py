@@ -102,10 +102,10 @@ async def test_a_shared_relation_is_deleted_only_at_this_loaders_own_source() ->
 
     await write_document_graph(cursor, "releases", [("r1", _RELEASE)])
 
-    for relation in ("issued_on", "credited_to"):
-        statement = next(s for s in cursor.statements() if f'DELETE FROM "graph"."{relation}"' in s)
+    for fragment in ('DELETE FROM "graph"."issued_on"', 'DELETE FROM "graph"."credited_to"'):
+        statement = next(s for s in cursor.statements() if fragment in s)
         assert '"source" = %s' in statement
-        assert cursor.rows_for(f'DELETE FROM "graph"."{relation}"') == (["r1"], "discogs")
+        assert cursor.rows_for(fragment) == (["r1"], "discogs")
 
 
 @pytest.mark.asyncio
