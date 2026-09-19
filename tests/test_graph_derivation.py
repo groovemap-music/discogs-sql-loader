@@ -89,6 +89,11 @@ class TestUsableIds:
         """`_jsonb_array` guards the SQL side; an unschema'd document must not raise here."""
         assert _rows("releases", "r1", {"artists": artists}, "by_artist") == []
 
+    @pytest.mark.parametrize("entity_id", [1.5, {"nested": "1"}, ["1"]])
+    def test_an_id_of_the_wrong_json_type_is_dropped(self, entity_id: Any) -> None:
+        """An id that is neither text nor a whole number names no vertex."""
+        assert _rows("releases", "r1", {"artists": [{"id": entity_id}]}, "by_artist") == []
+
     def test_a_non_mapping_element_is_skipped(self) -> None:
         """A malformed entry drops one element, not the whole document."""
         data = {"artists": ["1", None, {"id": "2"}]}
