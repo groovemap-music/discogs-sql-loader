@@ -42,6 +42,7 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
+from tableinator.graph_counters import refresh_derived_relations
 from tableinator.media import media_for_release
 from tableinator.queue_names import (
     dead_letter_exchange_name as catalog_dead_letter_exchange_name,
@@ -107,6 +108,23 @@ CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # D
 PURGE_MAX_DELETE_FRACTION = float(
     os.environ.get("PURGE_MAX_DELETE_FRACTION", "0.90")
 )  # Default 90% - refuse purges that would delete this share or more of a table
+
+# ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────────────────
+# The counter, degree, and genre-aggregate relations are whole-catalog sums over the edge
+# tables, so they are refreshed once — after every data type has signalled
+# extraction_complete, which is the same latch `graphinator` defers its own post-import
+# pass to (`handle_extraction_complete`: the four fanout queues drain at very different
+# rates and releases finishes last, so a per-type refresh would sum a half-written catalog).
+# `completed_files` cannot stand in for this: it is also written by `file_complete` and
+# ERASED by `_recover_consumers`, so it answers "has this type's file finished" rather than
+# "has this type signalled the end of the extraction".
+extraction_complete_signals: set[str] = set()
+
+# Single-flight. The four consumers deliver their signals concurrently, so two of them can
+# both observe the full set; the pass is idempotent, so the loser re-running would be
+# correct but would take ACCESS EXCLUSIVE on seven tables for a second full sweep.
+derived_refresh_lock = asyncio.Lock()
+# ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────────────────
 
 # Periodic queue checking settings
 QUEUE_CHECK_INTERVAL = int(
@@ -744,7 +762,38 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     )
                     purge_ok = False
 
-            if purge_ok:
+            # ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────
+            # Beside the purge, on the same latch, and only once every type has
+            # signalled. The pass reconciles `member_of` and `same_as` against the
+            # documents present now and recomputes the seven counter relations from
+            # the edge tables, in one transaction. It runs AFTER the purge, so the
+            # rows a shrunk dump removed are already gone from the edge tables the
+            # counters sum; a failure nacks this delivery exactly as a failed purge
+            # does, and the whole pass is idempotent so the retry re-runs it safely.
+            refresh_ok = True
+            if purge_ok and connection_pool is not None:
+                extraction_complete_signals.add(data_type)
+                if extraction_complete_signals.issuperset(DATA_TYPES):
+                    async with derived_refresh_lock:
+                        try:
+                            await refresh_derived_relations(connection_pool, logger)
+                        except Exception as refresh_exc:
+                            logger.error(
+                                "❌ Derived-relation refresh failed, nacking extraction_complete for retry",
+                                data_type=data_type,
+                                error=str(refresh_exc),
+                            )
+                            refresh_ok = False
+                else:
+                    logger.info(
+                        "⏳ Deferring the derived-relation refresh until every data type completes",
+                        data_type=data_type,
+                        received=sorted(extraction_complete_signals),
+                        pending=sorted(set(DATA_TYPES) - extraction_complete_signals),
+                    )
+            # ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────
+
+            if purge_ok and refresh_ok:
                 # extraction_complete is this type's terminal signal, so it must also
                 # (re-)mark the type complete. completed_files is otherwise written
                 # only by file_complete and ERASED by _recover_consumers for any type
@@ -766,7 +815,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 record_terminal("processed")
             else:
                 await message.nack(requeue=True)
-                record_terminal("failed", "purge_failed")
+                record_terminal("failed", "purge_failed" if not purge_ok else "refresh_failed")
             return
 
         # Normal message processing - require a non-empty 'id' field.
