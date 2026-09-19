@@ -3960,3 +3960,115 @@ class TestOutageRequeueBackoff:
 
         assert backoff.consecutive_failures == 1
         mock_message.nack.assert_called_once_with(requeue=True)
+
+
+# ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh latch ──────────
+
+
+class TestDerivedRelationRefresh:
+    """When the `extraction_complete` handler runs the counter and reconciliation pass.
+
+    The pass sums whole edge tables, so it must not run until every data type has signalled
+    — the four fanout queues drain at very different rates and releases finishes last, so a
+    per-type refresh would publish counts over a half-written catalog. `graphinator` defers
+    its own post-import pass on exactly this condition.
+    """
+
+    @staticmethod
+    def _signal(started_at: str = "2026-01-01T00:00:00Z") -> AsyncMock:
+        message = AsyncMock(spec=AbstractIncomingMessage)
+        message.body = json.dumps({"type": "extraction_complete", "version": "20260101", "started_at": started_at}).encode()
+        return message
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_three_of_four_signals_defer_the_refresh(self) -> None:
+        signals: set[str] = set()
+        refresh = AsyncMock()
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.completed_files", set()),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.extraction_complete_signals", signals),
+            patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
+        ):
+            for data_type in ("artists", "labels", "masters"):
+                await on_data_message(self._signal(), data_type)
+
+        assert signals == {"artists", "labels", "masters"}
+        refresh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_the_fourth_signal_runs_the_refresh_once(self) -> None:
+        signals: set[str] = set()
+        refresh = AsyncMock()
+        pool = MagicMock()
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", pool),
+            patch("tableinator.tableinator.completed_files", set()),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.extraction_complete_signals", signals),
+            patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
+        ):
+            for data_type in ("artists", "labels", "masters", "releases"):
+                message = self._signal()
+                await on_data_message(message, data_type)
+
+        refresh.assert_awaited_once()
+        assert refresh.await_args is not None
+        assert refresh.await_args.args[0] is pool
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_a_failed_refresh_requeues_the_signal_and_leaves_the_type_incomplete(self) -> None:
+        """The pass owes a retry, so the signal goes back exactly as a failed purge does."""
+        signals = {"artists", "labels", "masters"}
+        completed: set[str] = set()
+        message = self._signal()
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.completed_files", completed),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.extraction_complete_signals", signals),
+            patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.refresh_derived_relations", side_effect=Exception("refresh boom")),
+        ):
+            await on_data_message(message, "releases")
+
+        assert completed == set()
+        message.nack.assert_called_once_with(requeue=True)
+        message.ack.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_a_failed_purge_never_reaches_the_refresh(self) -> None:
+        """The counters sum the edge tables the purge is about to prune, so order holds."""
+        refresh = AsyncMock()
+        message = self._signal()
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.completed_files", set()),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.extraction_complete_signals", {"artists", "labels", "masters"}),
+            patch("tableinator.tableinator.purge_stale_rows", side_effect=Exception("purge boom")),
+            patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
+        ):
+            await on_data_message(message, "releases")
+
+        refresh.assert_not_awaited()
+        message.nack.assert_called_once_with(requeue=True)
