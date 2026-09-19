@@ -426,6 +426,15 @@ wheels = [
 ]
 
 [[package]]
+name = "groovemap-database-schema"
+version = "0.3.0"
+source = { git = "https://github.com/groovemap-music/database-schema.git?rev=ea36cfa66672cb1e3f565165fea56d01b9b19c95#ea36cfa66672cb1e3f565165fea56d01b9b19c95" }
+dependencies = [
+    { name = "groovemap-runtime", extra = ["neo4j", "otel", "postgres"] },
+    { name = "psycopg", extra = ["binary"] },
+]
+
+[[package]]
 name = "groovemap-discogs-sql-loader"
 version = "0.3.0"
 source = { editable = "." }
@@ -442,6 +451,7 @@ dev = [
     { name = "build" },
     { name = "commitizen" },
     { name = "cyclonedx-bom" },
+    { name = "groovemap-database-schema" },
     { name = "mypy" },
     { name = "pip-audit" },
     { name = "pip-licenses" },
@@ -456,7 +466,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aio-pika", specifier = ">=10.0.1" },
-    { name = "groovemap-runtime", extras = ["otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=e372b6a7598ae31ee6578fdff39bc920bedd7136" },
+    { name = "groovemap-runtime", extras = ["otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" },
     { name = "orjson", specifier = ">=3.12.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.5" },
     { name = "structlog", specifier = ">=26.1.0" },
@@ -467,6 +477,7 @@ dev = [
     { name = "build", specifier = ">=1.6.0" },
     { name = "commitizen", specifier = ">=4.18.0" },
     { name = "cyclonedx-bom", specifier = ">=7.3.1" },
+    { name = "groovemap-database-schema", git = "https://github.com/groovemap-music/database-schema.git?rev=ea36cfa66672cb1e3f565165fea56d01b9b19c95" },
     { name = "mypy", specifier = ">=2.3.1" },
     { name = "pip-audit", specifier = ">=2.10.1" },
     { name = "pip-licenses", specifier = ">=5.5.5" },
@@ -481,13 +492,16 @@ dev = [
 [[package]]
 name = "groovemap-runtime"
 version = "0.1.0"
-source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=e372b6a7598ae31ee6578fdff39bc920bedd7136#e372b6a7598ae31ee6578fdff39bc920bedd7136" }
+source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef#6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" }
 dependencies = [
     { name = "orjson" },
     { name = "structlog" },
 ]
 
 [package.optional-dependencies]
+neo4j = [
+    { name = "neo4j-rust-ext" },
+]
 otel = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
@@ -859,6 +873,38 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/6e/371856a3fb9d31ca8dac321cda606860fa4548858c0cc45d9d1d4ca2628b/mypy_extensions-1.1.0.tar.gz", hash = "sha256:52e68efc3284861e772bbcd66823fde5ae21fd2fdb51c62a211403730b916558", size = 6343, upload-time = "2025-04-22T14:54:24.164Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/79/7b/2c79738432f5c924bef5071f933bcc9efd0473bac3b4aa584a6f7c1c8df8/mypy_extensions-1.1.0-py3-none-any.whl", hash = "sha256:1be4cccdb0f2482337c4743e60421de3a356cd97508abadd57d47403e94f5505", size = 4963, upload-time = "2025-04-22T14:54:22.983Z" },
+]
+
+[[package]]
+name = "neo4j"
+version = "6.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/59/46/7a562799679d0c9bd3f12d28b43591eb953efc975e1241536733c5d8bcd3/neo4j-6.3.1.tar.gz", hash = "sha256:e75530ca0691d69916c56acdb7401df4ee9e1d5084cfcfb3ede796db38667dcd", size = 242885, upload-time = "2026-09-15T08:08:32.67Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/a5/e33f76f4eb7e72c350e65802151884048325f889ab5d156ce4b6d9bde959/neo4j-6.3.1-py3-none-any.whl", hash = "sha256:a1b702d356f88885c27bdcf7dcd56af76423dbff4e26064e5bf5dbf47af53044", size = 331462, upload-time = "2026-09-15T08:08:31.252Z" },
+]
+
+[[package]]
+name = "neo4j-rust-ext"
+version = "6.3.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "neo4j" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/09/61/758bbb248980b67c7dfa397191a14fd65582f6780c4353f8146a48f75e81/neo4j_rust_ext-6.3.1.0.tar.gz", hash = "sha256:cad00f2502b0fe6e9e79168d49b82c85971be7e44c3d1b8d24c782652c310dbe", size = 26477, upload-time = "2026-09-15T15:54:47.719Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b5/d5/6ccd1ae21e9816b1a130148fc223e4978cd2b14b10fc5764da14f7426472/neo4j_rust_ext-6.3.1.0-cp314-cp314-macosx_10_12_x86_64.whl", hash = "sha256:6f2abd512047dd0339897606edb28d8cef0b94bef308a81912cbd7dbc4bee3df", size = 718418, upload-time = "2026-09-15T15:54:35.18Z" },
+    { url = "https://files.pythonhosted.org/packages/83/04/f6ad352146c8c9cc533aede2aad2fa76c9ea103cf900abc2c272d1e456f3/neo4j_rust_ext-6.3.1.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:29fe51edf7a8b475933b813dc105fecc142419bdfe19a0abca21da544ceb60a2", size = 717006, upload-time = "2026-09-15T15:54:37.288Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/19/1a0a4787ec6a956302c80f9ff07fb3b4287dddbfb2b3b3071432e2551433/neo4j_rust_ext-6.3.1.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e88c09a6a5451858715e71b15754c2a43008eab3da6df5f97ebe0757219aa480", size = 315418, upload-time = "2026-09-15T15:54:38.826Z" },
+    { url = "https://files.pythonhosted.org/packages/32/b1/7861ca49e76f97abbb0d99024211f166d93f01c66ba75a218ca0d671e11e/neo4j_rust_ext-6.3.1.0-cp314-cp314-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:5cfc226b936126e8775a2b4cffacbb5304feed9d1473382c7bc3fa7ee269a35b", size = 317596, upload-time = "2026-09-15T15:54:40.176Z" },
+    { url = "https://files.pythonhosted.org/packages/34/d7/b720b4d73238ddb6e2e91dcf63c41a33b0dfb82a578a67aeb238448745ba/neo4j_rust_ext-6.3.1.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:716a1a24df4bce13e27baf1100efc8e38cfbef20f7db380f51417edd90733577", size = 312279, upload-time = "2026-09-15T15:54:41.519Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/8c/850525676fcf81b6ab5aa45b6dc8b8a4bf437ff530a8e27e672bc02bcc3c/neo4j_rust_ext-6.3.1.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:c4ecd7490b8b4caba1edc97bdb312f71be5c3bfdc9c1f971cdc606eb787b3f07", size = 520643, upload-time = "2026-09-15T15:54:42.701Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/ea/e338338d425f6b32e060e9bda9d0e7c7dde4ccd603aaf5bb2a3055d0cf47/neo4j_rust_ext-6.3.1.0-cp314-cp314-win32.whl", hash = "sha256:7381fb52f06c5bda42e5c75770b6592a5713da0b8cf3fde988c1c0631bf9c86c", size = 749975, upload-time = "2026-09-15T15:54:44.044Z" },
+    { url = "https://files.pythonhosted.org/packages/76/84/96288edbca0632a145c14445cbc8d08ec7637ece8939a6ad3b13e646bfc1/neo4j_rust_ext-6.3.1.0-cp314-cp314-win_amd64.whl", hash = "sha256:cb9dfbfb9d7b18fc52ceb27a9a2b5febae72eadb9e7243766d87b2b851c1728a", size = 686753, upload-time = "2026-09-15T15:54:45.567Z" },
+    { url = "https://files.pythonhosted.org/packages/52/2d/27d42fffcdf3852bf04cca85aa60b3cc3fb1472b4d250e8111c0caade9ce/neo4j_rust_ext-6.3.1.0-cp314-cp314-win_arm64.whl", hash = "sha256:5b570636898f269753c979b9907cfd3cce3cb1409b9aacd52ae680077e479a3b", size = 166058, upload-time = "2026-09-15T15:54:46.682Z" },
 ]
 
 [[package]]
@@ -1376,6 +1422,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "pytz"
+version = "2026.3.post1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/48/fb042503b6ca6cd271261dc559fd6432f7d8c713153e9ec5c591af4dfc1c/pytz-2026.3.post1.tar.gz", hash = "sha256:2211d3fcf9a797d3405cac96ac7f61d80e6a644f72a3309607282fe8a2010c5d", size = 319745, upload-time = "2026-07-25T15:12:07.385Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0f/7b/39c34ca613b0b198cb866466651b26b045e2009864c5183c979a3b83f383/pytz-2026.3.post1-py2.py3-none-any.whl", hash = "sha256:dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815", size = 508283, upload-time = "2026-07-25T15:12:05.782Z" },
 ]
 
 [[package]]
