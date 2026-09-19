@@ -172,7 +172,7 @@ class TestOnDataMessage:
         mock_message.ack.assert_called_once()
 
         # Verify single upsert was executed (no separate SELECT)
-        assert mock_cursor.execute.call_count == 1
+        assert len(_entity_upsert_calls(mock_cursor)) == 1
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
@@ -205,7 +205,7 @@ class TestOnDataMessage:
         mock_message.ack.assert_called_once()
 
         # Single conditional upsert — PostgreSQL decides whether to write
-        assert mock_cursor.execute.call_count == 1
+        assert len(_entity_upsert_calls(mock_cursor)) == 1
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", True)
@@ -288,6 +288,24 @@ class TestOnDataMessage:
         mock_message.nack.assert_called_once_with(requeue=False)
 
 
+def _entity_upsert_calls(mock_cursor: Any) -> list[Any]:
+    """Return the entity-table upserts among everything a cursor executed.
+
+    The graph vertex and edge writes share this cursor, so "one conditional upsert" is a
+    claim about the entity statement rather than about the cursor's whole traffic. Graph
+    rows go out through `executemany` and their document-scoped deletes are `DELETE`
+    statements, so the entity upsert is the only `INSERT INTO` among the executes.
+    """
+    return [call for call in mock_cursor.execute.call_args_list if "INSERT INTO" in str(call.args[0])]
+
+
+def _entity_upsert_call(mock_cursor: Any) -> Any:
+    """Return the one entity-table upsert a single-record write executed."""
+    calls = _entity_upsert_calls(mock_cursor)
+    assert len(calls) == 1, f"expected exactly one entity upsert, saw {len(calls)}"
+    return calls[0]
+
+
 def _make_purge_connection(total_count: int, stale_count: int) -> tuple[MagicMock, AsyncMock]:
     """Build a mock connection wired for purge_stale_rows.
 
@@ -334,8 +352,9 @@ class TestPurgeStaleRowsGuards:
         with patch("tableinator.tableinator.connection_pool", pool):
             await purge_stale_rows("artists", "2026-07-20T00:00:00+00:00", record_count=95)
 
-        # 2 count queries + 1 DELETE = 3 executes; the DELETE actually ran.
-        assert mock_cursor.execute.call_count == 3
+        # 2 count queries + 1 graph sweep (an artist purge reaches `graph.alias_of`)
+        # + 1 DELETE = 4 executes; the DELETE actually ran and went last.
+        assert mock_cursor.execute.call_count == 4
         delete_sql = mock_cursor.execute.call_args_list[-1].args[0]
         assert "DELETE FROM" in str(delete_sql)
         assert "RETURNING" not in str(delete_sql)
@@ -379,7 +398,7 @@ class TestPurgeStaleRowsGuards:
         with patch("tableinator.tableinator.connection_pool", pool):
             await purge_stale_rows("artists", "2026-07-20T00:00:00+00:00", record_count=11)
 
-        assert mock_cursor.execute.call_count == 3
+        assert mock_cursor.execute.call_count == 4
         delete_sql = mock_cursor.execute.call_args_list[-1].args[0]
         assert "DELETE FROM" in str(delete_sql)
         mock_cursor.fetchall.assert_not_awaited()
@@ -2048,7 +2067,7 @@ class TestOnDataMessageBatchMode:
             await on_data_message(mock_message, "artists")
 
         # Should have processed directly with a single conditional upsert
-        assert mock_cursor.execute.call_count == 1
+        assert len(_entity_upsert_calls(mock_cursor)) == 1
         mock_message.ack.assert_called_once()
 
 
@@ -2081,7 +2100,7 @@ class TestOnDataMessageDatabaseOperations:
             await on_data_message(mock_message, "artists")
 
         # Single conditional upsert handles both insert and update cases
-        assert mock_cursor.execute.call_count == 1
+        assert len(_entity_upsert_calls(mock_cursor)) == 1
         mock_message.ack.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2253,7 +2272,7 @@ class TestOnDataMessageReleaseMedia:
 
         cursor = await self._upsert(data, mock_async_pool)
 
-        query, params = cursor.execute.call_args[0]
+        query, params = _entity_upsert_call(cursor).args
         assert "media" in query.as_string(None)
         assert params[self._MEDIA_PARAM].obj == media_block
         # `data` itself is untouched — still carries the event's own media key verbatim.
@@ -2268,7 +2287,7 @@ class TestOnDataMessageReleaseMedia:
 
         cursor = await self._upsert(data, mock_async_pool)
 
-        derived = cursor.execute.call_args[0][1][self._MEDIA_PARAM].obj
+        derived = _entity_upsert_call(cursor).args[1][self._MEDIA_PARAM].obj
         assert derived["families"] == ["vinyl"]
         assert derived["items"][0]["medium"] == "vinyl_12"
         assert derived["items"][0]["source"]["descriptions"] == ["LP"]
@@ -2281,7 +2300,7 @@ class TestOnDataMessageReleaseMedia:
 
         cursor = await self._upsert(data, mock_async_pool)
 
-        derived = cursor.execute.call_args[0][1][self._MEDIA_PARAM].obj
+        derived = _entity_upsert_call(cursor).args[1][self._MEDIA_PARAM].obj
         assert derived["items"] == []
         assert derived["families"] == []
         assert "Zorbatron" in derived["unmapped"]["formats"] or "Zorbatron" in derived["unmapped"]["descriptions"]
@@ -2295,14 +2314,14 @@ class TestOnDataMessageReleaseMedia:
         cursor_first = await self._upsert(data, mock_async_pool)
         cursor_second = await self._upsert(data, mock_async_pool)
 
-        media_first = cursor_first.execute.call_args[0][1][self._MEDIA_PARAM].obj
-        media_second = cursor_second.execute.call_args[0][1][self._MEDIA_PARAM].obj
+        media_first = _entity_upsert_call(cursor_first).args[1][self._MEDIA_PARAM].obj
+        media_second = _entity_upsert_call(cursor_second).args[1][self._MEDIA_PARAM].obj
         assert media_first == media_second
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_non_release_entity_gets_no_media_parameter(self, sample_artist_data: dict[str, Any], mock_async_pool: Any) -> None:
-        """Non-release entities keep the original 3-parameter upsert, unchanged."""
+        """No other table has a media column, so no other statement binds a media block."""
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps(sample_artist_data).encode()
         mock_message.routing_key = "artists"
@@ -2320,9 +2339,11 @@ class TestOnDataMessageReleaseMedia:
             await on_data_message(mock_message, "artists")
 
         mock_message.ack.assert_called_once()
-        query, params = mock_cursor.execute.call_args[0]
+        query, params = _entity_upsert_call(mock_cursor).args
         assert "media" not in query.as_string(None)
-        assert len(params) == 4  # hash, data_id, data, gm_item_id
+        # data_id, hash, data_id, data, gm_item_id, hash — the `prior` CTE's lookup key
+        # first and its hash comparison last, bracketing the INSERT's own four values.
+        assert len(params) == 6
 
 
 class TestOnDataMessageMediaBackfill:
@@ -2337,13 +2358,14 @@ class TestOnDataMessageMediaBackfill:
     """
 
     @staticmethod
-    async def _upsert(data: dict[str, Any], mock_async_pool: Any, prior_state: tuple[bool] | None) -> tuple[MagicMock, list[str]]:
+    async def _upsert(data: dict[str, Any], mock_async_pool: Any, prior_state: tuple[bool, bool] | None) -> tuple[MagicMock, list[str]]:
         """Send one `releases` message through the non-batch path.
 
-        `prior_state` is what the statement's trailing SELECT answers -- `(True,)` for a
-        row whose hash matched and whose `media` was NULL, `(False,)` otherwise, `None`
-        for a release that did not exist yet. Returns the cursor and the outcomes
-        recorded for the delivery.
+        `prior_state` is what the statement's trailing SELECT answers, in its two columns:
+        the media backfill flag -- `True` for a row whose hash matched and whose `media`
+        was NULL -- and the content-hash gate, `True` when this event's payload differs
+        from the stored one. `None` stands for a release that did not exist yet. Returns
+        the cursor and the outcomes recorded for the delivery.
         """
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps(data).encode()
@@ -2372,9 +2394,9 @@ class TestOnDataMessageMediaBackfill:
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_media_rewrite_is_no_longer_gated_on_hash_alone(self, mock_async_pool: Any) -> None:
         """`media` also rewrites when it IS NULL; `hash` and `data` stay hash-gated."""
-        cursor, _outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True,))
+        cursor, _outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True, False))
 
-        query = cursor.execute.call_args[0][0].as_string(None)
+        query = _entity_upsert_call(cursor).args[0].as_string(None)
         assert 'media = CASE WHEN "releases".hash != EXCLUDED.hash OR "releases".media IS NULL' in query
         assert 'hash = CASE WHEN "releases".hash != EXCLUDED.hash THEN' in query
         assert 'data = CASE WHEN "releases".hash != EXCLUDED.hash THEN' in query
@@ -2383,8 +2405,9 @@ class TestOnDataMessageMediaBackfill:
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_prior_state_is_read_in_the_same_round_trip(self, mock_async_pool: Any) -> None:
         """One statement, not two: the CTE reads the pre-write row alongside the write."""
-        cursor, _outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True,))
+        cursor, _outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True, False))
 
+        # An unchanged hash writes no graph rows, so the upsert is the only statement.
         assert cursor.execute.call_count == 1
         query = cursor.execute.call_args[0][0].as_string(None)
         assert query.startswith("WITH prior AS (")
@@ -2394,7 +2417,7 @@ class TestOnDataMessageMediaBackfill:
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_unchanged_hash_with_null_media_is_reported_as_backfilled(self, mock_async_pool: Any) -> None:
         """Unchanged hash + NULL media reports `media_backfilled`, not `processed`."""
-        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True,))
+        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(True, False))
 
         assert outcomes == ["media_backfilled"]
 
@@ -2402,7 +2425,7 @@ class TestOnDataMessageMediaBackfill:
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_unchanged_hash_with_media_present_is_reported_as_processed(self, mock_async_pool: Any) -> None:
         """A row that already has media took no media write, so it is not a backfill."""
-        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(False,))
+        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=(False, False))
 
         assert outcomes == ["processed"]
 
@@ -2422,14 +2445,20 @@ class TestOnDataMessageMediaBackfill:
         The trailing SELECT yields a SQL boolean; anything else means the cursor was
         not answering this query, and reporting it as a backfill would be a lie.
         """
-        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=("yes",))  # type: ignore[arg-type]
+        _cursor, outcomes = await self._upsert(TestOnDataMessageReleaseMedia._release_data(), mock_async_pool, prior_state=("yes", False))  # type: ignore[arg-type]
 
         assert outcomes == ["processed"]
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_non_release_entity_keeps_the_plain_statement(self, sample_artist_data: dict[str, Any], mock_async_pool: Any) -> None:
-        """Only `releases` has a media column, so no other table grows the CTE."""
+        """The CTE is the content-hash gate both statements need; only media is release-only.
+
+        A non-release statement reads the same `prior.prior_hash` the release one does —
+        that is how the hash gate answers whether this event's graph rows have to be
+        rewritten, in the same round trip rather than a second SELECT. What it must NOT
+        grow is anything about `media`: no other table has the column.
+        """
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps(sample_artist_data).encode()
         mock_message.routing_key = "artists"
@@ -2449,8 +2478,9 @@ class TestOnDataMessageMediaBackfill:
         ):
             await on_data_message(mock_message, "artists")
 
-        query = mock_cursor.execute.call_args[0][0].as_string(None)
-        assert "WITH prior" not in query
+        query = _entity_upsert_call(mock_cursor).args[0].as_string(None)
+        assert query.startswith("WITH prior AS (")
+        assert "prior_media_is_null" not in query
         assert "media" not in query
         assert [call_args[0][1] for call_args in record_message.call_args_list] == ["processed"]
 
@@ -2555,7 +2585,7 @@ class TestPurgeStaleRows:
         mock_conn.set_autocommit.assert_called_once_with(False)
 
         # 2 count queries + 1 DELETE; the DELETE (last call) carries the parsed timestamp.
-        assert mock_cursor.execute.call_count == 3
+        assert mock_cursor.execute.call_count == 4
         call_args = mock_cursor.execute.call_args
         param = call_args[0][1]
         # After fix, started_at is parsed to a datetime with UTC timezone
@@ -2628,7 +2658,7 @@ class TestPurgeStaleRows:
         await purge_stale_rows("artists", "2026-01-01T00:00:00", record_count=97)
 
         # The DELETE (last execute) receives the UTC-normalized timestamp.
-        assert mock_cursor.execute.call_count == 3
+        assert mock_cursor.execute.call_count == 4
         call_args = mock_cursor.execute.call_args
         param = call_args[0][1]
         if isinstance(param, tuple):
