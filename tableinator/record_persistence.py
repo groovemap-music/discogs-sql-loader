@@ -134,108 +134,118 @@ class PostgreSQLRecordPersistence:
         # shape), and an absent `prior` row is a first sight of the document, which changes
         # everything there is to change.
         content_changed = True
-        async with self.connection_pool.connection() as conn, conn.cursor() as cursor:
-            # Native identity (ADR 0009): resolve before the upsert, on the same connection
-            # and therefore inside the same transaction, so the row is written with the
-            # native item it maps to or not written at all.
-            ref = alias_ref(data_type, data_id)
-            native_ids = await resolve_aliases(conn, [ref])
-            if ref not in native_ids:
-                # Every Discogs entity kind is a catalog kind, so a miss is a broken
-                # assumption rather than a retryable outage.
-                raise RuntimeError(f"resolve_aliases returned no native id for {data_type}: {data_id}")
-            gm_item_id = native_ids[ref]
+        # One transaction for the document, its aliases, and its graph rows, exactly as
+        # `purge_stale_rows` above and `PostgreSQLBatchWriter.process_batch` open one. The
+        # pool hands out an AUTOCOMMIT connection and resets it on return, so without this
+        # every statement below would commit on its own — and the document-scoped DELETE
+        # would land ahead of the edge INSERTs. A failure in between would leave the entity
+        # row and its NEW content hash durable with the edges gone, and the next delivery
+        # of the same event would read that hash, find it unchanged, and skip the
+        # re-derivation that is the only thing that would have put them back.
+        async with self.connection_pool.connection() as conn:
+            await conn.set_autocommit(False)
+            async with conn.transaction(), conn.cursor() as cursor:
+                # Native identity (ADR 0009): resolve before the upsert, on the same
+                # connection and therefore inside this transaction, so the row is written
+                # with the native item it maps to or not written at all.
+                ref = alias_ref(data_type, data_id)
+                native_ids = await resolve_aliases(conn, [ref])
+                if ref not in native_ids:
+                    # Every Discogs entity kind is a catalog kind, so a miss is a broken
+                    # assumption rather than a retryable outage.
+                    raise RuntimeError(f"resolve_aliases returned no native id for {data_type}: {data_id}")
+                gm_item_id = native_ids[ref]
 
-            if data_type == "releases":
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
-                    sql.SQL(
-                        "WITH prior AS ("
-                        "SELECT hash AS prior_hash, media IS NULL AS prior_media_is_null "
-                        "FROM {table} WHERE data_id = %s"
-                        "), upserted AS ("
-                        "INSERT INTO {table} (hash, data_id, data, media, gm_item_id, updated_at) "
-                        "VALUES (%s, %s, %s, %s, %s, NOW()) "
-                        "ON CONFLICT (data_id) DO UPDATE "
-                        "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.hash ELSE {table}.hash END, "
-                        "data = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.data ELSE {table}.data END, "
-                        "media = CASE WHEN {table}.hash != EXCLUDED.hash OR {table}.media IS NULL "
-                        "THEN EXCLUDED.media ELSE {table}.media END, "
-                        "gm_item_id = EXCLUDED.gm_item_id, "
-                        "updated_at = NOW() "
-                        "RETURNING 1"
-                        ") "
-                        "SELECT COALESCE(prior.prior_hash = %s, false) AND prior.prior_media_is_null, "
-                        "prior.prior_hash IS DISTINCT FROM %s "
-                        "FROM prior;"
-                    ).format(table=sql.Identifier(data_type)),
-                    (
-                        data_id,
-                        data.get("sha256", ""),
-                        data_id,
-                        Jsonb(data),
-                        Jsonb(self.media_resolver(data)),
-                        gm_item_id,
-                        data.get("sha256", ""),
-                        data.get("sha256", ""),
-                    ),
-                )
-                prior_state = await cursor.fetchone()
-                if prior_state is None:
-                    content_changed = True
+                if data_type == "releases":
+                    await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                        sql.SQL(
+                            "WITH prior AS ("
+                            "SELECT hash AS prior_hash, media IS NULL AS prior_media_is_null "
+                            "FROM {table} WHERE data_id = %s"
+                            "), upserted AS ("
+                            "INSERT INTO {table} (hash, data_id, data, media, gm_item_id, updated_at) "
+                            "VALUES (%s, %s, %s, %s, %s, NOW()) "
+                            "ON CONFLICT (data_id) DO UPDATE "
+                            "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
+                            "THEN EXCLUDED.hash ELSE {table}.hash END, "
+                            "data = CASE WHEN {table}.hash != EXCLUDED.hash "
+                            "THEN EXCLUDED.data ELSE {table}.data END, "
+                            "media = CASE WHEN {table}.hash != EXCLUDED.hash OR {table}.media IS NULL "
+                            "THEN EXCLUDED.media ELSE {table}.media END, "
+                            "gm_item_id = EXCLUDED.gm_item_id, "
+                            "updated_at = NOW() "
+                            "RETURNING 1"
+                            ") "
+                            "SELECT COALESCE(prior.prior_hash = %s, false) AND prior.prior_media_is_null, "
+                            "prior.prior_hash IS DISTINCT FROM %s "
+                            "FROM prior;"
+                        ).format(table=sql.Identifier(data_type)),
+                        (
+                            data_id,
+                            data.get("sha256", ""),
+                            data_id,
+                            Jsonb(data),
+                            Jsonb(self.media_resolver(data)),
+                            gm_item_id,
+                            data.get("sha256", ""),
+                            data.get("sha256", ""),
+                        ),
+                    )
+                    prior_state = await cursor.fetchone()
+                    if prior_state is None:
+                        content_changed = True
+                    else:
+                        if prior_state[0] is True:
+                            terminal_outcome = "media_backfilled"
+                        content_changed = bool(prior_state[1])
                 else:
-                    if prior_state[0] is True:
-                        terminal_outcome = "media_backfilled"
-                    content_changed = bool(prior_state[1])
-            else:
-                await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
-                    sql.SQL(
-                        "WITH prior AS ("
-                        "SELECT hash AS prior_hash FROM {table} WHERE data_id = %s"
-                        "), upserted AS ("
-                        "INSERT INTO {table} (hash, data_id, data, gm_item_id, updated_at) "
-                        "VALUES (%s, %s, %s, %s, NOW()) "
-                        "ON CONFLICT (data_id) DO UPDATE "
-                        "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.hash ELSE {table}.hash END, "
-                        "data = CASE WHEN {table}.hash != EXCLUDED.hash "
-                        "THEN EXCLUDED.data ELSE {table}.data END, "
-                        "gm_item_id = EXCLUDED.gm_item_id, "
-                        "updated_at = NOW() "
-                        "RETURNING 1"
-                        ") "
-                        "SELECT prior.prior_hash IS DISTINCT FROM %s FROM prior;"
-                    ).format(table=sql.Identifier(data_type)),
-                    (
-                        data_id,
-                        data.get("sha256", ""),
-                        data_id,
-                        Jsonb(data),
-                        gm_item_id,
-                        data.get("sha256", ""),
-                    ),
+                    await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                        sql.SQL(
+                            "WITH prior AS ("
+                            "SELECT hash AS prior_hash FROM {table} WHERE data_id = %s"
+                            "), upserted AS ("
+                            "INSERT INTO {table} (hash, data_id, data, gm_item_id, updated_at) "
+                            "VALUES (%s, %s, %s, %s, NOW()) "
+                            "ON CONFLICT (data_id) DO UPDATE "
+                            "SET hash = CASE WHEN {table}.hash != EXCLUDED.hash "
+                            "THEN EXCLUDED.hash ELSE {table}.hash END, "
+                            "data = CASE WHEN {table}.hash != EXCLUDED.hash "
+                            "THEN EXCLUDED.data ELSE {table}.data END, "
+                            "gm_item_id = EXCLUDED.gm_item_id, "
+                            "updated_at = NOW() "
+                            "RETURNING 1"
+                            ") "
+                            "SELECT prior.prior_hash IS DISTINCT FROM %s FROM prior;"
+                        ).format(table=sql.Identifier(data_type)),
+                        (
+                            data_id,
+                            data.get("sha256", ""),
+                            data_id,
+                            Jsonb(data),
+                            gm_item_id,
+                            data.get("sha256", ""),
+                        ),
+                    )
+                    prior_row = await cursor.fetchone()
+                    content_changed = prior_row is None or bool(prior_row[0])
+
+                # Identifier aliases (ADR 0011): the same attach the batch path makes, one
+                # record at a time, after the upsert and on this connection, so the aliases and
+                # the row they point at commit together. A record whose hash did not change is
+                # attached too, because the upsert above cannot report whether its aliases exist.
+                await attach_alias_targets(conn, alias_targets(data_type, [(data, gm_item_id)]), self.logger, data_type)
+
+                # The graph vertices and edges this document asserts, on this same connection
+                # and therefore this same transaction. A document whose hash did not change
+                # asserts nothing new, exactly as the enricher's own hash gate returns early
+                # from `process_artist` and its three siblings.
+                if content_changed:
+                    await write_document_graph(cursor, data_type, [(data_id, data)])
+
+                self.logger.debug(
+                    "🐘 Updated record in PostgreSQL",
+                    data_type=data_type[:-1],
+                    data_id=data_id,
                 )
-                prior_row = await cursor.fetchone()
-                content_changed = prior_row is None or bool(prior_row[0])
-
-            # Identifier aliases (ADR 0011): the same attach the batch path makes, one
-            # record at a time, after the upsert and on this connection, so the aliases and
-            # the row they point at commit together. A record whose hash did not change is
-            # attached too, because the upsert above cannot report whether its aliases exist.
-            await attach_alias_targets(conn, alias_targets(data_type, [(data, gm_item_id)]), self.logger, data_type)
-
-            # The graph vertices and edges this document asserts, on this same connection
-            # and therefore this same transaction. A document whose hash did not change
-            # asserts nothing new, exactly as the enricher's own hash gate returns early
-            # from `process_artist` and its three siblings.
-            if content_changed:
-                await write_document_graph(cursor, data_type, [(data_id, data)])
-
-            self.logger.debug(
-                "🐘 Updated record in PostgreSQL",
-                data_type=data_type[:-1],
-                data_id=data_id,
-            )
 
         return terminal_outcome

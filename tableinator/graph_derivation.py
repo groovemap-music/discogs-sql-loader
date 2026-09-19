@@ -153,6 +153,15 @@ def derive_artist(data_id: str, data: dict[str, Any]) -> DocumentGraph:
     two documents the dump happened to deliver last. The enricher never prunes MEMBER_OF
     either, so writing it additively is what keeps the two stores agreeing. `alias_of` has
     no such ambiguity: a row's `artist_id` is the asserting document, so it is replaced.
+
+    The cost is a known, bounded drift from the schema's own phase 0 body, which is a
+    `UNION` over both unnests and therefore drops a row the moment NEITHER end asserts it.
+    Written additively, a membership Discogs withdraws from both documents survives here
+    and in Neo4j until something sweeps it, so this relation and `same_as` are the two
+    `graph.bootstrap_fill()` can disagree with after a removal. Reconciling them belongs to
+    the `extraction_complete` pass in gm-discogs-sql-loader-2eg.3, which already re-reads
+    every edge table to recompute the counters; it is deliberately NOT done per document,
+    because per document is exactly the scope that cannot tell the two ends apart.
     """
     members = [(member_id, data_id) for member_id in _element_ids(data.get("members"))]
     groups = [(data_id, group_id) for group_id in _element_ids(data.get("groups"))]
@@ -199,7 +208,10 @@ def derive_release(data_id: str, data: dict[str, Any]) -> DocumentGraph:
     that can assert the row. `same_as` cannot be: its key is `(person_name, artist_id)` with
     no release column at all, so every release that credits the same person by id asserts
     the same row and no delete scoped to one release can tell them apart. The enricher never
-    prunes SAME_AS either.
+    prunes SAME_AS either. Like `member_of`, that leaves it able to outlive the last
+    release that asserted it, which is the one place it can disagree with the phase 0
+    body; see `derive_artist` for why the sweep belongs to the `extraction_complete` pass
+    rather than to a document.
 
     A release carrying no canonical `companies` block leaves `credited_to` untouched —
     neither deleted nor written. That is `company_projection.resolve_companies_block`: such

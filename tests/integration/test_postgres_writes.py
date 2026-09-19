@@ -29,14 +29,25 @@ pytestmark = pytest.mark.integration
 
 
 class SingleConnectionPool:
-    """Expose one test connection through the production pool protocol."""
+    """Expose one test connection through the production pool protocol.
+
+    `common.AsyncPostgreSQLPool` hands out an AUTOCOMMIT connection and restores autocommit
+    when the caller gives it back, precisely so a caller that opened its own transaction
+    cannot poison the next borrower. Both write paths and the stale-row purge rely on that,
+    so the double has to do it too or a test would see a connection production never hands
+    out.
+    """
 
     def __init__(self, connection: psycopg.AsyncConnection[Any]) -> None:
         self._connection = connection
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
-        yield self._connection
+        try:
+            yield self._connection
+        finally:
+            if not self._connection.autocommit:
+                await self._connection.set_autocommit(True)
 
 
 @dataclass(frozen=True)

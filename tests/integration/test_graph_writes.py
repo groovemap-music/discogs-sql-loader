@@ -43,14 +43,25 @@ class BatchRecord:
 
 
 class SingleConnectionPool:
-    """Expose one test connection through the production pool protocol."""
+    """Expose one test connection through the production pool protocol.
+
+    `common.AsyncPostgreSQLPool` hands out an AUTOCOMMIT connection and restores autocommit
+    when the caller gives it back, precisely so a caller that opened its own transaction
+    cannot poison the next borrower. Both write paths and the stale-row purge rely on that,
+    so the double has to do it too or a test would see a connection production never hands
+    out.
+    """
 
     def __init__(self, connection: psycopg.AsyncConnection[Any]) -> None:
         self._connection = connection
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
-        yield self._connection
+        try:
+            yield self._connection
+        finally:
+            if not self._connection.autocommit:
+                await self._connection.set_autocommit(True)
 
 
 # ── The fixture catalog ──────────────────────────────────────────────────────
@@ -194,12 +205,25 @@ async def _write_batch(connection: psycopg.AsyncConnection[Any], data_type: str,
     """Send one batch of documents through the batch write path."""
     writer = PostgreSQLBatchWriter(SingleConnectionPool(connection), MagicMock(), media_for_release)
     records = [BatchRecord(data_id, data, f"{data_id}-{suffix}") for data_id, data in documents]
-    try:
-        return await writer.process_batch(data_type, records)
-    finally:
-        # `process_batch` leaves the connection out of autocommit; the rest of the test
-        # runs statement by statement.
-        await connection.set_autocommit(True)
+    return await writer.process_batch(data_type, records)
+
+
+async def _persist(connection: psycopg.AsyncConnection[Any], data_type: str, data_id: str, data: dict[str, Any]) -> None:
+    """Send one document through the single-record write path."""
+    persistence = PostgreSQLRecordPersistence(SingleConnectionPool(connection), MagicMock(), 0.9, media_for_release)
+    await persistence.persist_record(data_type, data_id, data)
+
+
+def _break_one_edge_insert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the first edge INSERT fail, after the document-scoped DELETE has run.
+
+    `write_document_graph` writes vertices, then deletes each replaced relation's rows for
+    this document, then inserts the edges. Naming a column `graph.by_artist` does not have
+    turns that third step into an `UndefinedColumn` raised by the server, which is the
+    shape every real mid-write failure has: the delete is already done and the edges are
+    not back yet.
+    """
+    monkeypatch.setitem(EDGE_COLUMNS, "by_artist", ("release_id", "column_that_does_not_exist"))
 
 
 async def _load_catalog(connection: psycopg.AsyncConnection[Any], suffix: str = "v1") -> None:
@@ -324,7 +348,6 @@ async def test_the_stale_row_purge_removes_the_edges_of_the_documents_it_deletes
 
     persistence = PostgreSQLRecordPersistence(SingleConnectionPool(graph_connection), MagicMock(), 0.9, media_for_release)
     await persistence.purge_stale_rows("releases", "2001-01-01T00:00:00+00:00", record_count=1)
-    await graph_connection.set_autocommit(True)
 
     remaining = await (await graph_connection.execute("SELECT data_id FROM releases")).fetchall()
     assert remaining == [("gw-r1",)]
@@ -338,6 +361,55 @@ async def test_the_stale_row_purge_removes_the_edges_of_the_documents_it_deletes
 
 
 @pytest.mark.asyncio
+async def test_a_failed_graph_write_rolls_back_the_document_and_its_edges(
+    graph_connection: psycopg.AsyncConnection[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-record path must commit the document, its hash, and its edges together.
+
+    The pool hands out an AUTOCOMMIT connection, so without an explicit transaction the
+    document-scoped DELETE would commit on its own ahead of the edge INSERTs. A failure in
+    between would leave the entity row and its NEW hash durable with the edges gone — and
+    the next delivery of the same event would read that hash, find it unchanged, and skip
+    the re-derivation that is the only thing that would have put them back. This test is
+    the one that fails if the transaction goes away, because the fixture connection runs in
+    autocommit exactly as production does.
+    """
+    release = {**RELEASES[0][1], "sha256": "gw-r1-v1"}
+    await _persist(graph_connection, "releases", "gw-r1", release)
+    assert await _count(graph_connection, "by_artist") == 3
+
+    _break_one_edge_insert(monkeypatch)
+    corrected = {**release, "artists": [{"id": "gw-a1"}], "genres": ["Rock"], "sha256": "gw-r1-v2"}
+    with pytest.raises(psycopg.errors.UndefinedColumn):
+        await _persist(graph_connection, "releases", "gw-r1", corrected)
+
+    stored = await (await graph_connection.execute("SELECT hash FROM releases WHERE data_id = 'gw-r1'")).fetchone()
+    assert stored == ("gw-r1-v1",), "the entity row's content hash must not survive a failed graph write"
+    assert await _count(graph_connection, "by_artist") == 3
+    assert await _count(graph_connection, "in_genre") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failed_graph_write_rolls_back_the_whole_batch(
+    graph_connection: psycopg.AsyncConnection[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batch path's own transaction has to cover its graph writes for the same reason."""
+    await _write_batch(graph_connection, "releases", RELEASES)
+    assert await _count(graph_connection, "by_artist") == 4
+
+    _break_one_edge_insert(monkeypatch)
+    corrected = [("gw-r1", {**RELEASES[0][1], "artists": [{"id": "gw-a1"}]})]
+    with pytest.raises(psycopg.errors.UndefinedColumn):
+        await _write_batch(graph_connection, "releases", corrected, suffix="v2")
+
+    stored = await (await graph_connection.execute("SELECT hash FROM releases WHERE data_id = 'gw-r1'")).fetchone()
+    assert stored == ("gw-r1-v1",)
+    assert await _count(graph_connection, "by_artist") == 4
+
+
+@pytest.mark.asyncio
 async def test_the_single_record_path_writes_the_same_rows_as_the_batch_path(
     graph_connection: psycopg.AsyncConnection[Any],
 ) -> None:
@@ -346,10 +418,9 @@ async def test_the_single_record_path_writes_the_same_rows_as_the_batch_path(
     batched = await _counts(graph_connection, {**EXPECTED_EDGES, **EXPECTED_VERTICES})
 
     await _truncate(graph_connection)
-    persistence = PostgreSQLRecordPersistence(SingleConnectionPool(graph_connection), MagicMock(), 0.9, media_for_release)
     for data_type, documents in (("artists", ARTISTS), ("labels", LABELS), ("masters", MASTERS), ("releases", RELEASES)):
         for data_id, data in documents:
-            await persistence.persist_record(data_type, data_id, {**data, "sha256": f"{data_id}-v1"})
+            await _persist(graph_connection, data_type, data_id, {**data, "sha256": f"{data_id}-v1"})
 
     assert await _counts(graph_connection, {**EXPECTED_EDGES, **EXPECTED_VERTICES}) == batched
 
@@ -359,16 +430,15 @@ async def test_the_single_record_path_also_skips_an_unchanged_document(
     graph_connection: psycopg.AsyncConnection[Any],
 ) -> None:
     """Its hash gate is the `prior` CTE its own upsert carries, not a second SELECT."""
-    persistence = PostgreSQLRecordPersistence(SingleConnectionPool(graph_connection), MagicMock(), 0.9, media_for_release)
     release = {**RELEASES[0][1], "sha256": "gw-r1-v1"}
 
-    await persistence.persist_record("releases", "gw-r1", release)
+    await _persist(graph_connection, "releases", "gw-r1", release)
     await graph_connection.execute("DELETE FROM graph.by_artist")
-    await persistence.persist_record("releases", "gw-r1", release)
+    await _persist(graph_connection, "releases", "gw-r1", release)
 
     # Unchanged, so nothing was rewritten — the deleted rows stay deleted until the
     # document's content actually changes.
     assert await _count(graph_connection, "by_artist") == 0
 
-    await persistence.persist_record("releases", "gw-r1", {**release, "sha256": "gw-r1-v2"})
+    await _persist(graph_connection, "releases", "gw-r1", {**release, "sha256": "gw-r1-v2"})
     assert await _count(graph_connection, "by_artist") == 3

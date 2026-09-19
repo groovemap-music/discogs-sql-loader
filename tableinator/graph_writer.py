@@ -23,6 +23,17 @@ shared with `musicbrainz-sql-loader`, and the name-keyed vertices are a vocabula
 document re-asserts rather than a row any one document owns. Every edge INSERT is too, so a
 relation written additively (`member_of`, `same_as`) converges instead of raising, and so a
 batch in which two documents assert the same row writes it once.
+
+One consequence is worth stating before the parity harness finds it. The enricher UPDATES a
+vertex it matches — `SET co.name = c.name` in `MERGE_COMPANY_CYPHER`, `ON MATCH SET m.family
+… m.label` in `MERGE_MEDIA_CYPHER` — where DO NOTHING keeps whatever the first write put
+there. A company renamed upstream, or a medium relabelled by a newer taxonomy version, keeps
+its first spelling in `graph.company.name` and in `graph.medium.family` and `.label` until
+something rewrites it, while the Neo4j node moves. Only the property differs; the identity
+columns are derived from the same rule on both sides and cannot drift. The cross-store parity
+test in gm-discogs-sql-loader-2eg.4 will see this, and whether it becomes an ON CONFLICT DO
+UPDATE or a backfill is that bead's call, not this one's — a blind DO UPDATE here would have
+each provider overwrite the other's answer on the two shared vertex tables.
 """
 
 from __future__ import annotations

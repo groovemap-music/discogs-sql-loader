@@ -288,6 +288,22 @@ class TestOnDataMessage:
         mock_message.nack.assert_called_once_with(requeue=False)
 
 
+def _record_transaction(mock_connection: Any) -> Any:
+    """Give a connection double the transaction shape `persist_record` opens.
+
+    The single-record path takes the connection out of autocommit and drives one
+    `conn.transaction()` around the document, its aliases, and its graph rows, exactly as
+    the batch writer and the stale-row purge do. A double that answers only `cursor()`
+    cannot stand in for it.
+    """
+    transaction_cm = AsyncMock()
+    transaction_cm.__aenter__ = AsyncMock(return_value=None)
+    transaction_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_connection.set_autocommit = AsyncMock()
+    mock_connection.transaction = MagicMock(return_value=transaction_cm)
+    return mock_connection
+
+
 def _entity_upsert_calls(mock_cursor: Any) -> list[Any]:
     """Return the entity-table upserts among everything a cursor executed.
 
@@ -1981,6 +1997,7 @@ class TestOnDataMessageProgressLogging:
         mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
         mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
 
+        _record_transaction(mock_connection)
         mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
 
         # Setup async connection pool mock
@@ -2253,7 +2270,7 @@ class TestOnDataMessageReleaseMedia:
         mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
         mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
 
-        mock_connection = MagicMock()
+        mock_connection = _record_transaction(MagicMock())
         mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
 
         pool = mock_async_pool(mock_connection)
@@ -2331,7 +2348,7 @@ class TestOnDataMessageReleaseMedia:
         mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
         mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
 
-        mock_connection = MagicMock()
+        mock_connection = _record_transaction(MagicMock())
         mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
 
         pool = mock_async_pool(mock_connection)
@@ -2377,7 +2394,7 @@ class TestOnDataMessageMediaBackfill:
         mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
         mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
 
-        mock_connection = MagicMock()
+        mock_connection = _record_transaction(MagicMock())
         mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
 
         pool = mock_async_pool(mock_connection)
@@ -2468,7 +2485,7 @@ class TestOnDataMessageMediaBackfill:
         mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
         mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
 
-        mock_connection = MagicMock()
+        mock_connection = _record_transaction(MagicMock())
         mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
 
         pool = mock_async_pool(mock_connection)
@@ -2483,6 +2500,59 @@ class TestOnDataMessageMediaBackfill:
         assert "prior_media_is_null" not in query
         assert "media" not in query
         assert [call_args[0][1] for call_args in record_message.call_args_list] == ["processed"]
+
+
+class TestPersistRecordIsTransactional:
+    """The non-batch path must not let one of its statements commit on its own.
+
+    The pool hands out an AUTOCOMMIT connection and resets it on return, so an implicit
+    transaction per statement is what a caller gets unless the path opens one. The
+    document-scoped DELETE would then land ahead of the edge INSERTs, and a failure in
+    between would leave the entity row and its NEW content hash durable with the edges
+    gone — the next delivery of the same event reads that hash, finds it unchanged, and
+    skips the re-derivation that is the only thing that would have put them back.
+    `tests/integration/test_graph_writes.py` proves the rollback against a real server;
+    this pins the shape in the fast lane, beside the purge and the batch writer that have
+    opened a transaction all along.
+    """
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_every_statement_runs_inside_one_transaction(self, sample_artist_data: dict[str, Any], mock_async_pool: Any) -> None:
+        """Autocommit is turned off, one transaction is opened, and nothing runs outside it."""
+        order: list[str] = []
+
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(sample_artist_data).encode()
+        mock_message.routing_key = "artists"
+
+        mock_cursor = AsyncMock()
+        mock_cursor.execute = AsyncMock(side_effect=lambda *_args, **_kwargs: order.append("execute"))
+        mock_cursor.executemany = AsyncMock(side_effect=lambda *_args, **_kwargs: order.append("executemany"))
+        mock_cursor_cm = AsyncMock()
+        mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+
+        transaction_cm = AsyncMock()
+        transaction_cm.__aenter__ = AsyncMock(side_effect=lambda: order.append("begin"))
+        transaction_cm.__aexit__ = AsyncMock(side_effect=lambda *_args: order.append("commit"))
+
+        mock_connection = MagicMock()
+        mock_connection.set_autocommit = AsyncMock(side_effect=lambda value: order.append(f"autocommit={value}"))
+        mock_connection.transaction = MagicMock(return_value=transaction_cm)
+        mock_connection.cursor = MagicMock(return_value=mock_cursor_cm)
+
+        pool = mock_async_pool(mock_connection)
+        with patch("tableinator.tableinator.connection_pool", pool):
+            await on_data_message(mock_message, "artists")
+
+        mock_message.ack.assert_called_once()
+        mock_connection.transaction.assert_called_once_with()
+        assert order[0] == "autocommit=False"
+        assert order[1] == "begin"
+        assert order[-1] == "commit"
+        # The graph rows this artist asserts went out inside that transaction, not after it.
+        assert "executemany" in order[2:-1]
 
 
 class TestOnDataMessageFileCompletion:
