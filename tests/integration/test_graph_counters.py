@@ -28,7 +28,14 @@ import pytest
 import pytest_asyncio
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
-from tableinator.extraction_latch import EXTRACTION_LATCH_TABLE, extraction_latch_key, mark_extraction_refreshed, record_extraction_signal
+from tableinator.extraction_latch import (
+    LATCH_CANDIDATES,
+    LOADER_DISCRIMINATOR,
+    extraction_latch_key,
+    mark_extraction_refreshed,
+    probe_latch_relation,
+    record_extraction_signal,
+)
 from tableinator.graph_counters import REFRESH_ORDER, refresh_derived_relations
 from tableinator.graph_derivation import EDGE_COLUMNS, VERTEX_COLUMNS
 from tableinator.media import media_for_release
@@ -228,7 +235,8 @@ async def _truncate(connection: psycopg.AsyncConnection[Any]) -> None:
     relations = ", ".join(f"graph.{relation}" for relation in (*EDGE_COLUMNS, *VERTEX_COLUMNS, *REFRESH_ORDER))
     await connection.execute(f"TRUNCATE {relations}")
     await connection.execute(f"TRUNCATE {', '.join(ENTITY_TABLES)}")
-    await connection.execute(f"DROP TABLE IF EXISTS {EXTRACTION_LATCH_TABLE}")
+    for schema, table in LATCH_CANDIDATES:
+        await connection.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
 
 
 async def _write_batch(connection: psycopg.AsyncConnection[Any], data_type: str, documents: Any, suffix: str = "v1") -> None:
@@ -510,18 +518,56 @@ async def test_style_and_genre_counts_follow_the_schema_not_the_cypher(refreshed
 # Which signal fires the pass, and what survives a restart. Every call below goes through a
 # separate `SingleConnectionPool`, which is what a restarted process would do: nothing is
 # carried between them but the rows.
+#
+# The relation is created by the fixture below rather than by the loader, because the loader
+# creates no database objects and the pinned `groovemap-database-schema` does not declare
+# this one yet — a chore is adding it. The DDL here is therefore a stand-in for that
+# declaration, and the follow-up that repins should delete it and let the promoted schema
+# provide the table.
 
 FIRST_DUMP = "20260101"
 SECOND_DUMP = "20260201"
 
+_DECLARED_LATCH = """
+CREATE TABLE {schema}.{table} (
+    {loader_column}
+    version      text NOT NULL,
+    signals      text[] NOT NULL DEFAULT '{{}}',
+    created_at   timestamptz NOT NULL DEFAULT NOW(),
+    updated_at   timestamptz NOT NULL DEFAULT NOW(),
+    refreshed_at timestamptz,
+    PRIMARY KEY ({key})
+)
+"""
 
-async def _signal(connection: psycopg.AsyncConnection[Any], version: str, data_type: str) -> Any:
-    return await record_extraction_signal(SingleConnectionPool(connection), version, data_type)
+
+async def _declare_latch(connection: psycopg.AsyncConnection[Any], *, shared: bool) -> Any:
+    """Create the relation the schema chore is adding, then let the loader find it."""
+    schema, table = LATCH_CANDIDATES[0]
+    await connection.execute(
+        _DECLARED_LATCH.format(
+            schema=schema,
+            table=table,
+            loader_column="loader text NOT NULL," if shared else "",
+            key="loader, version" if shared else "version",
+        )
+    )
+    return await probe_latch_relation(SingleConnectionPool(connection), MagicMock())
 
 
-async def _mark_refreshed(connection: psycopg.AsyncConnection[Any], version: str) -> None:
+@pytest_asyncio.fixture
+async def declared_latch(counter_connection: psycopg.AsyncConnection[Any]) -> Any:
+    """The shared shape, which is the one the chore is most likely to land."""
+    return await _declare_latch(counter_connection, shared=True)
+
+
+async def _signal(connection: psycopg.AsyncConnection[Any], latch: Any, version: str, data_type: str) -> Any:
+    return await record_extraction_signal(SingleConnectionPool(connection), latch, version, data_type)
+
+
+async def _mark_refreshed(connection: psycopg.AsyncConnection[Any], latch: Any, version: str) -> None:
     async with connection.cursor() as cursor:
-        await mark_extraction_refreshed(cursor, version)
+        await mark_extraction_refreshed(cursor, latch, version)
 
 
 def test_the_latch_key_prefers_the_version_then_the_start_then_unknown() -> None:
@@ -532,28 +578,64 @@ def test_the_latch_key_prefers_the_version_then_the_start_then_unknown() -> None
 
 
 @pytest.mark.asyncio
-async def test_only_the_fourth_signal_of_an_extraction_fires_the_pass(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+async def test_the_probe_finds_nothing_in_the_promoted_schema_and_the_loader_degrades(
+    counter_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    """The pinned schema does not declare the relation yet, and the loader must not add it.
+
+    This is the degraded mode against a real database: the probe comes back empty, the
+    loader records no signal and fires no pass, and nothing in `public` or `graph` has been
+    created by looking.
+    """
+    relation = await probe_latch_relation(SingleConnectionPool(counter_connection), MagicMock())
+
+    assert relation is None
+    for schema, table in LATCH_CANDIDATES:
+        rows = await _rows(
+            counter_connection,
+            f"SELECT count(*) FROM information_schema.tables WHERE table_schema = '{schema}' AND table_name = '{table}'",  # noqa: S608
+        )
+        assert rows == [(0,)], f"the probe must not have created {schema}.{table}"
+
+
+@pytest.mark.asyncio
+async def test_the_probe_recognises_the_relation_once_it_is_declared(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    unshared = await _declare_latch(counter_connection, shared=False)
+
+    assert unshared is not None
+    assert (unshared.schema, unshared.table) == LATCH_CANDIDATES[0]
+    assert unshared.keyed_on_loader is False
+
+
+@pytest.mark.asyncio
+async def test_the_probe_reads_the_loader_column_when_the_relation_is_shared(declared_latch: Any) -> None:
+    assert declared_latch is not None
+    assert declared_latch.keyed_on_loader is True
+
+
+@pytest.mark.asyncio
+async def test_only_the_fourth_signal_of_an_extraction_fires_the_pass(counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any) -> None:
     fired = []
     for data_type in ENTITY_TABLES:
-        latch = await _signal(counter_connection, FIRST_DUMP, data_type)
+        latch = await _signal(counter_connection, declared_latch, FIRST_DUMP, data_type)
         fired.append(latch.should_refresh(ENTITY_TABLES))
 
     assert fired == [False, False, False, True]
 
 
 @pytest.mark.asyncio
-async def test_a_restart_between_signals_loses_none_of_them(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+async def test_a_restart_between_signals_loses_none_of_them(counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any) -> None:
     """An in-memory set would lose the first two, and four would never be reached.
 
     Each call opens its own pool over the connection, so nothing but the rows carries from
     one to the next — which is exactly what the process has after a restart.
     """
-    await _signal(counter_connection, FIRST_DUMP, "artists")
-    await _signal(counter_connection, FIRST_DUMP, "labels")
+    await _signal(counter_connection, declared_latch, FIRST_DUMP, "artists")
+    await _signal(counter_connection, declared_latch, FIRST_DUMP, "labels")
 
     # ... the loader restarts here ...
-    third = await _signal(counter_connection, FIRST_DUMP, "masters")
-    fourth = await _signal(counter_connection, FIRST_DUMP, "releases")
+    third = await _signal(counter_connection, declared_latch, FIRST_DUMP, "masters")
+    fourth = await _signal(counter_connection, declared_latch, FIRST_DUMP, "releases")
 
     assert third.signals == frozenset({"artists", "labels", "masters"})
     assert third.should_refresh(ENTITY_TABLES) is False
@@ -562,28 +644,28 @@ async def test_a_restart_between_signals_loses_none_of_them(counter_connection: 
 
 
 @pytest.mark.asyncio
-async def test_a_second_extraction_collects_its_own_four_signals(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+async def test_a_second_extraction_collects_its_own_four_signals(counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any) -> None:
     """An unkeyed latch would fire on the FIRST signal of the second dump, and then thrice more."""
     for data_type in ENTITY_TABLES:
-        await _signal(counter_connection, FIRST_DUMP, data_type)
-    await _mark_refreshed(counter_connection, FIRST_DUMP)
+        await _signal(counter_connection, declared_latch, FIRST_DUMP, data_type)
+    await _mark_refreshed(counter_connection, declared_latch, FIRST_DUMP)
 
     fired = []
     for data_type in ENTITY_TABLES:
-        latch = await _signal(counter_connection, SECOND_DUMP, data_type)
+        latch = await _signal(counter_connection, declared_latch, SECOND_DUMP, data_type)
         fired.append(latch.should_refresh(ENTITY_TABLES))
 
     assert fired == [False, False, False, True]
 
 
 @pytest.mark.asyncio
-async def test_a_straggler_from_a_superseded_extraction_fires_nothing(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+async def test_a_straggler_from_a_superseded_extraction_fires_nothing(counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any) -> None:
     """The next dump has started, so the late fourth signal of the last one must not sweep."""
     for data_type in ("artists", "labels", "masters"):
-        await _signal(counter_connection, FIRST_DUMP, data_type)
-    await _signal(counter_connection, SECOND_DUMP, "artists")
+        await _signal(counter_connection, declared_latch, FIRST_DUMP, data_type)
+    await _signal(counter_connection, declared_latch, SECOND_DUMP, "artists")
 
-    straggler = await _signal(counter_connection, FIRST_DUMP, "releases")
+    straggler = await _signal(counter_connection, declared_latch, FIRST_DUMP, "releases")
 
     assert straggler.signals == frozenset(ENTITY_TABLES)
     assert straggler.superseded is True
@@ -592,13 +674,13 @@ async def test_a_straggler_from_a_superseded_extraction_fires_nothing(counter_co
 
 @pytest.mark.asyncio
 async def test_a_redelivered_signal_after_a_successful_pass_fires_nothing(
-    counter_connection: psycopg.AsyncConnection[Any],
+    counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any
 ) -> None:
     for data_type in ENTITY_TABLES:
-        await _signal(counter_connection, FIRST_DUMP, data_type)
-    await _mark_refreshed(counter_connection, FIRST_DUMP)
+        await _signal(counter_connection, declared_latch, FIRST_DUMP, data_type)
+    await _mark_refreshed(counter_connection, declared_latch, FIRST_DUMP)
 
-    redelivered = await _signal(counter_connection, FIRST_DUMP, "releases")
+    redelivered = await _signal(counter_connection, declared_latch, FIRST_DUMP, "releases")
 
     assert redelivered.already_signalled is True
     assert redelivered.already_refreshed is True
@@ -607,13 +689,13 @@ async def test_a_redelivered_signal_after_a_successful_pass_fires_nothing(
 
 @pytest.mark.asyncio
 async def test_a_failed_pass_leaves_the_extraction_unstamped_so_the_retry_runs(
-    counter_connection: psycopg.AsyncConnection[Any],
+    counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any
 ) -> None:
     """The pass nacks its delivery on failure, and `refreshed_at` is stamped on its own transaction."""
     for data_type in ENTITY_TABLES:
-        await _signal(counter_connection, FIRST_DUMP, data_type)
+        await _signal(counter_connection, declared_latch, FIRST_DUMP, data_type)
 
-    retry = await _signal(counter_connection, FIRST_DUMP, "releases")
+    retry = await _signal(counter_connection, declared_latch, FIRST_DUMP, "releases")
 
     assert retry.already_signalled is True
     assert retry.already_refreshed is False
@@ -621,13 +703,31 @@ async def test_a_failed_pass_leaves_the_extraction_unstamped_so_the_retry_runs(
 
 
 @pytest.mark.asyncio
-async def test_the_pass_stamps_the_extraction_on_its_own_transaction(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+async def test_a_shared_relation_keeps_the_two_loaders_apart(counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any) -> None:
+    """musicbrainz-sql-loader's rows must neither satisfy nor supersede this loader's."""
+    schema, table = LATCH_CANDIDATES[0]
+    await counter_connection.execute(
+        f"INSERT INTO {schema}.{table} (loader, version, signals) VALUES ('musicbrainz', %s, %s)",  # noqa: S608
+        (FIRST_DUMP, list(ENTITY_TABLES)),
+    )
+
+    ours = await _signal(counter_connection, declared_latch, FIRST_DUMP, "artists")
+
+    assert ours.signals == frozenset({"artists"})
+    assert ours.superseded is False
+    rows = await _rows(counter_connection, f"SELECT loader, version FROM {schema}.{table} ORDER BY loader")  # noqa: S608
+    assert rows == [(LOADER_DISCRIMINATOR, FIRST_DUMP), ("musicbrainz", FIRST_DUMP)]
+
+
+@pytest.mark.asyncio
+async def test_the_pass_stamps_the_extraction_on_its_own_transaction(counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any) -> None:
     """A committed pass marks the extraction done, which is what makes a redelivery cheap."""
     await _load_catalog(counter_connection)
     for data_type in ENTITY_TABLES:
-        await _signal(counter_connection, FIRST_DUMP, data_type)
+        await _signal(counter_connection, declared_latch, FIRST_DUMP, data_type)
 
-    await _refresh(counter_connection, FIRST_DUMP)
+    await refresh_derived_relations(SingleConnectionPool(counter_connection), MagicMock(), FIRST_DUMP, declared_latch)
 
-    stamped = await _rows(counter_connection, f"SELECT refreshed_at IS NOT NULL FROM {EXTRACTION_LATCH_TABLE}")  # noqa: S608
+    schema, table = LATCH_CANDIDATES[0]
+    stamped = await _rows(counter_connection, f"SELECT refreshed_at IS NOT NULL FROM {schema}.{table}")  # noqa: S608
     assert stamped == [(True,)]

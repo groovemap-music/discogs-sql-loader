@@ -101,7 +101,7 @@ from typing import TYPE_CHECKING, Any, Final, LiteralString
 
 from psycopg import sql
 
-from tableinator.extraction_latch import mark_extraction_refreshed
+from tableinator.extraction_latch import LatchRelation, mark_extraction_refreshed
 from tableinator.graph_derivation import EDGE_COLUMNS, derive_document
 
 
@@ -474,7 +474,7 @@ async def refresh_counter_relations(cursor: Any, logger: Any) -> dict[str, int]:
     return counts
 
 
-async def refresh_derived_relations(connection_pool: Any, logger: Any, version: str) -> dict[str, int]:
+async def refresh_derived_relations(connection_pool: Any, logger: Any, version: str, latch: LatchRelation | None = None) -> dict[str, int]:
     """Reconcile the additive edges and recompute every counter, in one transaction.
 
     One transaction for all three steps, because `artist_degree` sums `member_of` and
@@ -488,6 +488,8 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
         connection_pool: The loader's `AsyncPostgreSQLPool`.
         logger: The loader's structured logger.
         version: The extraction this pass is running for, from `extraction_latch_key`.
+        latch: The declared latch relation to stamp, or None for a caller driving the pass
+            directly rather than off a signal.
 
     Returns:
         The row count written per counter relation.
@@ -501,7 +503,8 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
         async with conn.transaction(), conn.cursor() as cursor:
             reconciled = await reconcile_additive_edges(cursor, logger)
             counts = await refresh_counter_relations(cursor, logger)
-            await mark_extraction_refreshed(cursor, version)
+            if latch is not None:
+                await mark_extraction_refreshed(cursor, latch, version)
 
     logger.info(
         "✅ Refreshed the derived graph relations",

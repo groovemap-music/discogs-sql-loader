@@ -12,6 +12,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 import pytest
 from aio_pika.abc import AbstractIncomingMessage
 
+from tableinator.extraction_latch import LatchRelation
 from tableinator.tableinator import (
     channel_prefetch,
     check_all_consumers_idle,
@@ -30,9 +31,13 @@ from tableinator.tableinator import (
 # SimpleConnectionPool tests removed as we now use AsyncPostgreSQLPool
 
 
+# The relation the pending database-schema chore declares, as the startup probe resolves it.
+_DECLARED_LATCH = LatchRelation(schema="public", table="loader_extraction_latch", keyed_on_loader=True)
+
+
 # gm-discogs-sql-loader-2eg.3: a latch stub for the suites that exercise the purge rather
 # than the refresh. One of four types has signalled, so the derived-relation pass defers.
-async def _one_type_signalled(_pool: Any, version: str, data_type: str) -> Any:
+async def _one_type_signalled(_pool: Any, _latch: Any, version: str, data_type: str) -> Any:
     from tableinator.extraction_latch import ExtractionLatch
 
     return ExtractionLatch(
@@ -1123,6 +1128,7 @@ class TestOnDataMessageExtended:
             patch("tableinator.tableinator.connection_pool", MagicMock()),
             # One type of four has signalled, so the derived-relation pass defers.
             patch("tableinator.tableinator.record_extraction_signal", new=_one_type_signalled),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
         ):
             await on_data_message(mock_message, "artists")
 
@@ -1156,6 +1162,7 @@ class TestOnDataMessageExtended:
             patch("tableinator.tableinator.purge_stale_rows", new_callable=AsyncMock) as mock_purge,
             patch("tableinator.tableinator.connection_pool", MagicMock()),
             patch("tableinator.tableinator.record_extraction_signal", new=_one_type_signalled),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
         ):
             await on_data_message(mock_message, "artists")
 
@@ -3788,6 +3795,8 @@ class TestMainFullRun:
                 patch("tableinator.tableinator.setup_logging"),
                 patch("tableinator.tableinator.HealthServer") as mock_hs,
                 patch("tableinator.tableinator.AsyncPostgreSQLPool", return_value=mock_pool),
+                # The startup probe reads information_schema; this pool is a mock, not a database.
+                patch("tableinator.tableinator.probe_latch_relation", new=AsyncMock(return_value=_DECLARED_LATCH)),
                 patch("tableinator.tableinator.AsyncResilientRabbitMQ", return_value=mock_rabbitmq_instance),
                 patch("tableinator.tableinator.BATCH_MODE", True),
                 patch("tableinator.tableinator.progress_reporter", new=AsyncMock()),
@@ -3839,6 +3848,8 @@ class TestMainFullRun:
                 patch("tableinator.tableinator.setup_logging"),
                 patch("tableinator.tableinator.HealthServer") as mock_hs,
                 patch("tableinator.tableinator.AsyncPostgreSQLPool", return_value=mock_pool),
+                # The startup probe reads information_schema; this pool is a mock, not a database.
+                patch("tableinator.tableinator.probe_latch_relation", new=AsyncMock(return_value=_DECLARED_LATCH)),
                 patch("tableinator.tableinator.AsyncResilientRabbitMQ", return_value=mock_rabbitmq_instance),
                 patch("tableinator.tableinator.asyncio.sleep", side_effect=fast_sleep),
                 patch("tableinator.tableinator.signal.signal"),
@@ -3899,6 +3910,8 @@ class TestMainFullRun:
                 patch("tableinator.tableinator.setup_logging"),
                 patch("tableinator.tableinator.HealthServer") as mock_hs,
                 patch("tableinator.tableinator.AsyncPostgreSQLPool", return_value=mock_pool),
+                # The startup probe reads information_schema; this pool is a mock, not a database.
+                patch("tableinator.tableinator.probe_latch_relation", new=AsyncMock(return_value=_DECLARED_LATCH)),
                 patch("tableinator.tableinator.AsyncResilientRabbitMQ", return_value=mock_rabbitmq_instance),
                 patch("tableinator.tableinator.BATCH_MODE", True),
                 patch("tableinator.tableinator.progress_reporter", new=AsyncMock()),
@@ -4019,7 +4032,7 @@ class TestDerivedRelationRefresh:
         collected: set[str] = set()
         refresh = AsyncMock()
 
-        async def record(_pool: Any, version: str, data_type: str) -> Any:
+        async def record(_pool: Any, _latch: Any, version: str, data_type: str) -> Any:
             recorded.append((version, data_type))
             collected.add(data_type)
             return self._latch(collected)
@@ -4031,6 +4044,7 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", set()),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", new=record),
             patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
         ):
@@ -4047,7 +4061,7 @@ class TestDerivedRelationRefresh:
         refresh = AsyncMock()
         pool = MagicMock()
 
-        async def record(_pool: Any, _version: str, data_type: str) -> Any:
+        async def record(_pool: Any, _latch: Any, _version: str, data_type: str) -> Any:
             collected.add(data_type)
             return self._latch(collected)
 
@@ -4058,13 +4072,14 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", set()),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", new=record),
             patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
         ):
             for data_type in ("artists", "labels", "masters", "releases"):
                 await on_data_message(self._signal(), data_type)
 
-        refresh.assert_awaited_once_with(pool, ANY, "20260101")
+        refresh.assert_awaited_once_with(pool, ANY, "20260101", _DECLARED_LATCH)
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
@@ -4074,7 +4089,7 @@ class TestDerivedRelationRefresh:
         refresh = AsyncMock()
         collected: dict[str, set[str]] = {}
 
-        async def record(_pool: Any, version: str, data_type: str) -> Any:
+        async def record(_pool: Any, _latch: Any, version: str, data_type: str) -> Any:
             signals = collected.setdefault(version, set())
             signals.add(data_type)
             return self._latch(signals, version=version)
@@ -4086,6 +4101,7 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", set()),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", new=record),
             patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
         ):
@@ -4105,7 +4121,7 @@ class TestDerivedRelationRefresh:
         refresh = AsyncMock()
         message = self._signal()
 
-        async def record(_pool: Any, _version: str, _data_type: str) -> Any:
+        async def record(_pool: Any, _latch: Any, _version: str, _data_type: str) -> Any:
             return self._latch({"artists", "labels", "masters", "releases"}, superseded=True)
 
         with (
@@ -4115,6 +4131,7 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", set()),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", new=record),
             patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
         ):
@@ -4129,7 +4146,7 @@ class TestDerivedRelationRefresh:
         refresh = AsyncMock()
         message = self._signal()
 
-        async def record(_pool: Any, _version: str, _data_type: str) -> Any:
+        async def record(_pool: Any, _latch: Any, _version: str, _data_type: str) -> Any:
             return self._latch({"artists", "labels", "masters", "releases"}, already_refreshed=True)
 
         with (
@@ -4139,6 +4156,7 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", set()),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", new=record),
             patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
         ):
@@ -4161,6 +4179,7 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", completed),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", side_effect=Exception("latch boom")),
             patch("tableinator.tableinator.refresh_derived_relations", new=AsyncMock()),
         ):
@@ -4177,7 +4196,7 @@ class TestDerivedRelationRefresh:
         completed: set[str] = set()
         message = self._signal()
 
-        async def record(_pool: Any, _version: str, _data_type: str) -> Any:
+        async def record(_pool: Any, _latch: Any, _version: str, _data_type: str) -> Any:
             return self._latch({"artists", "labels", "masters", "releases"})
 
         with (
@@ -4187,6 +4206,7 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", completed),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", new=record),
             patch("tableinator.tableinator.refresh_derived_relations", side_effect=Exception("refresh boom")),
         ):
@@ -4210,9 +4230,49 @@ class TestDerivedRelationRefresh:
             patch("tableinator.tableinator.completed_files", set()),
             patch("tableinator.tableinator.queues", {}),
             patch("tableinator.tableinator.purge_stale_rows", side_effect=Exception("purge boom")),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
             patch("tableinator.tableinator.record_extraction_signal", new=record),
         ):
             await on_data_message(message, "releases")
 
         record.assert_not_awaited()
         message.nack.assert_called_once_with(requeue=True)
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_no_declared_relation_records_nothing_and_refreshes_nothing(self) -> None:
+        """The degraded mode. This service does not create database objects, so an absent
+        latch relation means the pass is off until a schema revision declares it — said in
+        the log, not worked around here."""
+        record = AsyncMock()
+        refresh = AsyncMock()
+        completed: set[str] = set()
+        message = self._signal()
+
+        with (
+            patch("tableinator.tableinator.logger") as mock_logger,
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.completed_files", completed),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", None),
+            patch("tableinator.tableinator.record_extraction_signal", new=record),
+            patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
+        ):
+            await on_data_message(message, "releases")
+
+        record.assert_not_awaited()
+        refresh.assert_not_awaited()
+        # The signal itself is still terminal: the purge ran and the type is complete.
+        assert completed == {"releases"}
+        message.ack.assert_called_once()
+        assert any("no extraction latch relation is declared" in str(call).lower() for call in mock_logger.warning.call_args_list)
+
+    def test_the_health_payload_says_when_the_refresh_is_degraded(self) -> None:
+        """A refresh that is silently not happening is what this field exists to surface."""
+        with patch("tableinator.tableinator.extraction_latch", None):
+            assert get_health_data()["derived_relation_refresh"] == "degraded"
+
+        with patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH):
+            assert get_health_data()["derived_relation_refresh"] == "enabled"

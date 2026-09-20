@@ -42,7 +42,7 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
-from tableinator.extraction_latch import extraction_latch_key, record_extraction_signal
+from tableinator.extraction_latch import LatchRelation, extraction_latch_key, probe_latch_relation, record_extraction_signal
 from tableinator.graph_counters import refresh_derived_relations
 from tableinator.media import media_for_release
 from tableinator.queue_names import (
@@ -124,6 +124,12 @@ PURGE_MAX_DELETE_FRACTION = float(
 # sound. `completed_files` cannot stand in for it either: it is also written by
 # `file_complete` and ERASED by `_recover_consumers`, so it answers "has this type's file
 # finished" rather than "has this type signalled the end of THIS extraction".
+
+# The declared latch relation, resolved once at startup by a read of `information_schema`.
+# None means the schema in front of this loader does not declare it, and the loader then
+# runs degraded: no signal is recorded and the pass never fires. This service never creates
+# database objects — `docs/database-schema.md`, guarded by `tests/test_service_contract.py`.
+extraction_latch: LatchRelation | None = None
 
 # Single-flight within the process. The four consumers deliver their signals concurrently,
 # so two of them can both observe a complete latch; the pass is idempotent, so the loser
@@ -211,6 +217,8 @@ def get_health_data() -> dict[str, Any]:
         "last_message_time": last_message_time.copy(),
         "active_consumers": list(consumer_tags.keys()),
         "completed_files": list(completed_files),
+        # A refresh that is silently not happening is the failure this field exists to surface.
+        "derived_relation_refresh": "enabled" if extraction_latch is not None else "degraded",
         "timestamp": datetime.now(UTC).isoformat(),
     }
 
@@ -777,13 +785,18 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             # counters sum; a failure nacks this delivery exactly as a failed purge
             # does, and the whole pass is idempotent so the retry re-runs it safely.
             refresh_ok = True
-            if purge_ok and connection_pool is not None:
+            if purge_ok and connection_pool is not None and extraction_latch is None:
+                logger.warning(
+                    "⚠️ Skipping the derived-relation refresh — no extraction latch relation is declared",
+                    data_type=data_type,
+                )
+            elif purge_ok and connection_pool is not None and extraction_latch is not None:
                 async with derived_refresh_lock:
                     try:
                         version = extraction_latch_key(data)
-                        latch = await record_extraction_signal(connection_pool, version, data_type)
+                        latch = await record_extraction_signal(connection_pool, extraction_latch, version, data_type)
                         if latch.should_refresh(DATA_TYPES):
-                            await refresh_derived_relations(connection_pool, logger, version)
+                            await refresh_derived_relations(connection_pool, logger, version, extraction_latch)
                         elif latch.already_refreshed:
                             logger.info(
                                 "✅ Derived relations were already refreshed for this extraction",
@@ -1083,7 +1096,8 @@ async def main() -> None:
         active_connection, \
         active_channel, \
         connection_check_task, \
-        batch_processor
+        batch_processor, \
+        extraction_latch
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -1145,6 +1159,9 @@ async def main() -> None:
         )
         await connection_pool.initialize()
         logger.info("🐘 Connected to PostgreSQL with async resilient connection pool")
+        # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
+        # read-only. A miss is a logged degraded mode, never a reason to create the table.
+        extraction_latch = await probe_latch_relation(connection_pool, logger)
         logger.info(
             "✅ Async connection pool initialized (min: %d, max: %d connections)",
             config.postgres_pool_min_size,

@@ -22,16 +22,29 @@ message carries, so each dump collects its own four.
 ack destroys the queued message, which was otherwise the only durable copy of the
 coordination state (discogsography-tk7v). An in-memory set has the same hole: a restart
 between the second and third signal loses the two already collected, the remaining two can
-never reach four, and the refresh silently never runs for that dump. The rows here outlive
-the process.
+never reach four, and the refresh silently never runs for that dump.
 
-The table is small, loader-private, and not declared by `groovemap-database-schema`, which
-is pinned and owns only relations more than one service reads. It is created with `CREATE
-TABLE IF NOT EXISTS` on the transaction that first writes to it: four DDL statements per
-dump, idempotent, and no startup ordering to get wrong. `public.extraction_history` is not
-usable for this — it is keyed on a UUID and a `users` row the loader has neither of — and
-`public.app_config` holds the encrypted Discogs consumer key and secret, which is not a
-table to put coordination state in.
+**This module issues no DDL.** `docs/database-schema.md` states that this service does not
+create or migrate database objects, `tests/test_service_contract.py` guards that sentence,
+and `database-schema` owns every executable definition. The latch relation is declared
+there; what happens here is a read of `information_schema` at startup to find it. When it is
+present the loader runs as described above. When it is absent the loader runs in a degraded
+mode that records no signal and fires no refresh, says so in the log and in the health
+payload, and never tries to make the relation itself. The counters simply stay as the last
+successful pass left them, which is the failure that can be seen and fixed rather than the
+one that writes a table nobody declared.
+
+`public.extraction_history` cannot serve as that relation: it is keyed on a UUID and a
+`users` row the loader has neither of. `public.app_config` holds the encrypted Discogs
+consumer key and secret, which is not a table to put coordination state in.
+
+**Until the pin moves**, the relation is being declared by a `database-schema` chore and its
+name is not yet settled, so `LATCH_CANDIDATES` names both proposals and the probe takes the
+first that matches. The follow-up that repins to the revision declaring it should cut this
+list to the one that landed. The `loader` discriminator is optional for the same reason: the
+relation is named for the loader family so `musicbrainz-sql-loader` can share it, and if it
+carries that column this module keys on it so the two loaders cannot read each other's
+signals.
 """
 
 from __future__ import annotations
@@ -39,60 +52,145 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final
 
+from psycopg import sql
+
 
 __all__ = [
-    "EXTRACTION_LATCH_TABLE",
     "EXTRACTION_LATCH_UNKNOWN_VERSION",
+    "LATCH_CANDIDATES",
+    "LOADER_DISCRIMINATOR",
     "ExtractionLatch",
-    "ensure_latch_table",
+    "LatchRelation",
     "extraction_latch_key",
     "mark_extraction_refreshed",
+    "probe_latch_relation",
     "record_extraction_signal",
 ]
 
 # `graphinator.EXTRACTION_LATCH_UNKNOWN_VERSION`, for a signal that names no extraction.
 EXTRACTION_LATCH_UNKNOWN_VERSION: Final = "unknown"
 
-EXTRACTION_LATCH_TABLE: Final = "discogs_loader_extraction_latch"
+# This loader's value for the `loader` column, when the declared relation carries one.
+LOADER_DISCRIMINATOR: Final = "discogs"
 
-# One row per extraction, holding the types that have signalled it. `refreshed_at` records
-# that the derived-relation pass completed for that extraction, which is what lets a
-# redelivered signal be answered without re-running a sweep that already succeeded.
-_CREATE_LATCH_TABLE: Final = f"""
-CREATE TABLE IF NOT EXISTS {EXTRACTION_LATCH_TABLE} (
-    version      text PRIMARY KEY,
-    signals      text[] NOT NULL DEFAULT '{{}}',
-    created_at   timestamptz NOT NULL DEFAULT NOW(),
-    updated_at   timestamptz NOT NULL DEFAULT NOW(),
-    refreshed_at timestamptz
+# Where the declared relation may live, most specific first. Both names are the ones the
+# `database-schema` chore proposes; the repin cuts this to whichever landed.
+LATCH_CANDIDATES: Final[tuple[tuple[str, str], ...]] = (
+    ("public", "loader_extraction_latch"),
+    ("graph", "extraction_latch"),
 )
+
+# The columns this module reads and writes, with the `information_schema` type each must
+# have. A relation that is missing one, or spells one differently, is not this relation and
+# the probe declines it rather than writing into something that merely shares a name.
+REQUIRED_COLUMNS: Final[dict[str, tuple[str, str | None]]] = {
+    "version": ("text", None),
+    "signals": ("ARRAY", "_text"),
+    "created_at": ("timestamp with time zone", None),
+    "updated_at": ("timestamp with time zone", None),
+    "refreshed_at": ("timestamp with time zone", None),
+}
+
+# Optional, and part of the key when present.
+LOADER_COLUMN: Final = "loader"
+LOADER_COLUMN_TYPE: Final = "text"
+
+_PROBE = """
+SELECT column_name, data_type, udt_name
+FROM information_schema.columns
+WHERE table_schema = %s AND table_name = %s
 """
 
-# Record one signal and report the state the caller decides on, in a single statement so
-# two consumers signalling at once cannot read a set neither of them wrote. `prior` is
-# evaluated on the pre-statement snapshot, so it sees the row as it was before the upsert.
-_RECORD_SIGNAL: Final = f"""
-WITH prior AS (
-    SELECT signals AS signals FROM {EXTRACTION_LATCH_TABLE} WHERE version = %(version)s
-), upserted AS (
-    INSERT INTO {EXTRACTION_LATCH_TABLE} AS latch (version, signals)
-    VALUES (%(version)s, ARRAY[%(data_type)s]::text[])
-    ON CONFLICT (version) DO UPDATE
-       SET signals = (SELECT array_agg(DISTINCT signal ORDER BY signal)
-                        FROM unnest(latch.signals || EXCLUDED.signals) AS signal),
-           updated_at = NOW()
-    RETURNING latch.signals AS signals, latch.refreshed_at AS refreshed_at, latch.created_at AS created_at
-)
-SELECT upserted.signals AS signals,
-       COALESCE(%(data_type)s = ANY(prior.signals), false) AS already_signalled,
-       upserted.refreshed_at IS NOT NULL AS already_refreshed,
-       EXISTS (
-           SELECT 1 FROM {EXTRACTION_LATCH_TABLE} AS newer WHERE newer.created_at > upserted.created_at
-       ) AS superseded
-FROM upserted LEFT JOIN prior ON true
-"""  # noqa: S608
 
-_MARK_REFRESHED: Final = f"UPDATE {EXTRACTION_LATCH_TABLE} SET refreshed_at = NOW(), updated_at = NOW() WHERE version = %s"  # noqa: S608
+@dataclass(frozen=True)
+class LatchRelation:
+    """The declared latch relation this loader found at startup.
+
+    Attributes:
+        schema: The schema it lives in.
+        table: Its name.
+        keyed_on_loader: It carries a `loader` column, so both loaders share it and every
+            statement this module issues is scoped to `LOADER_DISCRIMINATOR`.
+    """
+
+    schema: str
+    table: str
+    keyed_on_loader: bool
+
+    @property
+    def qualified(self) -> str:
+        """The relation as it reads in a log line."""
+        return f"{self.schema}.{self.table}"
+
+    def _relation(self) -> sql.Identifier:
+        return sql.Identifier(self.schema, self.table)
+
+    def _key_columns(self) -> tuple[str, ...]:
+        return (LOADER_COLUMN, "version") if self.keyed_on_loader else ("version",)
+
+    def _key_predicate(self, alias: str | None = None) -> sql.Composed:
+        def column(name: str) -> sql.Composable:
+            return sql.SQL("{alias}.{column}").format(alias=sql.Identifier(alias), column=sql.Identifier(name)) if alias else sql.Identifier(name)
+
+        clauses = [sql.SQL("{column} = {value}").format(column=column("version"), value=sql.Placeholder("version"))]
+        if self.keyed_on_loader:
+            clauses.append(sql.SQL("{column} = {value}").format(column=column(LOADER_COLUMN), value=sql.Placeholder(LOADER_COLUMN)))
+        return sql.SQL(" AND ").join(clauses)
+
+    def record_statement(self) -> sql.Composed:
+        """Return the one statement that records a signal and reports the latch.
+
+        One statement, so two consumers signalling at once cannot read a set neither of them
+        wrote. `prior` is evaluated on the pre-statement snapshot, so it sees the row as it
+        was before the upsert.
+        """
+        key_columns = self._key_columns()
+        columns = sql.SQL(", ").join(sql.Identifier(name) for name in key_columns)
+        values = sql.SQL(", ").join(sql.Placeholder(name) for name in key_columns)
+        newer_scope = (
+            sql.SQL(" AND {column} = {value}").format(column=sql.Identifier("newer", LOADER_COLUMN), value=sql.Placeholder(LOADER_COLUMN))
+            if self.keyed_on_loader
+            else sql.SQL("")
+        )
+        return sql.SQL(
+            "WITH prior AS ("
+            "SELECT signals AS signals FROM {relation} WHERE {key}"
+            "), upserted AS ("
+            "INSERT INTO {relation} AS latch ({columns}, signals) VALUES ({values}, ARRAY[{data_type}]::text[]) "
+            "ON CONFLICT ({columns}) DO UPDATE "
+            "SET signals = (SELECT array_agg(DISTINCT signal ORDER BY signal) FROM unnest(latch.signals || EXCLUDED.signals) AS signal), "
+            "updated_at = NOW() "
+            "RETURNING latch.signals AS signals, latch.refreshed_at AS refreshed_at, latch.created_at AS created_at"
+            ") "
+            "SELECT upserted.signals AS signals, "
+            "COALESCE({data_type} = ANY(prior.signals), false) AS already_signalled, "
+            "upserted.refreshed_at IS NOT NULL AS already_refreshed, "
+            "EXISTS (SELECT 1 FROM {relation} AS newer WHERE newer.created_at > upserted.created_at{newer_scope}) AS superseded "
+            "FROM upserted LEFT JOIN prior ON true"
+        ).format(
+            relation=self._relation(),
+            key=self._key_predicate(),
+            columns=columns,
+            values=values,
+            data_type=sql.Placeholder("data_type"),
+            newer_scope=newer_scope,
+        )
+
+    def stamp_statement(self) -> sql.Composed:
+        """Return the statement marking one extraction's pass as complete."""
+        return sql.SQL("UPDATE {relation} SET refreshed_at = NOW(), updated_at = NOW() WHERE {key}").format(
+            relation=self._relation(),
+            key=self._key_predicate(),
+        )
+
+    def parameters(self, version: str, data_type: str | None = None) -> dict[str, Any]:
+        """Return the bound parameters for one statement against this relation."""
+        values: dict[str, Any] = {"version": version}
+        if self.keyed_on_loader:
+            values[LOADER_COLUMN] = LOADER_DISCRIMINATOR
+        if data_type is not None:
+            values["data_type"] = data_type
+        return values
 
 
 @dataclass(frozen=True)
@@ -142,24 +240,77 @@ def extraction_latch_key(data: dict[str, Any]) -> str:
     return started_at or EXTRACTION_LATCH_UNKNOWN_VERSION
 
 
-async def ensure_latch_table(cursor: Any) -> None:
-    """Create the latch table if it is absent, on the caller's transaction.
+def _match(columns: dict[str, tuple[str, str]], schema: str, table: str) -> LatchRelation | None:
+    """Return the relation these `information_schema` rows describe, or None."""
+    for name, (expected_type, expected_udt) in REQUIRED_COLUMNS.items():
+        found = columns.get(name)
+        if found is None or found[0] != expected_type:
+            return None
+        if expected_udt is not None and found[1] != expected_udt:
+            return None
+    loader = columns.get(LOADER_COLUMN)
+    return LatchRelation(schema=schema, table=table, keyed_on_loader=loader is not None and loader[0] == LOADER_COLUMN_TYPE)
 
-    Idempotent and cheap, and called by every writer rather than once at startup: there is
-    then no ordering between the loader connecting and the first signal arriving, and no
-    statement that fails because a fresh database has never seen a dump.
-    """
-    await cursor.execute(_CREATE_LATCH_TABLE)
 
+async def probe_latch_relation(connection_pool: Any, logger: Any) -> LatchRelation | None:
+    """Return the declared latch relation, or None when the schema does not carry one.
 
-async def record_extraction_signal(connection_pool: Any, version: str, data_type: str) -> ExtractionLatch:
-    """Record that DATA_TYPE has signalled VERSION, and return the latch as it now stands.
-
-    Written before the delivery is acked, and idempotent under redelivery: the signal set
-    is a union, so the same signal recorded twice leaves the same row.
+    Read-only, and run once at startup. A miss is not an error here: it is the degraded mode
+    the module docstring describes, and the caller reports it rather than creating anything.
 
     Args:
         connection_pool: The loader's `AsyncPostgreSQLPool`.
+        logger: The loader's structured logger.
+
+    Returns:
+        The relation to use, or None to run degraded.
+    """
+    try:
+        async with connection_pool.connection() as conn, conn.cursor() as cursor:
+            for schema, table in LATCH_CANDIDATES:
+                await cursor.execute(_PROBE, (schema, table))
+                rows = await cursor.fetchall()
+                if not rows:
+                    continue
+                columns = {str(name): (str(data_type), str(udt)) for name, data_type, udt in rows}
+                relation = _match(columns, schema, table)
+                if relation is not None:
+                    logger.info(
+                        "🔒 Extraction latch relation found — the derived-relation refresh is enabled",
+                        relation=relation.qualified,
+                        keyed_on_loader=relation.keyed_on_loader,
+                    )
+                    return relation
+                logger.warning(
+                    "⚠️ A relation with the latch's name does not have its columns — ignoring it",
+                    relation=f"{schema}.{table}",
+                    columns=sorted(columns),
+                )
+    except Exception as exc:
+        logger.error(
+            "❌ Could not probe for the extraction latch relation — running without the derived-relation refresh",
+            error=str(exc),
+        )
+        return None
+
+    logger.warning(
+        "⚠️ No extraction latch relation is declared — the counter, degree, and genre-aggregate "
+        "relations will NOT be refreshed on extraction_complete. Apply a database-schema revision "
+        "that declares it; this service never creates database objects.",
+        candidates=[f"{schema}.{table}" for schema, table in LATCH_CANDIDATES],
+    )
+    return None
+
+
+async def record_extraction_signal(connection_pool: Any, latch: LatchRelation, version: str, data_type: str) -> ExtractionLatch:
+    """Record that DATA_TYPE has signalled VERSION, and return the latch as it now stands.
+
+    Written before the delivery is acked, and idempotent under redelivery: the signal set is
+    a union, so the same signal recorded twice leaves the same row.
+
+    Args:
+        connection_pool: The loader's `AsyncPostgreSQLPool`.
+        latch: The declared relation the startup probe found.
         version: The extraction the signal named, from `extraction_latch_key`.
         data_type: One of the four contract entity tables.
 
@@ -174,8 +325,7 @@ async def record_extraction_signal(connection_pool: Any, version: str, data_type
     async with connection_pool.connection() as conn:
         await conn.set_autocommit(False)
         async with conn.transaction(), conn.cursor() as cursor:
-            await ensure_latch_table(cursor)
-            await cursor.execute(_RECORD_SIGNAL, {"version": version, "data_type": data_type})
+            await cursor.execute(latch.record_statement(), latch.parameters(version, data_type))
             row = await cursor.fetchone()
 
     if row is None:  # pragma: no cover - the upsert always returns its row
@@ -191,14 +341,10 @@ async def record_extraction_signal(connection_pool: Any, version: str, data_type
     )
 
 
-async def mark_extraction_refreshed(cursor: Any, version: str) -> None:
+async def mark_extraction_refreshed(cursor: Any, latch: LatchRelation, version: str) -> None:
     """Stamp VERSION as refreshed, on the caller's transaction.
 
     On the pass's own transaction rather than after it, so a pass that rolls back leaves the
     extraction unstamped and the next delivery of any of its four signals runs it again.
-
-    The table is ensured here too, because a pass can be driven directly — by the parity
-    harness, or by a test — without a signal having been recorded first.
     """
-    await ensure_latch_table(cursor)
-    await cursor.execute(_MARK_REFRESHED, (version,))
+    await cursor.execute(latch.stamp_statement(), latch.parameters(version))

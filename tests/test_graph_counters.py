@@ -449,10 +449,23 @@ async def test_the_pass_reports_its_row_counts_and_duration() -> None:
 @pytest.mark.asyncio
 async def test_the_extraction_is_stamped_on_the_passs_own_transaction() -> None:
     """A pass that rolls back must leave the extraction unstamped, so the retry re-runs it."""
+    from tableinator.extraction_latch import LatchRelation
+
+    latch = LatchRelation(schema="public", table="loader_extraction_latch", keyed_on_loader=False)
+    cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
+
+    await refresh_derived_relations(FakePool(cursor), RecordingLogger(), "20260101", latch)
+
+    stamp = cursor.index_of("SET refreshed_at = NOW()")
+    assert cursor.calls[stamp][1] == {"version": "20260101"}
+    assert stamp > cursor.index_of('TRUNCATE "graph"."label_genre"'), "the stamp must follow the last relation it certifies"
+
+
+@pytest.mark.asyncio
+async def test_a_pass_driven_without_a_latch_stamps_nothing() -> None:
+    """A caller driving the counters directly has no extraction to certify."""
     cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
 
     await refresh_derived_relations(FakePool(cursor), RecordingLogger(), "20260101")
 
-    stamp = cursor.index_of("SET refreshed_at = NOW()")
-    assert cursor.calls[stamp][1] == ("20260101",)
-    assert stamp > cursor.index_of('TRUNCATE "graph"."label_genre"'), "the stamp must follow the last relation it certifies"
+    assert not cursor.indexes_of("SET refreshed_at = NOW()")
