@@ -31,3 +31,10 @@ runtime_dependency = pyproject["tool"]["uv"]["sources"]["groovemap-runtime"]
 assert runtime_source["package"] == "groovemap-runtime"
 assert runtime_source["version"] == compatibility["application_runtime"]["tested_version"]
 assert runtime_dependency["rev"] == runtime_source["source_commit"]
+
+# The persistence contract describes one revision of `database-schema`, and the dev pin is
+# the initializer the integration suite applies. If those two drift, the suite asserts the
+# loader against a schema the vendored contract does not describe — which is how a probe
+# can pass in CI against a relation the promoted contract never declared.
+schema_dependency = pyproject["tool"]["uv"]["sources"]["groovemap-database-schema"]
+assert schema_dependency["rev"] == persistence_source["producer_commit"]

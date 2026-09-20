@@ -484,6 +484,16 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
     next delivery of any of its four signals runs it again. A failure anywhere leaves every
     relation exactly as it was, and the caller retries the whole pass.
 
+    **Deferred: the path refresh functions (gm-discogs-sql-loader-vkb).**
+    `graph.refresh_artist_member_of()` and `graph.refresh_vertex_degree()` name this pass as
+    their refresh owner, and belong here — after the counters, on this same transaction, so
+    they either land with the counters they are consistent with or not at all. They are not
+    called yet because `gm-database-schema-820` declares them and has not landed; the pinned
+    revision (`8a343c8`) carries the latch relation and nothing else. Calling a function the
+    promoted schema does not declare would fail the pass and nack every fourth signal, which
+    is strictly worse than the counters this pass already refreshes. The repin that picks up
+    820 owns adding the two calls and the tests that assert their order.
+
     Args:
         connection_pool: The loader's `AsyncPostgreSQLPool`.
         logger: The loader's structured logger.

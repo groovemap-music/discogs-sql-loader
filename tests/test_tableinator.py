@@ -5,7 +5,7 @@ import contextlib
 import json
 import signal
 import time
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
@@ -31,8 +31,8 @@ from tableinator.tableinator import (
 # SimpleConnectionPool tests removed as we now use AsyncPostgreSQLPool
 
 
-# The relation the pending database-schema chore declares, as the startup probe resolves it.
-_DECLARED_LATCH = LatchRelation(schema="public", table="loader_extraction_latch", keyed_on_loader=True)
+# The relation the promoted database-schema declares, as the startup probe resolves it.
+_DECLARED_LATCH = LatchRelation(schema="public", table="loader_extraction_latch")
 
 
 # gm-discogs-sql-loader-2eg.3: a latch stub for the suites that exercise the purge rather
@@ -4276,6 +4276,46 @@ class TestDerivedRelationRefresh:
 
         with patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH):
             assert get_health_data()["derived_relation_refresh"] == "enabled"
+
+    def test_the_health_payload_carries_no_refusal_until_one_happens(self) -> None:
+        with patch("tableinator.tableinator.derived_relation_refresh_last_refused", None):
+            assert get_health_data()["derived_relation_refresh_last_refused"] is None
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_a_refused_signal_leaves_a_marker_in_the_health_payload(self) -> None:
+        """The ERROR line was the only trace, and it scrolls away; the payload read `enabled`.
+
+        That is the failure this marker exists to surface: the relation IS declared and the
+        latch IS working, and the refresh is still never firing, because the extractor
+        upstream stopped stamping a version. The `enabled` field is not flipped — it is
+        still telling the truth — so the refusal gets a field of its own.
+        """
+        message = AsyncMock(spec=AbstractIncomingMessage)
+        message.body = json.dumps({"type": "extraction_complete"}).encode()
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.completed_files", set()),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
+            patch("tableinator.tableinator.record_extraction_signal", new=AsyncMock()),
+            patch("tableinator.tableinator.refresh_derived_relations", new=AsyncMock()),
+            patch("tableinator.tableinator.derived_relation_refresh_last_refused", None),
+        ):
+            await on_data_message(message, "releases")
+            payload = get_health_data()
+
+        refused = payload["derived_relation_refresh_last_refused"]
+        assert refused is not None
+        assert refused["data_type"] == "releases"
+        assert "named no extraction" in refused["reason"]
+        datetime.fromisoformat(refused["at"])
+        # The relation is there and the latch works, so this field still reads enabled.
+        assert payload["derived_relation_refresh"] == "enabled"
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
