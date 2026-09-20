@@ -449,9 +449,7 @@ async def test_the_pass_reports_its_row_counts_and_duration() -> None:
 @pytest.mark.asyncio
 async def test_the_extraction_is_stamped_on_the_passs_own_transaction() -> None:
     """A pass that rolls back must leave the extraction unstamped, so the retry re-runs it."""
-    from tableinator.extraction_latch import LatchRelation
-
-    from tableinator.extraction_latch import LOADER_DISCRIMINATOR
+    from tableinator.extraction_latch import LOADER_DISCRIMINATOR, LatchRelation
 
     latch = LatchRelation(schema="public", table="loader_extraction_latch")
     cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
