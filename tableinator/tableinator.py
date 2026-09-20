@@ -42,6 +42,8 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
+from tableinator.extraction_latch import LatchRelation, extraction_latch_key, probe_latch_relation, record_extraction_signal
+from tableinator.graph_counters import refresh_derived_relations
 from tableinator.media import media_for_release
 from tableinator.queue_names import (
     dead_letter_exchange_name as catalog_dead_letter_exchange_name,
@@ -107,6 +109,39 @@ CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # D
 PURGE_MAX_DELETE_FRACTION = float(
     os.environ.get("PURGE_MAX_DELETE_FRACTION", "0.90")
 )  # Default 90% - refuse purges that would delete this share or more of a table
+
+# ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────────────────
+# The counter, degree, and genre-aggregate relations are whole-catalog sums over the edge
+# tables, so they are refreshed once — after every data type of ONE extraction has signalled
+# extraction_complete, which is the latch `graphinator` defers its own post-import pass to
+# (`handle_extraction_complete`: the four fanout queues drain at very different rates and
+# releases finishes last, so a per-type refresh would sum a half-written catalog). The
+# stale-row purge above needs no such latch, because a purge is scoped to the one table
+# whose signal arrived; this is a new latch, not a reuse of anything the purge has.
+#
+# The latch itself lives in PostgreSQL, keyed on the extraction — see
+# `tableinator.extraction_latch` for why neither an unkeyed count nor an in-memory set is
+# sound. `completed_files` cannot stand in for it either: it is also written by
+# `file_complete` and ERASED by `_recover_consumers`, so it answers "has this type's file
+# finished" rather than "has this type signalled the end of THIS extraction".
+
+
+class _UnnamedExtraction(Exception):
+    """An `extraction_complete` that names no extraction, so no latch row can key on it."""
+
+
+# The declared latch relation, resolved once at startup by a read of `information_schema`.
+# None means the schema in front of this loader does not declare it, and the loader then
+# runs degraded: no signal is recorded and the pass never fires. This service never creates
+# database objects — `docs/database-schema.md`, guarded by `tests/test_service_contract.py`.
+extraction_latch: LatchRelation | None = None
+
+# Single-flight within the process. The four consumers deliver their signals concurrently,
+# so two of them can both observe a complete latch; the pass is idempotent, so the loser
+# re-running would be correct but would take ACCESS EXCLUSIVE on seven tables for a second
+# full sweep. The `refreshed_at` stamp the winner writes is what makes the loser a no-op.
+derived_refresh_lock = asyncio.Lock()
+# ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────────────────
 
 # Periodic queue checking settings
 QUEUE_CHECK_INTERVAL = int(
@@ -187,6 +222,8 @@ def get_health_data() -> dict[str, Any]:
         "last_message_time": last_message_time.copy(),
         "active_consumers": list(consumer_tags.keys()),
         "completed_files": list(completed_files),
+        # A refresh that is silently not happening is the failure this field exists to surface.
+        "derived_relation_refresh": "enabled" if extraction_latch is not None else "degraded",
         "timestamp": datetime.now(UTC).isoformat(),
     }
 
@@ -744,7 +781,73 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     )
                     purge_ok = False
 
-            if purge_ok:
+            # ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────
+            # Beside the purge, on the same latch, and only once every type has
+            # signalled. The pass reconciles `member_of` and `same_as` against the
+            # documents present now and recomputes the seven counter relations from
+            # the edge tables, in one transaction. It runs AFTER the purge, so the
+            # rows a shrunk dump removed are already gone from the edge tables the
+            # counters sum; a failure nacks this delivery exactly as a failed purge
+            # does, and the whole pass is idempotent so the retry re-runs it safely.
+            refresh_ok = True
+            if purge_ok and connection_pool is not None and extraction_latch is None:
+                logger.warning(
+                    "⚠️ Skipping the derived-relation refresh — no extraction latch relation is declared",
+                    data_type=data_type,
+                )
+            elif purge_ok and connection_pool is not None and extraction_latch is not None:
+                async with derived_refresh_lock:
+                    try:
+                        version = extraction_latch_key(data)
+                        if version is None:
+                            # No version and no started_at. Every such dump would land on one
+                            # latch row, the first would stamp it refreshed, and every dump
+                            # after it would read as already done and silently never refresh.
+                            # Nothing can tell them apart, so nothing is recorded.
+                            logger.error(
+                                "❌ extraction_complete names no extraction (no version, no started_at) — "
+                                "recording no signal and refreshing no derived relations",
+                                data_type=data_type,
+                            )
+                            raise _UnnamedExtraction
+                        latch = await record_extraction_signal(connection_pool, extraction_latch, version, data_type)
+                        if latch.should_refresh(DATA_TYPES):
+                            await refresh_derived_relations(connection_pool, logger, version, extraction_latch)
+                        elif latch.already_refreshed:
+                            logger.info(
+                                "✅ Derived relations were already refreshed for this extraction",
+                                data_type=data_type,
+                                version=version,
+                            )
+                        elif latch.superseded:
+                            logger.warning(
+                                "⏭️ Ignoring a straggler extraction_complete — a later extraction has started",
+                                data_type=data_type,
+                                version=version,
+                            )
+                        else:
+                            logger.info(
+                                "⏳ Deferring the derived-relation refresh until every data type completes",
+                                data_type=data_type,
+                                version=version,
+                                received=sorted(latch.signals),
+                                pending=latch.pending(DATA_TYPES),
+                            )
+                    except _UnnamedExtraction:
+                        # Already logged. The delivery is still terminal: the purge ran and
+                        # this type is complete, and requeueing would only redeliver a
+                        # message that can never gain a version.
+                        pass
+                    except Exception as refresh_exc:
+                        logger.error(
+                            "❌ Derived-relation refresh failed, nacking extraction_complete for retry",
+                            data_type=data_type,
+                            error=str(refresh_exc),
+                        )
+                        refresh_ok = False
+            # ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────
+
+            if purge_ok and refresh_ok:
                 # extraction_complete is this type's terminal signal, so it must also
                 # (re-)mark the type complete. completed_files is otherwise written
                 # only by file_complete and ERASED by _recover_consumers for any type
@@ -766,7 +869,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 record_terminal("processed")
             else:
                 await message.nack(requeue=True)
-                record_terminal("failed", "purge_failed")
+                record_terminal("failed", "purge_failed" if not purge_ok else "refresh_failed")
             return
 
         # Normal message processing - require a non-empty 'id' field.
@@ -1014,7 +1117,8 @@ async def main() -> None:
         active_connection, \
         active_channel, \
         connection_check_task, \
-        batch_processor
+        batch_processor, \
+        extraction_latch
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -1076,6 +1180,9 @@ async def main() -> None:
         )
         await connection_pool.initialize()
         logger.info("🐘 Connected to PostgreSQL with async resilient connection pool")
+        # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
+        # read-only. A miss is a logged degraded mode, never a reason to create the table.
+        extraction_latch = await probe_latch_relation(connection_pool, logger)
         logger.info(
             "✅ Async connection pool initialized (min: %d, max: %d connections)",
             config.postgres_pool_min_size,
