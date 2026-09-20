@@ -1,11 +1,5 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "compatibility": {
-    "additive_changes": "compatible",
-    "consumer_rollout": "expand, migrate consumers, then contract",
-    "destructive_changes": "require a new major contract and an explicit migration",
-    "rollback": "every destructive migration requires a tested rollback or restore procedure"
-  },
   "application_runtime": {
     "package": "groovemap-runtime",
     "required_capabilities": [
@@ -13,10 +7,409 @@
       "otel",
       "postgres"
     ],
-    "tested_version": "0.1.0",
-    "tested_commit": "e372b6a7598ae31ee6578fdff39bc920bedd7136"
+    "tested_commit": "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef",
+    "tested_version": "0.1.0"
+  },
+  "compatibility": {
+    "additive_changes": "compatible",
+    "consumer_rollout": "expand, migrate consumers, then contract",
+    "destructive_changes": "require a new major contract and an explicit migration",
+    "rollback": "every destructive migration requires a tested rollback or restore procedure"
   },
   "contract": "groovemap.persistence",
+  "graph_schema": {
+    "availability": "unconditional",
+    "bootstrap": {
+      "authority": "none",
+      "availability": "unconditional",
+      "fills": [
+        "alias_of",
+        "artist_degree",
+        "artist_genre",
+        "by_artist",
+        "company",
+        "credited_on",
+        "credited_to",
+        "derived_from",
+        "genre",
+        "genre_stats",
+        "in_genre",
+        "in_style",
+        "issued_on",
+        "label_genre",
+        "label_stats",
+        "master_by_artist",
+        "master_in_genre",
+        "master_in_style",
+        "media_family",
+        "medium",
+        "member_of",
+        "on_label",
+        "person",
+        "release_degree_base",
+        "same_as",
+        "style",
+        "style_stats"
+      ],
+      "function": "graph.bootstrap_fill",
+      "kind": "additive",
+      "note": "A one-off fill deriving every loader-written table from the catalog documents, using the same definitions those relations published as views before they were tables. It is NOT authoritative: the owner recorded against each relation writes it and supersedes this fill on its first pass. It exists so an environment can be populated once, before a loader has run, so a read rewrite is not blocked on the dual-write. Nothing calls it; applying the schema declares it and writes no row. Each relation is emptied and refilled in one transaction, so re-running converges in both directions and a row no document justifies is removed. It reports a row count per relation. One known divergence: a company with no Discogs id is keyed on its name case-folded, and this fill folds with SQL lower where the loader applies Python casefold, so a handful of characters key differently and the loader's row is the correct one."
+    },
+    "counter_properties": {
+      "availability": "unconditional",
+      "kind": "additive",
+      "labels": {
+        "artist": {
+          "counters": "graph.artist_degree",
+          "element_table": "graph.artist_vertex",
+          "properties": [
+            "degree"
+          ]
+        },
+        "genre": {
+          "counters": "graph.genre_stats",
+          "element_table": "graph.genre_vertex",
+          "properties": [
+            "release_count",
+            "artist_count",
+            "label_count",
+            "style_count",
+            "first_year"
+          ]
+        },
+        "label": {
+          "counters": "graph.label_stats",
+          "element_table": "graph.label_vertex",
+          "properties": [
+            "release_count",
+            "artist_count",
+            "genre_count"
+          ]
+        },
+        "style": {
+          "counters": "graph.style_stats",
+          "element_table": "graph.style_vertex",
+          "properties": [
+            "release_count",
+            "artist_count",
+            "label_count",
+            "genre_count",
+            "first_year"
+          ]
+        }
+      },
+      "note": "graphinator writes these onto the Neo4j node of the same name, so the property graph publishes them on the same label rather than on a second one a rewrite would have to learn. SQL/PGQ admits one element table per label unless every table exposes an identical property set, so the label binds a view joining its storage relation to its counter relation; the counter relation is unique on the join column, so the planner removes the join for a query that reads no counter. A count reads zero where the loader has not computed one; first_year stays null. graph.release_degree is the one counter that stays a label of its own, because its live half is a pair of lateral counts no unique key makes removable."
+    },
+    "documentation": "docs/architecture.md#graph-schema",
+    "edge_relations": 38,
+    "functions": [
+      "graph.bootstrap_fill",
+      "graph.credit_role_category",
+      "graph.mb_relationship_type",
+      "graph.medium_label"
+    ],
+    "introduced_in_contract_version": 1,
+    "key_columns": {
+      "availability": "unconditional",
+      "kind": "additive",
+      "note": "Every key column of every graph relation is text. PostgreSQL 19 beta 3 cannot resolve an equality operator for a character varying property-graph vertex key, so the four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start. This retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements the phase 0 views appended for the same reason; nothing but CREATE PROPERTY GRAPH ever read them and they were never declared as properties.",
+      "type": "text"
+    },
+    "kind": "additive",
+    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
+    "property_graph": {
+      "absent_on": "PostgreSQL 18, and PostgreSQL 19 with the switch off",
+      "availability": "conditional",
+      "conditions": [
+        "server_version_num >= 190000",
+        "the SCHEMA_PROPERTY_GRAPH environment switch is enabled"
+      ],
+      "consumer_rule": "consumers must not assume it exists; probe pg_class for a relation named catalog in schema graph, of relkind g, and fall back to the views, which are always present",
+      "documentation": "docs/architecture.md#property-graph",
+      "edge_tables": 38,
+      "element_tables": "Fifty-five of the sixty-four graph relations. The nine that bind no element hold rows or counters for a label that binds a view joining them, plus graph.release_degree_base, whose rows the graph reaches through graph.release_degree.",
+      "kind": "additive",
+      "name": "graph.catalog",
+      "note": "A SQL/PGQ declaration over the graph schema's tables and views, applied after the rest of the PostgreSQL schema. A closed gate is logged and is not a failure. There is no IF NOT EXISTS for a property graph and this initializer never drops one except through a shape migration that re-declares it on the same run, so an existing graph.catalog is otherwise left as it is and a changed declaration does not roll out on its own.",
+      "vertex_tables": 17
+    },
+    "relation_count": 64,
+    "relations": {
+      "alias_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "app_user": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "artist": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "artist_degree": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "artist_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "artist_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "by_artist": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "catalog_item": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "collected": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "company": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "credited_on": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "credited_to": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "derived_from": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "genre_stats": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "genre_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "in_family": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "in_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "in_style": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "issued_on": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "table"
+      },
+      "label": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "label_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "label_stats": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "label_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "master": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "master_by_artist": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "master_in_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "master_in_style": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "mb_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "media_family": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "table"
+      },
+      "medium": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "table"
+      },
+      "member_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "on_label": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "owns": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "part_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "person": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "release": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "release_degree": {
+        "owner": "discogs-sql-loader, catalog-api",
+        "shape": "view"
+      },
+      "release_degree_base": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "same_as": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "style": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "style_stats": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "style_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "sublabel_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "wants": {
+        "owner": "catalog-api",
+        "shape": "view"
+      }
+    },
+    "schema": "graph",
+    "tables": 27,
+    "vertex_relations": 17,
+    "view_evolution": {
+      "allowed": "appending a column to the end of an existing view",
+      "engine_enforcement": "CREATE OR REPLACE VIEW fails the statement outright rather than replacing the view",
+      "forbidden": [
+        "dropping a column",
+        "renaming a view or a view column",
+        "reordering columns",
+        "retyping a column"
+      ],
+      "migration": "expand, migrate consumers, then contract, with a coordinated DROP ... CASCADE",
+      "rule": "append-only",
+      "shape_change": "A relation that becomes a loader-written table is replaced by a guarded migration that drops the view only when one is still there, in the same pass that creates the table. The published column names survive the change; the key columns are retyped from character varying to text, which psycopg returns identically."
+    },
+    "views": 37
+  },
   "owners": [
     "database-schema"
   ],
