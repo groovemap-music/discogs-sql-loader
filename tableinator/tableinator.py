@@ -136,6 +136,14 @@ class _UnnamedExtraction(Exception):
 # database objects — `docs/database-schema.md`, guarded by `tests/test_service_contract.py`.
 extraction_latch: LatchRelation | None = None
 
+# The last `extraction_complete` refused for naming no extraction, or None if none has
+# been. The refusal is correct — see `extraction_latch_key` — but until now the only trace
+# of it was one ERROR line, while the health payload went on reading `enabled`: a latch that
+# is declared and working, quietly refreshing nothing, because the extractor upstream stopped
+# stamping a version. This is a separate field rather than a flip of that one, because the
+# two say different things — the relation IS there, and a signal WAS dropped.
+derived_relation_refresh_last_refused: dict[str, str] | None = None
+
 # Single-flight within the process. The four consumers deliver their signals concurrently,
 # so two of them can both observe a complete latch; the pass is idempotent, so the loser
 # re-running would be correct but would take ACCESS EXCLUSIVE on seven tables for a second
@@ -224,6 +232,9 @@ def get_health_data() -> dict[str, Any]:
         "completed_files": list(completed_files),
         # A refresh that is silently not happening is the failure this field exists to surface.
         "derived_relation_refresh": "enabled" if extraction_latch is not None else "degraded",
+        # ... and this one surfaces the other shape of that failure: the latch is enabled and
+        # a signal was still dropped, because it named no extraction to key on.
+        "derived_relation_refresh_last_refused": derived_relation_refresh_last_refused,
         "timestamp": datetime.now(UTC).isoformat(),
     }
 
@@ -667,6 +678,8 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
 
 
 async def _process_data_message(message: AbstractIncomingMessage, data_type: str, span: Any) -> None:
+    global derived_relation_refresh_last_refused
+
     message_started = time.perf_counter()
 
     def record_terminal(outcome: str, error_type: str | None = None) -> None:
@@ -804,6 +817,11 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                             # latch row, the first would stamp it refreshed, and every dump
                             # after it would read as already done and silently never refresh.
                             # Nothing can tell them apart, so nothing is recorded.
+                            derived_relation_refresh_last_refused = {
+                                "at": datetime.now(UTC).isoformat(),
+                                "data_type": data_type,
+                                "reason": "extraction_complete named no extraction (no version, no started_at)",
+                            }
                             logger.error(
                                 "❌ extraction_complete names no extraction (no version, no started_at) — "
                                 "recording no signal and refreshing no derived relations",
