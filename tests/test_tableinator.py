@@ -167,12 +167,10 @@ class TestOnDataMessage:
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_process_new_record(self, sample_artist_data: dict[str, Any], mock_postgres_connection: MagicMock, mock_async_pool: Any) -> None:
         """Test processing a new record."""
-        # Create mock message
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps(sample_artist_data).encode()
         mock_message.routing_key = "artists"
 
-        # Setup async cursor mock
         mock_cursor = AsyncMock()
 
         mock_cursor_cm = AsyncMock()
@@ -181,7 +179,6 @@ class TestOnDataMessage:
 
         mock_postgres_connection.cursor = MagicMock(return_value=mock_cursor_cm)
 
-        # Setup async connection pool mock
         pool = mock_async_pool(mock_postgres_connection)
 
         with patch("tableinator.tableinator.connection_pool", pool):
@@ -559,14 +556,13 @@ class TestMain:
         _mock_setup_logging: Mock,
     ) -> None:
         """Test successful main execution."""
-        # Mock health server
         mock_health_instance = MagicMock()
         mock_health_server.return_value = mock_health_instance
 
         # Setup mocks with async connection support
         mock_pool = MagicMock()
         mock_pool_class.return_value = mock_pool
-        mock_pool.initialize = AsyncMock()  # Mock async initialize method
+        mock_pool.initialize = AsyncMock()
         mock_pool.close = AsyncMock()
 
         mock_conn = MagicMock()
@@ -584,7 +580,6 @@ class TestMain:
         mock_rabbitmq_instance = AsyncMock()
         mock_rabbitmq_class.return_value = mock_rabbitmq_instance
 
-        # Mock the connect method to return a connection
         mock_connection = AsyncMock()
         mock_rabbitmq_instance.connect.return_value = mock_connection
 
@@ -827,7 +822,6 @@ class TestScheduleConsumerCancellation:
         assert "artists" in tableinator.tableinator.consumer_cancel_tasks
         assert tableinator.tableinator.consumer_cancel_tasks["artists"] is not None
 
-        # Clean up
         tableinator.tableinator.consumer_cancel_tasks["artists"].cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await tableinator.tableinator.consumer_cancel_tasks["artists"]
@@ -2008,7 +2002,6 @@ class TestOnDataMessageProgressLogging:
         """Test that progress is logged at the correct interval."""
         import tableinator.tableinator
 
-        # Setup
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps({"id": "123", "name": "Test Artist", "sha256": "abc123"}).encode()
         mock_message.routing_key = "artists"  # Set routing_key for data_type
