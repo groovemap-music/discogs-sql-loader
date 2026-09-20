@@ -46,6 +46,14 @@ container when complete. To use an already-running disposable database instead, 
 `TEST_DATABASE_URL`; the command never prints that value. CI invokes this separate
 service-backed lane after the credential-free required checks.
 
+Run `just test-parity` to hold the graph this loader writes to the one
+`discogs-graph-enricher` writes. It plays one sequence of fixture events through both
+services — this loader into a disposable PostgreSQL, a pinned build of the enricher into a
+disposable Neo4j — and compares, per edge label, the set of (source, target, properties)
+tuples the two stores hold, against a registry of the differences on record. It is the
+only lane that needs a second engine, so it is opt-in and `just test-integration`
+deselects it. See [docs/store-parity.md](docs/store-parity.md).
+
 ## Operational behavior
 
 - Batch mode is on by default. Messages are acknowledged only after their PostgreSQL

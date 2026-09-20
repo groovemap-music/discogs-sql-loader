@@ -110,6 +110,7 @@ markers = [
     "benchmark: performance regression benchmarks",
     "e2e: end-to-end tests requiring external services",
     "integration: tests requiring a live backing service",
+    "parity: cross-store comparison against discogs-graph-enricher; needs Neo4j as well",
 ]
 
 [tool.coverage.run]
