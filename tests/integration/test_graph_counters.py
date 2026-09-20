@@ -6,11 +6,15 @@ catalog small enough to count by hand through the real write path, runs the
 `extraction_complete` pass against the promoted schema, and asserts every counter row
 against a value computed in the comments below rather than by re-running the same SQL.
 
-The catalog is chosen to reach every rule the schema reviews named. `gc-r1` carries two
-genres, two artists, and a style, so a label counting its releases has something to fan out
-over; `gc-r3` carries no year, so `first_year` has a release it must ignore; one membership
-is stated from both ends, and one release credits a person by id, so the two additive
-relations have a row that outlives the document asserting it.
+The catalog is chosen to reach every rule the schema reviews named. The first release
+carries three artists, two genres, and a style, so a label counting its releases has six
+joined rows to fan out over; the third carries no year, so `first_year` has a release it
+must ignore; one membership is stated from both ends, and one release credits a person by
+id, so the two additive relations have a row that outlives the document asserting it.
+
+The last section is the extraction latch that decides WHEN the pass runs, against the same
+real PostgreSQL: a second dump collecting its own four signals, a restart losing none of
+them, and a straggler from a superseded dump firing nothing.
 """
 
 import os
@@ -24,6 +28,7 @@ import pytest
 import pytest_asyncio
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
+from tableinator.extraction_latch import EXTRACTION_LATCH_TABLE, extraction_latch_key, mark_extraction_refreshed, record_extraction_signal
 from tableinator.graph_counters import REFRESH_ORDER, refresh_derived_relations
 from tableinator.graph_derivation import EDGE_COLUMNS, VERTEX_COLUMNS
 from tableinator.media import media_for_release
@@ -67,7 +72,7 @@ class SingleConnectionPool:
 # before it counts collection rows, so the fixture uses numeric ids rather than readable
 # ones. The comments name them by their short suffix.
 
-A1, A2, A3 = "9000001", "9000002", "9000003"  # Alpha, Beta, Gamma
+A1, A2, A3, A4 = "9000001", "9000002", "9000003", "9000004"  # Alpha, Beta, Gamma, Delta
 L1, L2 = "9100001", "9100002"
 M1 = "9200001"
 R1, R2, R3 = "9300001", "9300002", "9300003"
@@ -77,6 +82,7 @@ ARTISTS = [
     (A1, {"id": A1, "name": "Alpha", "members": [{"id": A2}]}),
     (A2, {"id": A2, "name": "Beta", "groups": [{"id": A1}]}),
     (A3, {"id": A3, "name": "Gamma", "aliases": [{"id": A1}]}),
+    (A4, {"id": A4, "name": "Delta"}),
 ]
 
 LABELS = [(L1, {"id": L1, "name": "First Label"}), (L2, {"id": L2, "name": "Second Label"})]
@@ -91,7 +97,9 @@ RELEASES = [
             "title": "First Release",
             "year": "1970",
             "master_id": M1,
-            "artists": [{"id": A1}, {"id": A2}],
+            # Three artists and two genres: the label join yields six rows for this one
+            # release, so only a DISTINCT keeps its label's release_count at one for it.
+            "artists": [{"id": A1}, {"id": A2}, {"id": A4}],
             "labels": [{"id": L1, "catno": "FL-001"}],
             # Two genres, so this release asserts no `part_of` row.
             "genres": ["Rock", "Jazz"],
@@ -129,7 +137,7 @@ RELEASES = [
 # ── What the catalog above asserts, counted by hand ──────────────────────────
 #
 # Edges, which every counter sums:
-#   by_artist   (R1,A1) (R1,A2) (R2,A1) (R3,A3)
+#   by_artist   (R1,A1) (R1,A2) (R1,A4) (R2,A1) (R3,A3)
 #   on_label    (R1,L1) (R2,L1) (R3,L2)
 #   in_genre    (R1,Rock) (R1,Jazz) (R2,Rock) (R3,Jazz)
 #   in_style    (R1,Pop Rock) (R2,Fusion)
@@ -140,42 +148,56 @@ RELEASES = [
 #
 # `graph.part_of` is asserted only by a document carrying exactly one genre: R2 gives
 # (Fusion, Rock) and the master gives (Pop Rock, Rock). R1 has two genres and R3 has no
-# style, so neither contributes.
+# style, so neither contributes. That single-genre guard is where `style_count` and
+# `genre_count` part company with graphinator; see the divergence test at the foot of the
+# counter section.
 
 # (name, release_count, artist_count, label_count, style_count, first_year)
-#   Jazz  : R1 and R3 → 2 releases; artists {A1,A2} plus {A3} = 3; labels {L1,L2} = 2;
-#           no style sits under Jazz; years 1970 and (none) → 1970.
-#   Rock  : R1 and R2 → 2 releases; artists {A1,A2} plus {A1} = 2; labels {L1} = 1;
+#   Jazz  : R1 and R3 → 2 releases; artists {A1,A2,A4} plus {A3} = 4; labels {L1,L2} = 2;
+#           no single-genre document puts a style under Jazz → 0;
+#           years 1970 and (none) → 1970.
+#   Rock  : R1 and R2 → 2 releases; artists {A1,A2,A4} plus {A1} = 3; labels {L1} = 1;
 #           Fusion and Pop Rock sit under Rock → 2; years 1970 and 1965 → 1965.
-EXPECTED_GENRE_STATS = [("Jazz", 2, 3, 2, 0, 1970), ("Rock", 2, 2, 1, 2, 1965)]
+EXPECTED_GENRE_STATS = [("Jazz", 2, 4, 2, 0, 1970), ("Rock", 2, 3, 1, 2, 1965)]
 
 # (name, release_count, artist_count, label_count, genre_count, first_year)
 #   Fusion   : R2 → 1 release; artists {A1}; labels {L1}; one genre above it; 1965.
-#   Pop Rock : R1 → 1 release; artists {A1,A2}; labels {L1}; one genre above it; 1970.
-EXPECTED_STYLE_STATS = [("Fusion", 1, 1, 1, 1, 1965), ("Pop Rock", 1, 2, 1, 1, 1970)]
+#   Pop Rock : R1 → 1 release; artists {A1,A2,A4} = 3; labels {L1};
+#              one genre above it, from the master; 1970.
+EXPECTED_STYLE_STATS = [("Fusion", 1, 1, 1, 1, 1965), ("Pop Rock", 1, 3, 1, 1, 1970)]
 
 # (label_id, release_count, artist_count, genre_count)
-#   L1 : R1 and R2. R1 alone joins two artists and two genres, so the join yields four
+#   L1 : R1 and R2. R1 alone joins three artists and two genres, so the join yields six
 #        rows for it — `count(DISTINCT release_id)` is what keeps release_count at 2.
+#        Artists {A1,A2,A4} plus {A1} = 3; genres {Rock,Jazz} plus {Rock} = 2.
 #   L2 : R3 only.
-EXPECTED_LABEL_STATS = [(L1, 2, 2, 2), (L2, 1, 1, 1)]
+EXPECTED_LABEL_STATS = [(L1, 2, 3, 2), (L2, 1, 1, 1)]
 
 # (artist_id, degree), every edge an `:Artist` carries counted undirected:
 #   A1 : by_artist x2, master_by_artist x1, member_of as the group x1, alias_of as the
 #        alias x1 → 5
 #   A2 : by_artist x1, member_of as the member x1 → 2
 #   A3 : by_artist x1, same_as x1, alias_of as the target x1 → 3
-EXPECTED_ARTIST_DEGREE = [(A1, 5), (A2, 2), (A3, 3)]
+#   A4 : by_artist x1 → 1
+EXPECTED_ARTIST_DEGREE = [(A1, 5), (A2, 2), (A3, 3), (A4, 1)]
 
 # (release_id, degree), the catalog half only:
-#   R1 : 2 by_artist + 1 on_label + 2 in_genre + 1 in_style + 1 derived_from
-#        + 1 credited_on + 1 credited_to + 1 issued_on = 10
+#   R1 : 3 by_artist + 1 on_label + 2 in_genre + 1 in_style + 1 derived_from
+#        + 1 credited_on + 1 credited_to + 1 issued_on = 11
 #   R2 : 1 + 1 + 1 + 1 = 4
 #   R3 : 1 + 1 + 1 = 3
-EXPECTED_RELEASE_DEGREE_BASE = [(R1, 10), (R2, 4), (R3, 3)]
+EXPECTED_RELEASE_DEGREE_BASE = [(R1, 11), (R2, 4), (R3, 3)]
 
 # (artist_id, genre_name, release_count): every genre of every release the artist is on.
-EXPECTED_ARTIST_GENRE = [(A1, "Jazz", 1), (A1, "Rock", 2), (A2, "Jazz", 1), (A2, "Rock", 1), (A3, "Jazz", 1)]
+EXPECTED_ARTIST_GENRE = [
+    (A1, "Jazz", 1),
+    (A1, "Rock", 2),
+    (A2, "Jazz", 1),
+    (A2, "Rock", 1),
+    (A3, "Jazz", 1),
+    (A4, "Jazz", 1),
+    (A4, "Rock", 1),
+]
 
 # (label_id, genre_name, release_count)
 EXPECTED_LABEL_GENRE = [(L1, "Jazz", 1), (L1, "Rock", 2), (L2, "Jazz", 1)]
@@ -206,6 +228,7 @@ async def _truncate(connection: psycopg.AsyncConnection[Any]) -> None:
     relations = ", ".join(f"graph.{relation}" for relation in (*EDGE_COLUMNS, *VERTEX_COLUMNS, *REFRESH_ORDER))
     await connection.execute(f"TRUNCATE {relations}")
     await connection.execute(f"TRUNCATE {', '.join(ENTITY_TABLES)}")
+    await connection.execute(f"DROP TABLE IF EXISTS {EXTRACTION_LATCH_TABLE}")
 
 
 async def _write_batch(connection: psycopg.AsyncConnection[Any], data_type: str, documents: Any, suffix: str = "v1") -> None:
@@ -220,8 +243,8 @@ async def _load_catalog(connection: psycopg.AsyncConnection[Any]) -> None:
     await _write_batch(connection, "releases", RELEASES)
 
 
-async def _refresh(connection: psycopg.AsyncConnection[Any]) -> dict[str, int]:
-    return await refresh_derived_relations(SingleConnectionPool(connection), MagicMock())
+async def _refresh(connection: psycopg.AsyncConnection[Any], version: str = "20260101") -> dict[str, int]:
+    return await refresh_derived_relations(SingleConnectionPool(connection), MagicMock(), version)
 
 
 async def _rows(connection: psycopg.AsyncConnection[Any], query: str) -> list[tuple[Any, ...]]:
@@ -256,7 +279,7 @@ async def test_style_stats_matches_the_hand_computed_counts(refreshed: psycopg.A
 
 @pytest.mark.asyncio
 async def test_label_stats_counts_a_release_once_however_it_fans_out(refreshed: psycopg.AsyncConnection[Any]) -> None:
-    """`9300001` joins two artists and two genres; its label still counts one release."""
+    """The first release joins three artists and two genres; its label still counts it once."""
     query = "SELECT label_id, release_count, artist_count, genre_count FROM graph.label_stats ORDER BY label_id"
 
     assert await _rows(refreshed, query) == EXPECTED_LABEL_STATS
@@ -434,9 +457,9 @@ async def test_the_degrees_see_the_sweep_rather_than_the_rows_it_removed(
     await _refresh(counter_connection)
 
     rows = await _rows(counter_connection, "SELECT artist_id, degree FROM graph.artist_degree ORDER BY artist_id")
-    # A1 loses the membership it was the group of (5 → 4) and A2 loses its only membership
-    # (2 → 1). A3 is untouched.
-    assert rows == [(A1, 4), (A2, 1), (A3, 3)]
+    # A1 loses the membership it was the group of, 5 down to 4, and A2 loses its only
+    # membership, 2 down to 1. A3 and A4 are untouched.
+    assert rows == [(A1, 4), (A2, 1), (A3, 3), (A4, 1)]
 
 
 @pytest.mark.asyncio
@@ -448,3 +471,163 @@ async def test_an_empty_entity_table_does_not_empty_the_relation(counter_connect
     await _refresh(counter_connection)
 
     assert await _rows(counter_connection, "SELECT member_artist_id, group_artist_id FROM graph.member_of") == [(A2, A1)]
+
+
+# ── The one divergence from graphinator ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_style_and_genre_counts_follow_the_schema_not_the_cypher(refreshed: psycopg.AsyncConnection[Any]) -> None:
+    """`style_count` and `genre_count` count `graph.part_of`, which graphinator does not.
+
+    `genre_cypher` counts `count(DISTINCT s)` over `(g)<-[:IS]-(r:Release)-[:IS]->(s:Style)`,
+    every style CO-OCCURRING on the genre's releases. The schema body counts `graph.part_of`
+    rows instead, and a document asserts one only when it carries exactly one genre, because
+    with two nothing in it says which genre a style sits under.
+
+    The fixture's first release carries Rock, Jazz, and Pop Rock, so the two readings
+    disagree on exactly two numbers:
+
+    | counter | here | Neo4j |
+    | --- | --- | --- |
+    | Jazz `style_count` | 0 | 1, Pop Rock co-occurs on that release |
+    | Pop Rock `genre_count` | 1, from the master alone | 2, Rock and Jazz co-occur |
+
+    The body stays the schema's, which is the definition of record. This test exists so the
+    divergence is asserted rather than discovered by the parity harness.
+    """
+    part_of = await _rows(refreshed, "SELECT style_name, genre_name FROM graph.part_of ORDER BY style_name")
+    jazz = await _rows(refreshed, "SELECT style_count FROM graph.genre_stats WHERE name = 'Jazz'")
+    pop_rock = await _rows(refreshed, "SELECT genre_count FROM graph.style_stats WHERE name = 'Pop Rock'")
+
+    # Only the master and the second release carry exactly one genre.
+    assert part_of == [("Fusion", "Rock"), ("Pop Rock", "Rock")]
+    assert jazz == [(0,)]
+    assert pop_rock == [(1,)]
+
+
+# ── The extraction latch ─────────────────────────────────────────────────────
+# Which signal fires the pass, and what survives a restart. Every call below goes through a
+# separate `SingleConnectionPool`, which is what a restarted process would do: nothing is
+# carried between them but the rows.
+
+FIRST_DUMP = "20260101"
+SECOND_DUMP = "20260201"
+
+
+async def _signal(connection: psycopg.AsyncConnection[Any], version: str, data_type: str) -> Any:
+    return await record_extraction_signal(SingleConnectionPool(connection), version, data_type)
+
+
+async def _mark_refreshed(connection: psycopg.AsyncConnection[Any], version: str) -> None:
+    async with connection.cursor() as cursor:
+        await mark_extraction_refreshed(cursor, version)
+
+
+def test_the_latch_key_prefers_the_version_then_the_start_then_unknown() -> None:
+    """Two dumps that both omit a version must not share one latch row."""
+    assert extraction_latch_key({"version": "20260101", "started_at": "2026-01-01T00:00:00Z"}) == "20260101"
+    assert extraction_latch_key({"started_at": "2026-01-01T00:00:00Z"}) == "2026-01-01T00:00:00Z"
+    assert extraction_latch_key({}) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_only_the_fourth_signal_of_an_extraction_fires_the_pass(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    fired = []
+    for data_type in ENTITY_TABLES:
+        latch = await _signal(counter_connection, FIRST_DUMP, data_type)
+        fired.append(latch.should_refresh(ENTITY_TABLES))
+
+    assert fired == [False, False, False, True]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_between_signals_loses_none_of_them(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    """An in-memory set would lose the first two, and four would never be reached.
+
+    Each call opens its own pool over the connection, so nothing but the rows carries from
+    one to the next — which is exactly what the process has after a restart.
+    """
+    await _signal(counter_connection, FIRST_DUMP, "artists")
+    await _signal(counter_connection, FIRST_DUMP, "labels")
+
+    # ... the loader restarts here ...
+    third = await _signal(counter_connection, FIRST_DUMP, "masters")
+    fourth = await _signal(counter_connection, FIRST_DUMP, "releases")
+
+    assert third.signals == frozenset({"artists", "labels", "masters"})
+    assert third.should_refresh(ENTITY_TABLES) is False
+    assert fourth.signals == frozenset(ENTITY_TABLES)
+    assert fourth.should_refresh(ENTITY_TABLES) is True
+
+
+@pytest.mark.asyncio
+async def test_a_second_extraction_collects_its_own_four_signals(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    """An unkeyed latch would fire on the FIRST signal of the second dump, and then thrice more."""
+    for data_type in ENTITY_TABLES:
+        await _signal(counter_connection, FIRST_DUMP, data_type)
+    await _mark_refreshed(counter_connection, FIRST_DUMP)
+
+    fired = []
+    for data_type in ENTITY_TABLES:
+        latch = await _signal(counter_connection, SECOND_DUMP, data_type)
+        fired.append(latch.should_refresh(ENTITY_TABLES))
+
+    assert fired == [False, False, False, True]
+
+
+@pytest.mark.asyncio
+async def test_a_straggler_from_a_superseded_extraction_fires_nothing(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    """The next dump has started, so the late fourth signal of the last one must not sweep."""
+    for data_type in ("artists", "labels", "masters"):
+        await _signal(counter_connection, FIRST_DUMP, data_type)
+    await _signal(counter_connection, SECOND_DUMP, "artists")
+
+    straggler = await _signal(counter_connection, FIRST_DUMP, "releases")
+
+    assert straggler.signals == frozenset(ENTITY_TABLES)
+    assert straggler.superseded is True
+    assert straggler.should_refresh(ENTITY_TABLES) is False
+
+
+@pytest.mark.asyncio
+async def test_a_redelivered_signal_after_a_successful_pass_fires_nothing(
+    counter_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    for data_type in ENTITY_TABLES:
+        await _signal(counter_connection, FIRST_DUMP, data_type)
+    await _mark_refreshed(counter_connection, FIRST_DUMP)
+
+    redelivered = await _signal(counter_connection, FIRST_DUMP, "releases")
+
+    assert redelivered.already_signalled is True
+    assert redelivered.already_refreshed is True
+    assert redelivered.should_refresh(ENTITY_TABLES) is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pass_leaves_the_extraction_unstamped_so_the_retry_runs(
+    counter_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    """The pass nacks its delivery on failure, and `refreshed_at` is stamped on its own transaction."""
+    for data_type in ENTITY_TABLES:
+        await _signal(counter_connection, FIRST_DUMP, data_type)
+
+    retry = await _signal(counter_connection, FIRST_DUMP, "releases")
+
+    assert retry.already_signalled is True
+    assert retry.already_refreshed is False
+    assert retry.should_refresh(ENTITY_TABLES) is True
+
+
+@pytest.mark.asyncio
+async def test_the_pass_stamps_the_extraction_on_its_own_transaction(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    """A committed pass marks the extraction done, which is what makes a redelivery cheap."""
+    await _load_catalog(counter_connection)
+    for data_type in ENTITY_TABLES:
+        await _signal(counter_connection, FIRST_DUMP, data_type)
+
+    await _refresh(counter_connection, FIRST_DUMP)
+
+    stamped = await _rows(counter_connection, f"SELECT refreshed_at IS NOT NULL FROM {EXTRACTION_LATCH_TABLE}")  # noqa: S608
+    assert stamped == [(True,)]

@@ -31,8 +31,8 @@ Where each counter comes from, and the function it mirrors:
 
 | relation | reference |
 | --- | --- |
-| `genre_stats` | `graphinator.compute_genre_style_stats`, its `genre_cypher` |
-| `style_stats` | `graphinator.compute_genre_style_stats`, its `style_cypher` |
+| `genre_stats` | `graphinator.compute_genre_style_stats`, its `genre_cypher`, except `style_count` |
+| `style_stats` | `graphinator.compute_genre_style_stats`, its `style_cypher`, except `genre_count` |
 | `label_stats` | `graphinator.compute_genre_style_stats`, its `label_cypher` |
 | `artist_degree` | no graphinator pass writes it; it is `COUNT { (a)--() }`, `rarity_queries._ARTIST_DEGREE_QUERY`, counted once instead of per request |
 | `release_degree_base` | the catalog half of `COUNT { (r)--() }`, `rarity_queries._DEGREE_QUERY` |
@@ -55,14 +55,43 @@ Three properties the schema reviews require, and where each one lives:
   on_label.release_id)` over a LEFT JOIN to `by_artist` and `in_genre`, so a release with
   three artists and two genres counts once, as `count(DISTINCT r)` does in `label_cypher`.
 
+**One counter of the seven does not agree with graphinator, and the divergence is in the
+schema rather than in this module.** `genre_stats.style_count` and `style_stats.genre_count`
+count rows of `graph.part_of`, which a document asserts only when it carries EXACTLY ONE
+genre — with two, nothing in the document says which genre a style sits under, and that
+single-genre guard is the whole correctness argument for the relation. `genre_cypher` and
+`style_cypher` count something else: `count(DISTINCT s)` over
+`(g)<-[:IS]-(r:Release)-[:IS]->(s:Style)` is every style CO-OCCURRING on the genre's
+releases, whatever else those releases are tagged with. The two answers differ whenever a
+multi-genre release carries a style. In the fixture of
+`tests/integration/test_graph_counters.py` the first release carries Rock and Jazz and the
+style Pop Rock, so:
+
+| counter | this module | Neo4j |
+| --- | --- | --- |
+| Jazz `style_count` | 0, because no single-genre document puts a style under Jazz | 1, Pop Rock co-occurs on that release |
+| Pop Rock `genre_count` | 1, only the master puts Pop Rock under Rock | 2, Rock and Jazz co-occur on that release |
+
+The body stays identical to the schema's, which is the definition of record and the one the
+parity harness fills these relations with. This note is the citation, not a defect: the four
+other columns of both relations do mirror the Cypher named above.
+
 Two costs are stated rather than hidden. `TRUNCATE` takes ACCESS EXCLUSIVE, so a reader of
 one of these seven tables waits for the whole transaction; that is the schema's own choice
 in `graph.bootstrap_fill` and for the same reason — `ON CONFLICT DO NOTHING` converges
-upward only, so a row the documents no longer justify would survive every re-run. And the
-whole pass is inline on the `extraction_complete` delivery, beside the stale-row purge it
-already runs, so a dump-scale pass shares that delivery's ack budget; `graphinator` acks
-first and detaches for exactly this reason (discogsography-zjja), and doing the same here
-is a decision for whoever measures a full dump.
+upward only, so a row the documents no longer justify would survive every re-run.
+
+**And the whole pass runs inline on the still-unacked `extraction_complete` delivery**,
+beside the stale-row purge, so a dump-scale pass spends that delivery's ack budget.
+`graphinator` acks the trigger BEFORE its own post-import maintenance starts and runs it
+detached with its own retry, because holding the delivery across unbounded work trips
+RabbitMQ's 30-minute consumer ack timeout, which closes the SHARED channel with
+PRECONDITION_FAILED: all four consumers die, the signal is redelivered, the sweep restarts
+from scratch, and after `x-delivery-limit=20` redeliveries the trigger is dead-lettered and
+maintenance never completes at all (discogsography-zjja). The durable latch in
+`tableinator.extraction_latch` is what makes detaching possible here without losing the
+trigger, since the coordination state no longer lives in the delivery. Doing it is a
+follow-on bead, and wants a measurement of a full dump first.
 """
 
 from __future__ import annotations
@@ -72,6 +101,7 @@ from typing import TYPE_CHECKING, Any, Final, LiteralString
 
 from psycopg import sql
 
+from tableinator.extraction_latch import mark_extraction_refreshed
 from tableinator.graph_derivation import EDGE_COLUMNS, derive_document
 
 
@@ -444,17 +474,20 @@ async def refresh_counter_relations(cursor: Any, logger: Any) -> dict[str, int]:
     return counts
 
 
-async def refresh_derived_relations(connection_pool: Any, logger: Any) -> dict[str, int]:
+async def refresh_derived_relations(connection_pool: Any, logger: Any, version: str) -> dict[str, int]:
     """Reconcile the additive edges and recompute every counter, in one transaction.
 
-    One transaction for both steps, because `artist_degree` sums `member_of` and `same_as`:
-    a reconciliation that committed separately would leave a window in which the degrees
-    count edges the sweep has already decided are gone. A failure anywhere leaves every
+    One transaction for all three steps, because `artist_degree` sums `member_of` and
+    `same_as`: a reconciliation that committed separately would leave a window in which the
+    degrees count edges the sweep has already decided are gone. The extraction is stamped
+    refreshed on the same transaction, so a pass that rolls back leaves it unstamped and the
+    next delivery of any of its four signals runs it again. A failure anywhere leaves every
     relation exactly as it was, and the caller retries the whole pass.
 
     Args:
         connection_pool: The loader's `AsyncPostgreSQLPool`.
         logger: The loader's structured logger.
+        version: The extraction this pass is running for, from `extraction_latch_key`.
 
     Returns:
         The row count written per counter relation.
@@ -468,9 +501,11 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any) -> dict[s
         async with conn.transaction(), conn.cursor() as cursor:
             reconciled = await reconcile_additive_edges(cursor, logger)
             counts = await refresh_counter_relations(cursor, logger)
+            await mark_extraction_refreshed(cursor, version)
 
     logger.info(
         "✅ Refreshed the derived graph relations",
+        version=version,
         duration_seconds=round(time.perf_counter() - started, 3),
         rows=counts,
         total_rows=sum(counts.values()),

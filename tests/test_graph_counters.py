@@ -74,7 +74,7 @@ class RecordingCursor:
         self._all: list[Any] = []
 
     async def execute(self, statement: Any, parameters: Any = None) -> None:
-        text = statement.as_string(None)
+        text = statement if isinstance(statement, str) else statement.as_string(None)
         self.calls.append((text, parameters))
         self.rowcount = 0
         if text.startswith("SELECT count(*) FROM"):
@@ -415,7 +415,7 @@ async def test_the_additive_edges_are_reconciled_before_the_degrees_sum_them() -
     """`artist_degree` unions `member_of` and `same_as`, so the sweep has to precede it."""
     cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
 
-    await refresh_derived_relations(FakePool(cursor), RecordingLogger())
+    await refresh_derived_relations(FakePool(cursor), RecordingLogger(), "20260101")
 
     assert cursor.index_of('DELETE FROM "graph"."member_of"') < cursor.index_of('TRUNCATE "graph"."artist_degree"')
     assert cursor.index_of('DELETE FROM "graph"."same_as"') < cursor.index_of('TRUNCATE "graph"."artist_degree"')
@@ -427,7 +427,7 @@ async def test_the_whole_pass_runs_on_one_non_autocommit_transaction() -> None:
     cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
     pool = FakePool(cursor)
 
-    await refresh_derived_relations(pool, RecordingLogger())
+    await refresh_derived_relations(pool, RecordingLogger(), "20260101")
 
     assert pool.connection_double.autocommit is False
 
@@ -437,10 +437,22 @@ async def test_the_pass_reports_its_row_counts_and_duration() -> None:
     logger = RecordingLogger()
     cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
 
-    counts = await refresh_derived_relations(FakePool(cursor), logger)
+    counts = await refresh_derived_relations(FakePool(cursor), logger, "20260101")
 
     assert set(counts) == set(REFRESH_ORDER)
     fields = logger.fields_for("Refreshed the derived graph relations")
     assert set(fields["rows"]) == set(REFRESH_ORDER)
     assert set(fields["reconciled"]) == set(ADDITIVE_RELATIONS)
     assert fields["duration_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_the_extraction_is_stamped_on_the_passs_own_transaction() -> None:
+    """A pass that rolls back must leave the extraction unstamped, so the retry re-runs it."""
+    cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
+
+    await refresh_derived_relations(FakePool(cursor), RecordingLogger(), "20260101")
+
+    stamp = cursor.index_of("SET refreshed_at = NOW()")
+    assert cursor.calls[stamp][1] == ("20260101",)
+    assert stamp > cursor.index_of('TRUNCATE "graph"."label_genre"'), "the stamp must follow the last relation it certifies"

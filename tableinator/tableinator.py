@@ -42,6 +42,7 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
+from tableinator.extraction_latch import extraction_latch_key, record_extraction_signal
 from tableinator.graph_counters import refresh_derived_relations
 from tableinator.media import media_for_release
 from tableinator.queue_names import (
@@ -111,18 +112,23 @@ PURGE_MAX_DELETE_FRACTION = float(
 
 # ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────────────────
 # The counter, degree, and genre-aggregate relations are whole-catalog sums over the edge
-# tables, so they are refreshed once — after every data type has signalled
-# extraction_complete, which is the same latch `graphinator` defers its own post-import
-# pass to (`handle_extraction_complete`: the four fanout queues drain at very different
-# rates and releases finishes last, so a per-type refresh would sum a half-written catalog).
-# `completed_files` cannot stand in for this: it is also written by `file_complete` and
-# ERASED by `_recover_consumers`, so it answers "has this type's file finished" rather than
-# "has this type signalled the end of the extraction".
-extraction_complete_signals: set[str] = set()
+# tables, so they are refreshed once — after every data type of ONE extraction has signalled
+# extraction_complete, which is the latch `graphinator` defers its own post-import pass to
+# (`handle_extraction_complete`: the four fanout queues drain at very different rates and
+# releases finishes last, so a per-type refresh would sum a half-written catalog). The
+# stale-row purge above needs no such latch, because a purge is scoped to the one table
+# whose signal arrived; this is a new latch, not a reuse of anything the purge has.
+#
+# The latch itself lives in PostgreSQL, keyed on the extraction — see
+# `tableinator.extraction_latch` for why neither an unkeyed count nor an in-memory set is
+# sound. `completed_files` cannot stand in for it either: it is also written by
+# `file_complete` and ERASED by `_recover_consumers`, so it answers "has this type's file
+# finished" rather than "has this type signalled the end of THIS extraction".
 
-# Single-flight. The four consumers deliver their signals concurrently, so two of them can
-# both observe the full set; the pass is idempotent, so the loser re-running would be
-# correct but would take ACCESS EXCLUSIVE on seven tables for a second full sweep.
+# Single-flight within the process. The four consumers deliver their signals concurrently,
+# so two of them can both observe a complete latch; the pass is idempotent, so the loser
+# re-running would be correct but would take ACCESS EXCLUSIVE on seven tables for a second
+# full sweep. The `refreshed_at` stamp the winner writes is what makes the loser a no-op.
 derived_refresh_lock = asyncio.Lock()
 # ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────────────────
 
@@ -772,25 +778,39 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             # does, and the whole pass is idempotent so the retry re-runs it safely.
             refresh_ok = True
             if purge_ok and connection_pool is not None:
-                extraction_complete_signals.add(data_type)
-                if extraction_complete_signals.issuperset(DATA_TYPES):
-                    async with derived_refresh_lock:
-                        try:
-                            await refresh_derived_relations(connection_pool, logger)
-                        except Exception as refresh_exc:
-                            logger.error(
-                                "❌ Derived-relation refresh failed, nacking extraction_complete for retry",
+                async with derived_refresh_lock:
+                    try:
+                        version = extraction_latch_key(data)
+                        latch = await record_extraction_signal(connection_pool, version, data_type)
+                        if latch.should_refresh(DATA_TYPES):
+                            await refresh_derived_relations(connection_pool, logger, version)
+                        elif latch.already_refreshed:
+                            logger.info(
+                                "✅ Derived relations were already refreshed for this extraction",
                                 data_type=data_type,
-                                error=str(refresh_exc),
+                                version=version,
                             )
-                            refresh_ok = False
-                else:
-                    logger.info(
-                        "⏳ Deferring the derived-relation refresh until every data type completes",
-                        data_type=data_type,
-                        received=sorted(extraction_complete_signals),
-                        pending=sorted(set(DATA_TYPES) - extraction_complete_signals),
-                    )
+                        elif latch.superseded:
+                            logger.warning(
+                                "⏭️ Ignoring a straggler extraction_complete — a later extraction has started",
+                                data_type=data_type,
+                                version=version,
+                            )
+                        else:
+                            logger.info(
+                                "⏳ Deferring the derived-relation refresh until every data type completes",
+                                data_type=data_type,
+                                version=version,
+                                received=sorted(latch.signals),
+                                pending=latch.pending(DATA_TYPES),
+                            )
+                    except Exception as refresh_exc:
+                        logger.error(
+                            "❌ Derived-relation refresh failed, nacking extraction_complete for retry",
+                            data_type=data_type,
+                            error=str(refresh_exc),
+                        )
+                        refresh_ok = False
             # ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────
 
             if purge_ok and refresh_ok:
