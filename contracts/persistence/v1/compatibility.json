@@ -17,6 +17,39 @@
     "rollback": "every destructive migration requires a tested rollback or restore procedure"
   },
   "contract": "groovemap.persistence",
+  "extraction_latch": {
+    "columns": {
+      "loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+      "loader_extraction_latch.loader": "TEXT NOT NULL",
+      "loader_extraction_latch.refreshed_at": "TIMESTAMPTZ",
+      "loader_extraction_latch.signals": "TEXT[] NOT NULL DEFAULT '{}'",
+      "loader_extraction_latch.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+      "loader_extraction_latch.version": "TEXT NOT NULL"
+    },
+    "consumers": [
+      "discogs-sql-loader",
+      "musicbrainz-sql-loader"
+    ],
+    "design_decision": "Named public.loader_extraction_latch and shaped with a loader discriminator so the loader family can share one relation, matching discogs-sql-loader's tableinator/extraction_latch.py startup probe: it checks LATCH_CANDIDATES (public.loader_extraction_latch first, graph.extraction_latch second) against information_schema, requires the five non-key columns at their exact information_schema types, and — when the relation carries a loader column — keys and scopes every statement on it (its own _key_columns() and ON CONFLICT (loader, version)). Declaring the loader column and the composite primary key here up front means the loader's repin needs no statement changes, only removing its own candidate-name tolerance.",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "loader_values": {
+      "discogs-sql-loader": "discogs",
+      "musicbrainz-sql-loader": "musicbrainz"
+    },
+    "note": "A durable, per-(loader, extraction) latch recording which of a loader's entity types have signalled one extraction's `extraction_complete`, and whether that loader's post-import derived-relation refresh has completed for it (`refreshed_at`). Written before the triggering delivery is acked, so a restart resumes signal collection instead of losing it. Mirrors graphinator's Neo4j-side latch. This repository writes no row; discogs-sql-loader is the writer today, and musicbrainz-sql-loader may write its own (loader, version) rows into the same relation when it adopts the same pattern.",
+    "primary_key": {
+      "columns": [
+        "loader",
+        "version"
+      ],
+      "name": "loader_extraction_latch_pkey"
+    },
+    "relation": "loader_extraction_latch",
+    "schema": "public",
+    "shape": "table",
+    "storage_only": true
+  },
   "graph_schema": {
     "availability": "unconditional",
     "bootstrap": {
@@ -409,6 +442,16 @@
       "shape_change": "A relation that becomes a loader-written table is replaced by a guarded migration that drops the view only when one is still there, in the same pass that creates the table. The published column names survive the change; the key columns are retyped from character varying to text, which psycopg returns identically."
     },
     "views": 37
+  },
+  "musicbrainz_delete_reconciliation": {
+    "columns": {
+      "musicbrainz.external_links.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+      "musicbrainz.relationships.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+    },
+    "consumer": "musicbrainz-sql-loader",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "note": "musicbrainz.relationships and musicbrainz.external_links were declared with created_at only, unlike every other MusicBrainz entity table. The additive updated_at column closes the gap: the loader refreshes it on every upsert and reconciles deletes by removing rows where updated_at < run start, the same purge_stale_rows shape discogs-sql-loader already runs against the Discogs entity tables' own updated_at. DDL ownership is database-schema alone, so this column is declared here rather than carried as a startup ALTER in the loader."
   },
   "owners": [
     "database-schema"
