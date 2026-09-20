@@ -29,7 +29,8 @@ import pytest_asyncio
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
 from tableinator.extraction_latch import (
-    LATCH_CANDIDATES,
+    KEY_COLUMNS,
+    LATCH_RELATION,
     LOADER_DISCRIMINATOR,
     extraction_latch_key,
     mark_extraction_refreshed,
@@ -235,8 +236,10 @@ async def _truncate(connection: psycopg.AsyncConnection[Any]) -> None:
     relations = ", ".join(f"graph.{relation}" for relation in (*EDGE_COLUMNS, *VERTEX_COLUMNS, *REFRESH_ORDER))
     await connection.execute(f"TRUNCATE {relations}")
     await connection.execute(f"TRUNCATE {', '.join(ENTITY_TABLES)}")
-    for schema, table in LATCH_CANDIDATES:
-        await connection.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
+    # Emptied, never dropped: the latch relation belongs to the promoted schema now, and the
+    # session applies that schema once. Dropping it here would take it away from every test
+    # that ran after this one.
+    await connection.execute("TRUNCATE {}.{}".format(*LATCH_RELATION))
 
 
 async def _write_batch(connection: psycopg.AsyncConnection[Any], data_type: str, documents: Any, suffix: str = "v1") -> None:
@@ -255,8 +258,8 @@ async def _refresh(connection: psycopg.AsyncConnection[Any], version: str = "202
     return await refresh_derived_relations(SingleConnectionPool(connection), MagicMock(), version)
 
 
-async def _rows(connection: psycopg.AsyncConnection[Any], query: str) -> list[tuple[Any, ...]]:
-    return list(await (await connection.execute(query)).fetchall())
+async def _rows(connection: psycopg.AsyncConnection[Any], query: str, parameters: Any = None) -> list[tuple[Any, ...]]:
+    return list(await (await connection.execute(query, parameters)).fetchall())
 
 
 @pytest_asyncio.fixture
@@ -519,46 +522,36 @@ async def test_style_and_genre_counts_follow_the_schema_not_the_cypher(refreshed
 # separate `SingleConnectionPool`, which is what a restarted process would do: nothing is
 # carried between them but the rows.
 #
-# The relation is created by the fixture below rather than by the loader, because the loader
-# creates no database objects and the pinned `groovemap-database-schema` does not declare
-# this one yet — a chore is adding it. The DDL here is therefore a stand-in for that
-# declaration, and the follow-up that repins should delete it and let the promoted schema
-# provide the table.
+# Nothing here creates the relation. The promoted `groovemap-database-schema` declares
+# `public.loader_extraction_latch`, the session fixture in `conftest.py` applies that
+# initializer once, and every test below resolves the relation the way the running loader
+# does: by probing for it. A stand-in `CREATE TABLE` used to stand where this comment is,
+# and it is gone on purpose — a fixture that builds the table it then asserts against can
+# only ever prove the fixture right.
 
 FIRST_DUMP = "20260101"
 SECOND_DUMP = "20260201"
 
-_DECLARED_LATCH = """
-CREATE TABLE {schema}.{table} (
-    {loader_column}
-    version      text NOT NULL,
-    signals      text[] NOT NULL DEFAULT '{{}}',
-    created_at   timestamptz NOT NULL DEFAULT NOW(),
-    updated_at   timestamptz NOT NULL DEFAULT NOW(),
-    refreshed_at timestamptz,
-    PRIMARY KEY ({key})
-)
+# The same catalog read the probe makes, asked here by name so a schema revision that keeps
+# the columns and drops the constraint fails this suite rather than every signal at runtime.
+_KEY_CONSTRAINTS = """
+SELECT conname, array_agg(attribute.attname::text ORDER BY attribute.attname::text)
+FROM pg_constraint AS constraint_
+JOIN pg_class AS relation ON relation.oid = constraint_.conrelid
+JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+JOIN LATERAL unnest(constraint_.conkey) AS member(attnum) ON true
+JOIN pg_attribute AS attribute ON attribute.attrelid = constraint_.conrelid AND attribute.attnum = member.attnum
+WHERE namespace.nspname = %s AND relation.relname = %s AND constraint_.contype IN ('p', 'u')
+GROUP BY constraint_.oid, conname
 """
-
-
-async def _declare_latch(connection: psycopg.AsyncConnection[Any], *, shared: bool) -> Any:
-    """Create the relation the schema chore is adding, then let the loader find it."""
-    schema, table = LATCH_CANDIDATES[0]
-    await connection.execute(
-        _DECLARED_LATCH.format(
-            schema=schema,
-            table=table,
-            loader_column="loader text NOT NULL," if shared else "",
-            key="loader, version" if shared else "version",
-        )
-    )
-    return await probe_latch_relation(SingleConnectionPool(connection), MagicMock())
 
 
 @pytest_asyncio.fixture
 async def declared_latch(counter_connection: psycopg.AsyncConnection[Any]) -> Any:
-    """The shared shape, which is the one the chore is most likely to land."""
-    return await _declare_latch(counter_connection, shared=True)
+    """The relation as the startup probe resolves it out of the promoted schema."""
+    latch = await probe_latch_relation(SingleConnectionPool(counter_connection), MagicMock())
+    assert latch is not None, "the promoted schema must declare the extraction latch relation"
+    return latch
 
 
 async def _signal(connection: psycopg.AsyncConnection[Any], latch: Any, version: str, data_type: str) -> Any:
@@ -570,8 +563,12 @@ async def _mark_refreshed(connection: psycopg.AsyncConnection[Any], latch: Any, 
         await mark_extraction_refreshed(cursor, latch, version)
 
 
-def test_the_latch_key_prefers_the_version_then_the_start_then_unknown() -> None:
-    """Two dumps that both omit a version must not share one latch row."""
+def test_the_latch_key_prefers_the_version_then_the_start_then_nothing() -> None:
+    """Two dumps that both omit a version must not share one latch row.
+
+    And a message carrying neither has no key at all, rather than a sentinel — which is
+    what the third case asserts, and what the old name of this test got wrong.
+    """
     assert extraction_latch_key({"version": "20260101", "started_at": "2026-01-01T00:00:00Z"}) == "20260101"
     assert extraction_latch_key({"started_at": "2026-01-01T00:00:00Z"}) == "2026-01-01T00:00:00Z"
     # And a message naming neither has no key, so nothing is recorded for it at all.
@@ -579,39 +576,63 @@ def test_the_latch_key_prefers_the_version_then_the_start_then_unknown() -> None
 
 
 @pytest.mark.asyncio
-async def test_the_probe_finds_nothing_in_the_promoted_schema_and_the_loader_degrades(
-    counter_connection: psycopg.AsyncConnection[Any],
-) -> None:
-    """The pinned schema does not declare the relation yet, and the loader must not add it.
+async def test_the_probe_finds_the_relation_the_promoted_schema_declares(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    """The whole point of the repin, asserted against the real initializer rather than a fixture.
 
-    This is the degraded mode against a real database: the probe comes back empty, the
-    loader records no signal and fires no pass, and nothing in `public` or `graph` has been
-    created by looking.
+    Before it, this suite built the table itself and the promoted schema had none — so the
+    probe's answer said something about the fixture and nothing about what a deployed loader
+    would find. Here the only thing that has run is `create_postgres_schema`.
     """
     relation = await probe_latch_relation(SingleConnectionPool(counter_connection), MagicMock())
 
-    assert relation is None
-    for schema, table in LATCH_CANDIDATES:
-        rows = await _rows(
-            counter_connection,
-            f"SELECT count(*) FROM information_schema.tables WHERE table_schema = '{schema}' AND table_name = '{table}'",  # noqa: S608
-        )
-        assert rows == [(0,)], f"the probe must not have created {schema}.{table}"
+    assert relation is not None
+    assert (relation.schema, relation.table) == LATCH_RELATION
+    assert relation.keyed_on_loader is True
+    assert relation.key_columns == KEY_COLUMNS
 
 
 @pytest.mark.asyncio
-async def test_the_probe_recognises_the_relation_once_it_is_declared(counter_connection: psycopg.AsyncConnection[Any]) -> None:
-    unshared = await _declare_latch(counter_connection, shared=False)
+async def test_the_promoted_schema_declares_the_key_the_upsert_conflicts_on(counter_connection: psycopg.AsyncConnection[Any]) -> None:
+    """`ON CONFLICT (loader, version)` needs a real key, and the probe now insists on one.
 
-    assert unshared is not None
-    assert (unshared.schema, unshared.table) == LATCH_CANDIDATES[0]
-    assert unshared.keyed_on_loader is False
+    Asserted here against the catalog the probe reads, so a later schema revision that keeps
+    the columns and loses the constraint fails this suite rather than every signal at runtime.
+    """
+    keys = await _rows(counter_connection, _KEY_CONSTRAINTS, LATCH_RELATION)
+
+    assert keys == [("loader_extraction_latch_pkey", sorted(KEY_COLUMNS))]
 
 
 @pytest.mark.asyncio
-async def test_the_probe_reads_the_loader_column_when_the_relation_is_shared(declared_latch: Any) -> None:
-    assert declared_latch is not None
-    assert declared_latch.keyed_on_loader is True
+async def test_four_signals_fire_the_pass_once_and_write_only_this_loaders_rows(
+    counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any
+) -> None:
+    """One extraction end to end over the promoted relation: four signals, one pass, one row.
+
+    The relation is shared with `musicbrainz-sql-loader`, so `loader` is asserted on every
+    row this loader left behind — a row written without the discriminator would be one the
+    other loader's probe could read as its own.
+    """
+    await _load_catalog(counter_connection)
+
+    fired = []
+    for data_type in ENTITY_TABLES:
+        latch = await _signal(counter_connection, declared_latch, FIRST_DUMP, data_type)
+        fired.append(latch.should_refresh(ENTITY_TABLES))
+    assert fired == [False, False, False, True], "the pass fires on the fourth signal and no earlier"
+
+    await refresh_derived_relations(SingleConnectionPool(counter_connection), MagicMock(), FIRST_DUMP, declared_latch)
+
+    schema, table = LATCH_RELATION
+    rows = await _rows(
+        counter_connection,
+        f"SELECT loader, version, signals, refreshed_at IS NOT NULL FROM {schema}.{table}",  # noqa: S608
+    )
+    assert rows == [(LOADER_DISCRIMINATOR, FIRST_DUMP, sorted(ENTITY_TABLES), True)]
+
+    # And a fifth delivery of any of the four is now a cheap no-op rather than a second sweep.
+    redelivered = await _signal(counter_connection, declared_latch, FIRST_DUMP, "releases")
+    assert redelivered.should_refresh(ENTITY_TABLES) is False
 
 
 @pytest.mark.asyncio
@@ -706,7 +727,7 @@ async def test_a_failed_pass_leaves_the_extraction_unstamped_so_the_retry_runs(
 @pytest.mark.asyncio
 async def test_a_shared_relation_keeps_the_two_loaders_apart(counter_connection: psycopg.AsyncConnection[Any], declared_latch: Any) -> None:
     """musicbrainz-sql-loader's rows must neither satisfy nor supersede this loader's."""
-    schema, table = LATCH_CANDIDATES[0]
+    schema, table = LATCH_RELATION
     await counter_connection.execute(
         f"INSERT INTO {schema}.{table} (loader, version, signals) VALUES ('musicbrainz', %s, %s)",  # noqa: S608
         (FIRST_DUMP, list(ENTITY_TABLES)),
@@ -729,6 +750,6 @@ async def test_the_pass_stamps_the_extraction_on_its_own_transaction(counter_con
 
     await refresh_derived_relations(SingleConnectionPool(counter_connection), MagicMock(), FIRST_DUMP, declared_latch)
 
-    schema, table = LATCH_CANDIDATES[0]
+    schema, table = LATCH_RELATION
     stamped = await _rows(counter_connection, f"SELECT refreshed_at IS NOT NULL FROM {schema}.{table}")  # noqa: S608
     assert stamped == [(True,)]
