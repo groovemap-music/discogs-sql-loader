@@ -31,8 +31,8 @@ from tableinator.tableinator import (
 # SimpleConnectionPool tests removed as we now use AsyncPostgreSQLPool
 
 
-# The relation the pending database-schema chore declares, as the startup probe resolves it.
-_DECLARED_LATCH = LatchRelation(schema="public", table="loader_extraction_latch", keyed_on_loader=True)
+# The relation the promoted database-schema declares, as the startup probe resolves it.
+_DECLARED_LATCH = LatchRelation(schema="public", table="loader_extraction_latch")
 
 
 # gm-discogs-sql-loader-2eg.3: a latch stub for the suites that exercise the purge rather

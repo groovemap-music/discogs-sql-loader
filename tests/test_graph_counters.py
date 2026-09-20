@@ -451,13 +451,15 @@ async def test_the_extraction_is_stamped_on_the_passs_own_transaction() -> None:
     """A pass that rolls back must leave the extraction unstamped, so the retry re-runs it."""
     from tableinator.extraction_latch import LatchRelation
 
-    latch = LatchRelation(schema="public", table="loader_extraction_latch", keyed_on_loader=False)
+    from tableinator.extraction_latch import LOADER_DISCRIMINATOR
+
+    latch = LatchRelation(schema="public", table="loader_extraction_latch")
     cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
 
     await refresh_derived_relations(FakePool(cursor), RecordingLogger(), "20260101", latch)
 
     stamp = cursor.index_of("SET refreshed_at = NOW()")
-    assert cursor.calls[stamp][1] == {"version": "20260101"}
+    assert cursor.calls[stamp][1] == {"version": "20260101", "loader": LOADER_DISCRIMINATOR}
     assert stamp > cursor.index_of('TRUNCATE "graph"."label_genre"'), "the stamp must follow the last relation it certifies"
 
 

@@ -27,7 +27,8 @@ never reach four, and the refresh silently never runs for that dump.
 **This module issues no DDL.** `docs/database-schema.md` states that this service does not
 create or migrate database objects, `tests/test_service_contract.py` guards that sentence,
 and `database-schema` owns every executable definition. The latch relation is declared
-there; what happens here is a read of `information_schema` at startup to find it. When it is
+there; what happens here is a read of `information_schema` and `pg_constraint` at startup to
+find it and check its shape. When it is
 present the loader runs as described above. When it is absent the loader runs in a degraded
 mode that records no signal and fires no refresh, says so in the log and in the health
 payload, and never tries to make the relation itself. The counters simply stay as the last
@@ -44,13 +45,26 @@ them under one sentinel row would let the first stamp `refreshed_at` and every l
 read as already refreshed and never fire. That is the silent skip this latch exists to
 prevent, so the signal is logged at ERROR and dropped instead.
 
-**Until the pin moves**, the relation is being declared by a `database-schema` chore and its
-name is not yet settled, so `LATCH_CANDIDATES` names both proposals and the probe takes the
-first that matches. The follow-up that repins to the revision declaring it should cut this
-list to the one that landed. The `loader` discriminator is optional for the same reason: the
-relation is named for the loader family so `musicbrainz-sql-loader` can share it, and if it
-carries that column this module keys on it so the two loaders cannot read each other's
-signals.
+**One declared name, and one declared key.** `database-schema` at the pinned revision
+declares `public.loader_extraction_latch` with a `loader` discriminator and a composite
+primary key over `(loader, version)`, so the probe looks for that relation and nothing else,
+and the discriminator is required rather than tolerated. The relation is named for the
+loader family, not for one loader, so `musicbrainz-sql-loader` writes its own rows into the
+same table; every statement here is scoped to `LOADER_DISCRIMINATOR` so the two loaders can
+neither read nor supersede each other's signals.
+
+The probe checks that key as well as the columns. `ON CONFLICT (loader, version)` needs a
+unique or primary-key constraint over exactly those columns, and a relation carrying the
+right columns without one raises `InvalidColumnReference` on the FIRST signal — a failure
+that nacks the delivery and is redelivered until the trigger is dead-lettered, long after
+whoever deployed the schema has stopped watching. Asked once at startup, that same mismatch
+is one log line and the degraded mode instead.
+
+**Deferred here (gm-discogs-sql-loader-vkb).** The pinned revision does not yet declare
+`graph.refresh_artist_member_of()` or `graph.refresh_vertex_degree()` — those ship with
+`gm-database-schema-820`, which is still in flight — so the `extraction_complete` pass does
+not call them yet. The repin that picks them up owns adding those two calls after the
+counters, inside the pass's transaction.
 """
 
 from __future__ import annotations
@@ -62,7 +76,7 @@ from psycopg import sql
 
 
 __all__ = [
-    "LATCH_CANDIDATES",
+    "LATCH_RELATION",
     "LOADER_DISCRIMINATOR",
     "ExtractionLatch",
     "LatchRelation",
@@ -72,20 +86,22 @@ __all__ = [
     "record_extraction_signal",
 ]
 
-# This loader's value for the `loader` column, when the declared relation carries one.
+# This loader's value for the `loader` column. `musicbrainz-sql-loader` writes 'musicbrainz'
+# into the same relation; the contract records both under `extraction_latch.loader_values`.
 LOADER_DISCRIMINATOR: Final = "discogs"
 
-# Where the declared relation may live, most specific first. Both names are the ones the
-# `database-schema` chore proposes; the repin cuts this to whichever landed.
-LATCH_CANDIDATES: Final[tuple[tuple[str, str], ...]] = (
-    ("public", "loader_extraction_latch"),
-    ("graph", "extraction_latch"),
-)
+# The one relation `database-schema` declares, at the pinned revision.
+LATCH_RELATION: Final[tuple[str, str]] = ("public", "loader_extraction_latch")
+
+# The discriminator that keys this loader's rows apart from the other loader's. Declared
+# NOT NULL, so it is required, not tolerated.
+LOADER_COLUMN: Final = "loader"
 
 # The columns this module reads and writes, with the `information_schema` type each must
 # have. A relation that is missing one, or spells one differently, is not this relation and
 # the probe declines it rather than writing into something that merely shares a name.
 REQUIRED_COLUMNS: Final[dict[str, tuple[str, str | None]]] = {
+    LOADER_COLUMN: ("text", None),
     "version": ("text", None),
     "signals": ("ARRAY", "_text"),
     "created_at": ("timestamp with time zone", None),
@@ -93,14 +109,28 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, str | None]]] = {
     "refreshed_at": ("timestamp with time zone", None),
 }
 
-# Optional, and part of the key when present.
-LOADER_COLUMN: Final = "loader"
-LOADER_COLUMN_TYPE: Final = "text"
+# The columns every statement keys on, and the ones `ON CONFLICT` names.
+KEY_COLUMNS: Final[tuple[str, ...]] = (LOADER_COLUMN, "version")
 
-_PROBE = """
+_PROBE_COLUMNS = """
 SELECT column_name, data_type, udt_name
 FROM information_schema.columns
 WHERE table_schema = %s AND table_name = %s
+"""
+
+# Every PRIMARY KEY and UNIQUE constraint on the relation, as its column set. `pg_constraint`
+# rather than `information_schema.table_constraints` because `contype` answers the question
+# directly and the catalog is readable without owning the relation. See the module docstring
+# for why a missing key has to fail at startup instead of on the first signal.
+_PROBE_KEYS = """
+SELECT array_agg(attribute.attname::text ORDER BY attribute.attname::text) AS columns
+FROM pg_constraint AS constraint_
+JOIN pg_class AS relation ON relation.oid = constraint_.conrelid
+JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+JOIN LATERAL unnest(constraint_.conkey) AS member(attnum) ON true
+JOIN pg_attribute AS attribute ON attribute.attrelid = constraint_.conrelid AND attribute.attnum = member.attnum
+WHERE namespace.nspname = %s AND relation.relname = %s AND constraint_.contype IN ('p', 'u')
+GROUP BY constraint_.oid
 """
 
 
@@ -111,33 +141,41 @@ class LatchRelation:
     Attributes:
         schema: The schema it lives in.
         table: Its name.
-        keyed_on_loader: It carries a `loader` column, so both loaders share it and every
-            statement this module issues is scoped to `LOADER_DISCRIMINATOR`.
     """
 
     schema: str
     table: str
-    keyed_on_loader: bool
 
     @property
     def qualified(self) -> str:
         """The relation as it reads in a log line."""
         return f"{self.schema}.{self.table}"
 
+    @property
+    def keyed_on_loader(self) -> bool:
+        """Always true: `loader` is a declared NOT NULL column and half of the primary key.
+
+        Kept as a named property rather than dropped, because it is what the startup log
+        line reports and what a reader checks to know this loader's statements are scoped to
+        its own rows and cannot see `musicbrainz-sql-loader`'s.
+        """
+        return True
+
+    @property
+    def key_columns(self) -> tuple[str, ...]:
+        """The columns every statement keys on, and the ones `ON CONFLICT` names."""
+        return KEY_COLUMNS
+
     def _relation(self) -> sql.Identifier:
         return sql.Identifier(self.schema, self.table)
-
-    def _key_columns(self) -> tuple[str, ...]:
-        return (LOADER_COLUMN, "version") if self.keyed_on_loader else ("version",)
 
     def _key_predicate(self, alias: str | None = None) -> sql.Composed:
         def column(name: str) -> sql.Composable:
             return sql.SQL("{alias}.{column}").format(alias=sql.Identifier(alias), column=sql.Identifier(name)) if alias else sql.Identifier(name)
 
-        clauses = [sql.SQL("{column} = {value}").format(column=column("version"), value=sql.Placeholder("version"))]
-        if self.keyed_on_loader:
-            clauses.append(sql.SQL("{column} = {value}").format(column=column(LOADER_COLUMN), value=sql.Placeholder(LOADER_COLUMN)))
-        return sql.SQL(" AND ").join(clauses)
+        return sql.SQL(" AND ").join(
+            sql.SQL("{column} = {value}").format(column=column(name), value=sql.Placeholder(name)) for name in ("version", LOADER_COLUMN)
+        )
 
     def record_statement(self) -> sql.Composed:
         """Return the one statement that records a signal and reports the latch.
@@ -146,14 +184,9 @@ class LatchRelation:
         wrote. `prior` is evaluated on the pre-statement snapshot, so it sees the row as it
         was before the upsert.
         """
-        key_columns = self._key_columns()
-        columns = sql.SQL(", ").join(sql.Identifier(name) for name in key_columns)
-        values = sql.SQL(", ").join(sql.Placeholder(name) for name in key_columns)
-        newer_scope = (
-            sql.SQL(" AND {column} = {value}").format(column=sql.Identifier("newer", LOADER_COLUMN), value=sql.Placeholder(LOADER_COLUMN))
-            if self.keyed_on_loader
-            else sql.SQL("")
-        )
+        columns = sql.SQL(", ").join(sql.Identifier(name) for name in self.key_columns)
+        values = sql.SQL(", ").join(sql.Placeholder(name) for name in self.key_columns)
+        newer_scope = sql.SQL(" AND {column} = {value}").format(column=sql.Identifier("newer", LOADER_COLUMN), value=sql.Placeholder(LOADER_COLUMN))
         return sql.SQL(
             "WITH prior AS ("
             "SELECT signals AS signals FROM {relation} WHERE {key}"
@@ -187,9 +220,7 @@ class LatchRelation:
 
     def parameters(self, version: str, data_type: str | None = None) -> dict[str, Any]:
         """Return the bound parameters for one statement against this relation."""
-        values: dict[str, Any] = {"version": version}
-        if self.keyed_on_loader:
-            values[LOADER_COLUMN] = LOADER_DISCRIMINATOR
+        values: dict[str, Any] = {"version": version, LOADER_COLUMN: LOADER_DISCRIMINATOR}
         if data_type is not None:
             values["data_type"] = data_type
         return values
@@ -248,16 +279,15 @@ def extraction_latch_key(data: dict[str, Any]) -> str | None:
     return str(data.get("started_at") or "").strip() or None
 
 
-def _match(columns: dict[str, tuple[str, str]], schema: str, table: str) -> LatchRelation | None:
-    """Return the relation these `information_schema` rows describe, or None."""
+def _has_declared_columns(columns: dict[str, tuple[str, str]]) -> bool:
+    """Whether these `information_schema` rows are the declared relation's columns."""
     for name, (expected_type, expected_udt) in REQUIRED_COLUMNS.items():
         found = columns.get(name)
         if found is None or found[0] != expected_type:
-            return None
+            return False
         if expected_udt is not None and found[1] != expected_udt:
-            return None
-    loader = columns.get(LOADER_COLUMN)
-    return LatchRelation(schema=schema, table=table, keyed_on_loader=loader is not None and loader[0] == LOADER_COLUMN_TYPE)
+            return False
+    return True
 
 
 async def probe_latch_relation(connection_pool: Any, logger: Any) -> LatchRelation | None:
@@ -266,6 +296,12 @@ async def probe_latch_relation(connection_pool: Any, logger: Any) -> LatchRelati
     Read-only, and run once at startup. A miss is not an error here: it is the degraded mode
     the module docstring describes, and the caller reports it rather than creating anything.
 
+    Three things have to hold, and each failure has its own log line so the deployment that
+    caused it can be read off the startup output: the relation exists, it carries every
+    column in `REQUIRED_COLUMNS` at the declared type, and a primary or unique key covers
+    exactly `KEY_COLUMNS`. The last is the one that cannot be deferred to first use — without
+    it the upsert's `ON CONFLICT` raises, and the signal nacks and redelivers forever.
+
     Args:
         connection_pool: The loader's `AsyncPostgreSQLPool`.
         logger: The loader's structured logger.
@@ -273,41 +309,57 @@ async def probe_latch_relation(connection_pool: Any, logger: Any) -> LatchRelati
     Returns:
         The relation to use, or None to run degraded.
     """
+    schema, table = LATCH_RELATION
+    relation = LatchRelation(schema=schema, table=table)
     try:
         async with connection_pool.connection() as conn, conn.cursor() as cursor:
-            for schema, table in LATCH_CANDIDATES:
-                await cursor.execute(_PROBE, (schema, table))
-                rows = await cursor.fetchall()
-                if not rows:
-                    continue
-                columns = {str(name): (str(data_type), str(udt)) for name, data_type, udt in rows}
-                relation = _match(columns, schema, table)
-                if relation is not None:
-                    logger.info(
-                        "🔒 Extraction latch relation found — the derived-relation refresh is enabled",
-                        relation=relation.qualified,
-                        keyed_on_loader=relation.keyed_on_loader,
-                    )
-                    return relation
+            await cursor.execute(_PROBE_COLUMNS, (schema, table))
+            rows = await cursor.fetchall()
+            if not rows:
+                logger.warning(
+                    "⚠️ No extraction latch relation is declared — the counter, degree, and genre-aggregate "
+                    "relations will NOT be refreshed on extraction_complete. Apply a database-schema revision "
+                    "that declares it; this service never creates database objects.",
+                    relation=relation.qualified,
+                )
+                return None
+
+            columns = {str(name): (str(data_type), str(udt)) for name, data_type, udt in rows}
+            if not _has_declared_columns(columns):
                 logger.warning(
                     "⚠️ A relation with the latch's name does not have its columns — ignoring it",
-                    relation=f"{schema}.{table}",
+                    relation=relation.qualified,
                     columns=sorted(columns),
+                    required=sorted(REQUIRED_COLUMNS),
                 )
+                return None
+
+            await cursor.execute(_PROBE_KEYS, (schema, table))
+            declared_keys = {tuple(sorted(row[0] or ())) for row in await cursor.fetchall()}
+            required_key = tuple(sorted(relation.key_columns))
+            if required_key not in declared_keys:
+                logger.warning(
+                    "⚠️ The latch relation has no primary or unique key on the columns the upsert "
+                    "conflicts on — ignoring it rather than nacking every signal forever",
+                    relation=relation.qualified,
+                    required=list(required_key),
+                    declared=[list(key) for key in sorted(declared_keys)],
+                )
+                return None
+
+            logger.info(
+                "🔒 Extraction latch relation found — the derived-relation refresh is enabled",
+                relation=relation.qualified,
+                keyed_on_loader=relation.keyed_on_loader,
+                key_columns=list(relation.key_columns),
+            )
+            return relation
     except Exception as exc:
         logger.error(
             "❌ Could not probe for the extraction latch relation — running without the derived-relation refresh",
             error=str(exc),
         )
         return None
-
-    logger.warning(
-        "⚠️ No extraction latch relation is declared — the counter, degree, and genre-aggregate "
-        "relations will NOT be refreshed on extraction_complete. Apply a database-schema revision "
-        "that declares it; this service never creates database objects.",
-        candidates=[f"{schema}.{table}" for schema, table in LATCH_CANDIDATES],
-    )
-    return None
 
 
 async def record_extraction_signal(connection_pool: Any, latch: LatchRelation, version: str, data_type: str) -> ExtractionLatch:
