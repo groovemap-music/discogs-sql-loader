@@ -125,6 +125,11 @@ PURGE_MAX_DELETE_FRACTION = float(
 # `file_complete` and ERASED by `_recover_consumers`, so it answers "has this type's file
 # finished" rather than "has this type signalled the end of THIS extraction".
 
+
+class _UnnamedExtraction(Exception):
+    """An `extraction_complete` that names no extraction, so no latch row can key on it."""
+
+
 # The declared latch relation, resolved once at startup by a read of `information_schema`.
 # None means the schema in front of this loader does not declare it, and the loader then
 # runs degraded: no signal is recorded and the pass never fires. This service never creates
@@ -794,6 +799,17 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 async with derived_refresh_lock:
                     try:
                         version = extraction_latch_key(data)
+                        if version is None:
+                            # No version and no started_at. Every such dump would land on one
+                            # latch row, the first would stamp it refreshed, and every dump
+                            # after it would read as already done and silently never refresh.
+                            # Nothing can tell them apart, so nothing is recorded.
+                            logger.error(
+                                "❌ extraction_complete names no extraction (no version, no started_at) — "
+                                "recording no signal and refreshing no derived relations",
+                                data_type=data_type,
+                            )
+                            raise _UnnamedExtraction
                         latch = await record_extraction_signal(connection_pool, extraction_latch, version, data_type)
                         if latch.should_refresh(DATA_TYPES):
                             await refresh_derived_relations(connection_pool, logger, version, extraction_latch)
@@ -817,6 +833,11 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                                 received=sorted(latch.signals),
                                 pending=latch.pending(DATA_TYPES),
                             )
+                    except _UnnamedExtraction:
+                        # Already logged. The delivery is still terminal: the purge ran and
+                        # this type is complete, and requeueing would only redeliver a
+                        # message that can never gain a version.
+                        pass
                     except Exception as refresh_exc:
                         logger.error(
                             "❌ Derived-relation refresh failed, nacking extraction_complete for retry",

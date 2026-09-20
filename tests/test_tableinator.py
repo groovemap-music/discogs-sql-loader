@@ -4276,3 +4276,69 @@ class TestDerivedRelationRefresh:
 
         with patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH):
             assert get_health_data()["derived_relation_refresh"] == "enabled"
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_an_extraction_complete_naming_no_extraction_records_and_refreshes_nothing(self) -> None:
+        """No version and no started_at: every such dump would share one latch row.
+
+        The first would stamp it refreshed and every dump after it would read as already
+        done and silently never refresh. Nothing can tell them apart, so the signal is
+        logged at ERROR and dropped rather than filed under a sentinel.
+        """
+        record = AsyncMock()
+        refresh = AsyncMock()
+        completed: set[str] = set()
+        message = AsyncMock(spec=AbstractIncomingMessage)
+        message.body = json.dumps({"type": "extraction_complete"}).encode()
+
+        with (
+            patch("tableinator.tableinator.logger") as mock_logger,
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.completed_files", completed),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
+            patch("tableinator.tableinator.record_extraction_signal", new=record),
+            patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
+        ):
+            await on_data_message(message, "releases")
+
+        record.assert_not_awaited()
+        refresh.assert_not_awaited()
+        assert any("names no extraction" in str(call) for call in mock_logger.error.call_args_list)
+        # Terminal all the same: the purge ran, and requeueing would redeliver a message
+        # that can never gain a version.
+        assert completed == {"releases"}
+        message.ack.assert_called_once()
+        message.nack.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_a_started_at_alone_still_keys_the_latch(self) -> None:
+        """The fallback is what keeps two versionless dumps apart when they carry a start."""
+        collected: set[str] = set()
+        refresh = AsyncMock()
+
+        async def record(_pool: Any, _latch: Any, version: str, data_type: str) -> Any:
+            collected.add(data_type)
+            return self._latch(collected, version=version)
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", None),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.completed_files", set()),
+            patch("tableinator.tableinator.queues", {}),
+            patch("tableinator.tableinator.purge_stale_rows", new=AsyncMock()),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
+            patch("tableinator.tableinator.record_extraction_signal", new=record),
+            patch("tableinator.tableinator.refresh_derived_relations", new=refresh),
+        ):
+            for data_type in ("artists", "labels", "masters", "releases"):
+                message = AsyncMock(spec=AbstractIncomingMessage)
+                message.body = json.dumps({"type": "extraction_complete", "started_at": "2026-03-01T00:00:00Z"}).encode()
+                await on_data_message(message, data_type)
+
+        refresh.assert_awaited_once_with(ANY, ANY, "2026-03-01T00:00:00Z", _DECLARED_LATCH)

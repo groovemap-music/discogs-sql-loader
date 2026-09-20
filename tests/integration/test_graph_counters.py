@@ -574,7 +574,8 @@ def test_the_latch_key_prefers_the_version_then_the_start_then_unknown() -> None
     """Two dumps that both omit a version must not share one latch row."""
     assert extraction_latch_key({"version": "20260101", "started_at": "2026-01-01T00:00:00Z"}) == "20260101"
     assert extraction_latch_key({"started_at": "2026-01-01T00:00:00Z"}) == "2026-01-01T00:00:00Z"
-    assert extraction_latch_key({}) == "unknown"
+    # And a message naming neither has no key, so nothing is recorded for it at all.
+    assert extraction_latch_key({}) is None
 
 
 @pytest.mark.asyncio

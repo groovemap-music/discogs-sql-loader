@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from tableinator.extraction_latch import (
-    EXTRACTION_LATCH_UNKNOWN_VERSION,
     LATCH_CANDIDATES,
     LOADER_DISCRIMINATOR,
     ExtractionLatch,
@@ -72,9 +71,16 @@ def test_the_start_keys_it_when_the_version_is_missing_or_blank() -> None:
     assert extraction_latch_key({"version": "   ", "started_at": "2026-02-01T00:00:00Z"}) == "2026-02-01T00:00:00Z"
 
 
-def test_a_message_naming_no_extraction_falls_back_to_unknown() -> None:
-    assert extraction_latch_key({}) == EXTRACTION_LATCH_UNKNOWN_VERSION
-    assert extraction_latch_key({"version": None, "started_at": ""}) == EXTRACTION_LATCH_UNKNOWN_VERSION
+def test_a_message_naming_no_extraction_has_no_key_at_all() -> None:
+    """A sentinel would let every versionless dump share one row.
+
+    The first of them to complete stamps `refreshed_at`, and every dump after it reads as
+    already refreshed and never fires — the silent skip this latch exists to prevent.
+    graphinator files these under the literal version `"unknown"`; this loader refuses.
+    """
+    assert extraction_latch_key({}) is None
+    assert extraction_latch_key({"version": None, "started_at": ""}) is None
+    assert extraction_latch_key({"version": "  ", "started_at": "   "}) is None
 
 
 # ── What fires the pass ──────────────────────────────────────────────────────

@@ -38,6 +38,12 @@ one that writes a table nobody declared.
 `users` row the loader has neither of. `public.app_config` holds the encrypted Discogs
 consumer key and secret, which is not a table to put coordination state in.
 
+**A message that names no extraction is refused rather than guessed at.** See
+`extraction_latch_key`: there is no key that tells two versionless dumps apart, so lumping
+them under one sentinel row would let the first stamp `refreshed_at` and every later one
+read as already refreshed and never fire. That is the silent skip this latch exists to
+prevent, so the signal is logged at ERROR and dropped instead.
+
 **Until the pin moves**, the relation is being declared by a `database-schema` chore and its
 name is not yet settled, so `LATCH_CANDIDATES` names both proposals and the probe takes the
 first that matches. The follow-up that repins to the revision declaring it should cut this
@@ -56,7 +62,6 @@ from psycopg import sql
 
 
 __all__ = [
-    "EXTRACTION_LATCH_UNKNOWN_VERSION",
     "LATCH_CANDIDATES",
     "LOADER_DISCRIMINATOR",
     "ExtractionLatch",
@@ -66,9 +71,6 @@ __all__ = [
     "probe_latch_relation",
     "record_extraction_signal",
 ]
-
-# `graphinator.EXTRACTION_LATCH_UNKNOWN_VERSION`, for a signal that names no extraction.
-EXTRACTION_LATCH_UNKNOWN_VERSION: Final = "unknown"
 
 # This loader's value for the `loader` column, when the declared relation carries one.
 LOADER_DISCRIMINATOR: Final = "discogs"
@@ -226,18 +228,24 @@ class ExtractionLatch:
         return sorted(set(data_types) - self.signals)
 
 
-def extraction_latch_key(data: dict[str, Any]) -> str:
-    """Return the extraction one `extraction_complete` message belongs to.
+def extraction_latch_key(data: dict[str, Any]) -> str | None:
+    """Return the extraction one `extraction_complete` message belongs to, or None.
 
     `version` is what the extractor stamps and what `graphinator` keys on. `started_at` is
-    the fallback rather than `unknown`, because two dumps that both omit a version would
-    otherwise share one latch row and the second would inherit the first's four signals.
+    the fallback, because two dumps that both omit a version would otherwise share one latch
+    row and the second would inherit the first's four signals.
+
+    A message carrying NEITHER names no extraction, and this returns None rather than a
+    sentinel. `graphinator` files those under the literal version `"unknown"`, and that is
+    the same bug one level down: every versionless dump lands on one row, the first one to
+    complete stamps `refreshed_at`, and every dump after it reads as already refreshed and
+    silently never fires. There is no key that can tell those dumps apart, so the honest
+    answer is to refuse — the caller records nothing, refreshes nothing, and says so loudly.
     """
     version = str(data.get("version") or "").strip()
     if version:
         return version
-    started_at = str(data.get("started_at") or "").strip()
-    return started_at or EXTRACTION_LATCH_UNKNOWN_VERSION
+    return str(data.get("started_at") or "").strip() or None
 
 
 def _match(columns: dict[str, tuple[str, str]], schema: str, table: str) -> LatchRelation | None:
