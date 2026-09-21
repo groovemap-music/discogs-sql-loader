@@ -522,7 +522,13 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
             reconciled = await reconcile_additive_edges(cursor, logger)
             counts = await refresh_counter_relations(cursor, logger)
             for function in PATH_REFRESH_FUNCTIONS:
+                function_started = time.perf_counter()
                 await cursor.execute(f"SELECT * FROM {GRAPH_SCHEMA}.{function}()")  # noqa: S608
+                logger.info(
+                    f"🧭 Refreshed graph.{function}",
+                    function=f"{GRAPH_SCHEMA}.{function}",
+                    duration_seconds=round(time.perf_counter() - function_started, 3),
+                )
             if latch is not None:
                 await mark_extraction_refreshed(cursor, latch, version)
 
