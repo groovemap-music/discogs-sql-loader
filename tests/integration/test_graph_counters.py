@@ -156,23 +156,22 @@ RELEASES = [
 #
 # `graph.part_of` is asserted only by a document carrying exactly one genre: R2 gives
 # (Fusion, Rock) and the master gives (Pop Rock, Rock). R1 has two genres and R3 has no
-# style, so neither contributes. That single-genre guard is where `style_count` and
-# `genre_count` part company with graphinator; see the divergence test at the foot of the
-# counter section.
+# style, so neither contributes. Counter parity is intentionally independent: genre/style
+# counts use release co-occurrence while `part_of` preserves its stricter taxonomy meaning.
 
 # (name, release_count, artist_count, label_count, style_count, first_year)
 #   Jazz  : R1 and R3 → 2 releases; artists {A1,A2,A4} plus {A3} = 4; labels {L1,L2} = 2;
-#           no single-genre document puts a style under Jazz → 0;
+#           Pop Rock co-occurs with Jazz on R1 → 1;
 #           years 1970 and (none) → 1970.
 #   Rock  : R1 and R2 → 2 releases; artists {A1,A2,A4} plus {A1} = 3; labels {L1} = 1;
 #           Fusion and Pop Rock sit under Rock → 2; years 1970 and 1965 → 1965.
-EXPECTED_GENRE_STATS = [("Jazz", 2, 4, 2, 0, 1970), ("Rock", 2, 3, 1, 2, 1965)]
+EXPECTED_GENRE_STATS = [("Jazz", 2, 4, 2, 1, 1970), ("Rock", 2, 3, 1, 2, 1965)]
 
 # (name, release_count, artist_count, label_count, genre_count, first_year)
 #   Fusion   : R2 → 1 release; artists {A1}; labels {L1}; one genre above it; 1965.
 #   Pop Rock : R1 → 1 release; artists {A1,A2,A4} = 3; labels {L1};
-#              one genre above it, from the master; 1970.
-EXPECTED_STYLE_STATS = [("Fusion", 1, 1, 1, 1, 1965), ("Pop Rock", 1, 3, 1, 1, 1970)]
+#              Rock and Jazz co-occur with it on R1; 1970.
+EXPECTED_STYLE_STATS = [("Fusion", 1, 1, 1, 1, 1965), ("Pop Rock", 1, 3, 1, 2, 1970)]
 
 # (label_id, release_count, artist_count, genre_count)
 #   L1 : R1 and R2. R1 alone joins three artists and two genres, so the join yields six
@@ -343,6 +342,77 @@ async def test_a_genre_no_release_names_gets_a_non_null_zero(counter_connection:
 
 
 @pytest.mark.asyncio
+async def test_counter_parity_covers_empty_labels_positive_years_zero_year_and_cooccurrence(
+    counter_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    """The refresh mirrors graphinator without broadening `part_of` taxonomy.
+
+    These deliberately bypass the importer normalizer to exercise the counter contract on
+    legacy/raw stored data. The normalizer's plausibility bounds are asserted separately.
+    """
+    empty_label_id = "9400001"
+    positive_year_release_id = "9400002"
+    zero_year_release_id = "9400003"
+    await _write_batch(
+        counter_connection,
+        "labels",
+        [(empty_label_id, {"id": empty_label_id, "name": "No Releases Label"})],
+    )
+    await _write_batch(
+        counter_connection,
+        "releases",
+        [
+            (
+                positive_year_release_id,
+                {
+                    "id": positive_year_release_id,
+                    "title": "Positive Three Digit Year",
+                    "year": "197",
+                    "genres": ["Counter Genre One", "Counter Genre Two"],
+                    "styles": ["Counter Style"],
+                },
+            ),
+            (
+                zero_year_release_id,
+                {
+                    "id": zero_year_release_id,
+                    "title": "Zero Year",
+                    "year": "0000",
+                    "genres": ["Zero Year Genre"],
+                },
+            ),
+        ],
+    )
+
+    await _refresh(counter_connection)
+
+    assert await _rows(
+        counter_connection,
+        "SELECT release_count, artist_count, genre_count FROM graph.label_stats WHERE label_id = %s",
+        (empty_label_id,),
+    ) == [(0, 0, 0)]
+    assert await _rows(
+        counter_connection,
+        "SELECT name, style_count, first_year FROM graph.genre_stats WHERE name IN ('Counter Genre One', 'Counter Genre Two') ORDER BY name",
+    ) == [("Counter Genre One", 1, 197), ("Counter Genre Two", 1, 197)]
+    assert await _rows(
+        counter_connection,
+        "SELECT genre_count, first_year FROM graph.style_stats WHERE name = 'Counter Style'",
+    ) == [(2, 197)]
+    assert await _rows(
+        counter_connection,
+        "SELECT first_year FROM graph.genre_stats WHERE name = 'Zero Year Genre'",
+    ) == [(None,)]
+    assert (
+        await _rows(
+            counter_connection,
+            "SELECT genre_name FROM graph.part_of WHERE style_name = 'Counter Style'",
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
 async def test_the_refresh_reports_the_rows_it_wrote(counter_connection: psycopg.AsyncConnection[Any]) -> None:
     await _load_catalog(counter_connection)
 
@@ -507,37 +577,22 @@ async def test_an_empty_entity_table_does_not_empty_the_relation(counter_connect
     assert await _rows(counter_connection, "SELECT member_artist_id, group_artist_id FROM graph.member_of") == [(A2, A1)]
 
 
-# ── The one divergence from graphinator ──────────────────────────────────────
+# ── Counter parity without weakening taxonomy ────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_style_and_genre_counts_follow_the_schema_not_the_cypher(refreshed: psycopg.AsyncConnection[Any]) -> None:
-    """`style_count` and `genre_count` count `graph.part_of`, which graphinator does not.
-
-    `genre_cypher` counts `count(DISTINCT s)` over `(g)<-[:IS]-(r:Release)-[:IS]->(s:Style)`,
-    every style CO-OCCURRING on the genre's releases. The schema body counts `graph.part_of`
-    rows instead, and a document asserts one only when it carries exactly one genre, because
-    with two nothing in it says which genre a style sits under.
-
-    The fixture's first release carries Rock, Jazz, and Pop Rock, so the two readings
-    disagree on exactly two numbers:
-
-    | counter | here | Neo4j |
-    | --- | --- | --- |
-    | Jazz `style_count` | 0 | 1, Pop Rock co-occurs on that release |
-    | Pop Rock `genre_count` | 1, from the master alone | 2, Rock and Jazz co-occur |
-
-    The body stays the schema's, which is the definition of record. This test exists so the
-    divergence is asserted rather than discovered by the parity harness.
-    """
+async def test_style_and_genre_counts_use_cooccurrence_while_part_of_keeps_taxonomy(
+    refreshed: psycopg.AsyncConnection[Any],
+) -> None:
+    """Counters mirror Neo4j while `part_of` retains the single-genre assertion rule."""
     part_of = await _rows(refreshed, "SELECT style_name, genre_name FROM graph.part_of ORDER BY style_name")
     jazz = await _rows(refreshed, "SELECT style_count FROM graph.genre_stats WHERE name = 'Jazz'")
     pop_rock = await _rows(refreshed, "SELECT genre_count FROM graph.style_stats WHERE name = 'Pop Rock'")
 
     # Only the master and the second release carry exactly one genre.
     assert part_of == [("Fusion", "Rock"), ("Pop Rock", "Rock")]
-    assert jazz == [(0,)]
-    assert pop_rock == [(1,)]
+    assert jazz == [(1,)]
+    assert pop_rock == [(2,)]
 
 
 # ── The extraction latch ─────────────────────────────────────────────────────

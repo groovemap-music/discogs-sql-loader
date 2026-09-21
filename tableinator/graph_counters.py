@@ -41,8 +41,8 @@ Where each counter comes from, and the function it mirrors:
 
 | relation | reference |
 | --- | --- |
-| `genre_stats` | `graphinator.compute_genre_style_stats`, its `genre_cypher`, except `style_count` |
-| `style_stats` | `graphinator.compute_genre_style_stats`, its `style_cypher`, except `genre_count` |
+| `genre_stats` | `graphinator.compute_genre_style_stats`, its `genre_cypher` |
+| `style_stats` | `graphinator.compute_genre_style_stats`, its `style_cypher` |
 | `label_stats` | `graphinator.compute_genre_style_stats`, its `label_cypher` |
 | `artist_degree` | no graphinator pass writes it; it is `COUNT { (a)--() }`, `rarity_queries._ARTIST_DEGREE_QUERY`, counted once instead of per request |
 | `release_degree_base` | the catalog half of `COUNT { (r)--() }`, `rarity_queries._DEGREE_QUERY` |
@@ -53,38 +53,24 @@ Three properties the schema reviews require, and where each one lives:
 - **Non-null zeros.** Every count column is `bigint NOT NULL DEFAULT 0` and every body
   produces a zero rather than a NULL where graphinator writes an explicit zero: the
   `genre_stats`/`style_stats` correlated subqueries are `count(...)`, which is 0 over no
-  rows, and `label_stats` LEFT JOINs so a label with no artists counts 0. A Genre no
-  release names still gets a row, with `release_count` 0, because the body drives off
-  `graph.genre`. `first_year` is the one nullable column and stays NULL when unknown —
-  `min(...)` over no qualifying release — matching `min(r.year)` over an empty match.
+  rows, and `label_stats` now drives from `graph.label` with the same shape, so labels with
+  no releases also get explicit zero rows. `first_year` is the one nullable column and
+  stays NULL when unknown — `min(...)` over no qualifying positive decimal year — matching
+  `min(r.year)` over an empty match.
 - **`release_degree_base` is the loader's half only.** `COUNT { (r)--() }` in Neo4j counts
   COLLECTED and WANTS, which `catalog-api` writes and this loader never sees. The body here
   unions only the eight catalog edge tables; `graph.release_degree` adds the live
   collection and wantlist counts on read.
-- **`label_stats.release_count` does not fan out.** It is `count(DISTINCT
-  on_label.release_id)` over a LEFT JOIN to `by_artist` and `in_genre`, so a release with
-  three artists and two genres counts once, as `count(DISTINCT r)` does in `label_cypher`.
-
-**One counter of the seven does not agree with graphinator, and the divergence is in the
-schema rather than in this module.** `genre_stats.style_count` and `style_stats.genre_count`
-count rows of `graph.part_of`, which a document asserts only when it carries EXACTLY ONE
-genre — with two, nothing in the document says which genre a style sits under, and that
-single-genre guard is the whole correctness argument for the relation. `genre_cypher` and
-`style_cypher` count something else: `count(DISTINCT s)` over
-`(g)<-[:IS]-(r:Release)-[:IS]->(s:Style)` is every style CO-OCCURRING on the genre's
-releases, whatever else those releases are tagged with. The two answers differ whenever a
-multi-genre release carries a style. In the fixture of
-`tests/integration/test_graph_counters.py` the first release carries Rock and Jazz and the
-style Pop Rock, so:
-
-| counter | this module | Neo4j |
-| --- | --- | --- |
-| Jazz `style_count` | 0, because no single-genre document puts a style under Jazz | 1, Pop Rock co-occurs on that release |
-| Pop Rock `genre_count` | 1, only the master puts Pop Rock under Rock | 2, Rock and Jazz co-occur on that release |
-
-The body stays identical to the schema's, which is the definition of record and the one the
-parity harness fills these relations with. This note is the citation, not a defect: the four
-other columns of both relations do mirror the Cypher named above.
+- **`label_stats.release_count` does not fan out.** Each aggregate is a correlated
+  `count(DISTINCT ...)` over one label's releases, so a release with three artists and two
+  genres counts once, as `count(DISTINCT r)` does in `label_cypher`.
+- **Genre/style counters use release co-occurrence, not taxonomy.** `style_count` and
+  `genre_count` join the normalized `in_genre` and `in_style` edges by release, matching
+  graphinator even when a release has several genres. `graph.part_of` deliberately keeps
+  its stricter single-genre taxonomy rule; the counter fix does not broaden that relation.
+- **Years mirror the Cypher predicate.** Any decimal value greater than zero participates
+  in `first_year`, including positive three-digit years; `0000` is rejected. Plausibility
+  bounds remain the importer's normalization responsibility rather than a counter rule.
 
 Two costs are stated rather than hidden. `TRUNCATE` takes ACCESS EXCLUSIVE, so a reader of
 one of these seven tables waits for the whole transaction; that is the schema's own choice
@@ -174,12 +160,16 @@ SELECT genre.name AS name,
           FROM graph.in_genre AS edge
           JOIN graph.on_label AS on_label ON on_label.release_id = edge.release_id
          WHERE edge.genre_name = genre.name) AS label_count,
-       (SELECT count(*) FROM graph.part_of AS part WHERE part.genre_name = genre.name) AS style_count,
-       (SELECT min(NULLIF(btrim(release.year), '')::integer)
+       (SELECT count(DISTINCT in_style.style_name)
+          FROM graph.in_genre AS in_genre
+          JOIN graph.in_style AS in_style ON in_style.release_id = in_genre.release_id
+         WHERE in_genre.genre_name = genre.name) AS style_count,
+       (SELECT min(btrim(release.year)::integer)
           FROM graph.in_genre AS edge
           JOIN graph.release AS release ON release.release_id = edge.release_id
          WHERE edge.genre_name = genre.name
-           AND btrim(release.year) ~ '^[0-9]{4}$') AS first_year
+           AND btrim(release.year) ~ '^[0-9]+$'
+           AND btrim(release.year)::numeric > 0) AS first_year
 FROM graph.genre AS genre
 """,
     "style_stats": """
@@ -193,23 +183,32 @@ SELECT style.name AS name,
           FROM graph.in_style AS edge
           JOIN graph.on_label AS on_label ON on_label.release_id = edge.release_id
          WHERE edge.style_name = style.name) AS label_count,
-       (SELECT count(*) FROM graph.part_of AS part WHERE part.style_name = style.name) AS genre_count,
-       (SELECT min(NULLIF(btrim(release.year), '')::integer)
+       (SELECT count(DISTINCT in_genre.genre_name)
+          FROM graph.in_style AS in_style
+          JOIN graph.in_genre AS in_genre ON in_genre.release_id = in_style.release_id
+         WHERE in_style.style_name = style.name) AS genre_count,
+       (SELECT min(btrim(release.year)::integer)
           FROM graph.in_style AS edge
           JOIN graph.release AS release ON release.release_id = edge.release_id
          WHERE edge.style_name = style.name
-           AND btrim(release.year) ~ '^[0-9]{4}$') AS first_year
+           AND btrim(release.year) ~ '^[0-9]+$'
+           AND btrim(release.year)::numeric > 0) AS first_year
 FROM graph.style AS style
 """,
     "label_stats": """
-SELECT on_label.label_id AS label_id,
-       count(DISTINCT on_label.release_id) AS release_count,
-       count(DISTINCT by_artist.artist_id) AS artist_count,
-       count(DISTINCT in_genre.genre_name) AS genre_count
-FROM graph.on_label AS on_label
-LEFT JOIN graph.by_artist AS by_artist ON by_artist.release_id = on_label.release_id
-LEFT JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
-GROUP BY on_label.label_id
+SELECT label.label_id AS label_id,
+       (SELECT count(DISTINCT on_label.release_id)
+          FROM graph.on_label AS on_label
+         WHERE on_label.label_id = label.label_id) AS release_count,
+       (SELECT count(DISTINCT by_artist.artist_id)
+          FROM graph.on_label AS on_label
+          JOIN graph.by_artist AS by_artist ON by_artist.release_id = on_label.release_id
+         WHERE on_label.label_id = label.label_id) AS artist_count,
+       (SELECT count(DISTINCT in_genre.genre_name)
+          FROM graph.on_label AS on_label
+          JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
+         WHERE on_label.label_id = label.label_id) AS genre_count
+FROM graph.label AS label
 """,
     "artist_degree": """
 SELECT endpoint.artist_id AS artist_id, count(*) AS degree
