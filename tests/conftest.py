@@ -172,6 +172,7 @@ def reset_service_state() -> Iterator[None]:
         service.durable_refresh_recovery_signals = set()
         service.durable_refresh_resume_types = set()
         service.durable_refresh_pause_lock = asyncio.Lock()
+        service.durable_refresh_broker_reset_pending = False
         service.durable_refresh_health = {"status": "starting"}
 
     reset()

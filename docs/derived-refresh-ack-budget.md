@@ -129,6 +129,10 @@ a periodic recovery probe retries the failed signal's database commit without
 consuming another delivery attempt, and only then resubscribes. The in-memory copy
 is a recovery hint, never the sole obligation or a reason to ack. This prevents a
 database outage from rapidly exhausting the quorum queue's delivery limit of 20.
+If broker cancellation cannot be confirmed, the service closes the delivery
+connection/channel to requeue its unsettled message once. Recovery remains paused
+until that close succeeds and the required consumers are actually resubscribed;
+a stale local consumer tag is never treated as proof of recovery.
 
 The durable producer accepts only real `YYYYMMDD` dump versions. The extractor's
 `started_at` can identify an attempt but cannot order source dumps; later arrival at

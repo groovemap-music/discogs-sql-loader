@@ -171,6 +171,7 @@ durable_refresh_paused = False
 durable_refresh_recovery_signals: set[tuple[str, str]] = set()
 durable_refresh_resume_types: set[str] = set()
 durable_refresh_pause_lock = asyncio.Lock()
+durable_refresh_broker_reset_pending = False
 # ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────────────────
 
 # Periodic queue checking settings
@@ -404,7 +405,7 @@ async def pause_durable_consumers(data_type: str, version: str) -> bool:
     Return false when broker cancellation is uncertain; the caller must leave its
     message unacked rather than risk a hot requeue.
     """
-    global durable_refresh_paused, durable_refresh_ready
+    global durable_refresh_paused, durable_refresh_ready, durable_refresh_broker_reset_pending
 
     async with durable_refresh_pause_lock:
         durable_refresh_paused = True
@@ -423,11 +424,50 @@ async def pause_durable_consumers(data_type: str, version: str) -> bool:
                 await queue.cancel(consumer_tag, nowait=False)
             except Exception as exc:
                 logger.error("❌ Durable consumer cancellation failed", data_type=type_name, error_type=type(exc).__name__)
+                durable_refresh_broker_reset_pending = True
+                await _reset_durable_broker()
                 return False
             consumer_tags.pop(type_name, None)
             telemetry.record_consumer_stopped()
         logger.error("❌ Durable terminal consumption paused until its database commit recovers", data_type=data_type, version=version)
         return True
+
+
+async def _reset_durable_broker() -> bool:
+    """Close the delivery channel so an unsettled terminal is broker-requeued.
+
+    An uncertain `basic.cancel` is not proof that the consumer stopped. Keep the
+    recovery gate closed until connection/channel closure is confirmed. Never
+    clear a stale tag merely because a database probe now succeeds.
+    """
+    global active_connection, active_channel, durable_refresh_broker_reset_pending
+
+    connection = active_connection
+    channel = active_channel
+    try:
+        if connection is not None:
+            await connection.close()
+            active_connection = None
+            active_channel = None
+        elif channel is not None:
+            await channel.close()
+            active_channel = None
+    except Exception as exc:
+        logger.error("❌ Could not close uncertain durable delivery channel", error_type=type(exc).__name__)
+        if channel is None:
+            return False
+        try:
+            await channel.close()
+        except Exception as channel_exc:
+            logger.error("❌ Durable channel close also failed", error_type=type(channel_exc).__name__)
+            return False
+        active_channel = None
+    for _ in range(len(consumer_tags)):
+        telemetry.record_consumer_stopped()
+    consumer_tags.clear()
+    durable_refresh_broker_reset_pending = False
+    logger.warning("⚠️ Closed durable delivery channel; broker will requeue unsettled terminals once")
+    return True
 
 
 async def attempt_durable_recovery() -> bool:
@@ -442,6 +482,8 @@ async def attempt_durable_recovery() -> bool:
     if not durable_refresh_active or shutdown_requested or connection_pool is None:
         return False
     async with durable_refresh_pause_lock:
+        if durable_refresh_broker_reset_pending and not await _reset_durable_broker():
+            return False
         if not await probe_durable_schema(connection_pool, logger):
             durable_refresh_ready = False
             durable_refresh_paused = True
@@ -474,6 +516,9 @@ async def attempt_durable_recovery() -> bool:
                         telemetry.record_consumer_started()
             else:
                 await _recover_consumers()
+            missing = durable_refresh_resume_types.difference(consumer_tags)
+            if missing:
+                raise RuntimeError(f"durable consumers did not resume: {sorted(missing)}")
         except Exception as exc:
             durable_refresh_paused = True
             durable_refresh_ready = False
@@ -1069,8 +1114,9 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 record_terminal("processed")
             else:
                 if durable_handoff_failed and not await pause_durable_consumers(data_type, ordered_version(data.get("version"))):
-                    # Cancellation was not confirmed. Keep this delivery unsettled;
-                    # closing the connection will requeue it once, without a loop.
+                    # Cancellation was not confirmed. Closing its channel
+                    # requeues once; if closure also failed, recovery keeps
+                    # trying while this delivery remains unsettled.
                     record_terminal("failed", "durable_consumer_pause_failed")
                     return
                 await message.nack(requeue=True)

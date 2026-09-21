@@ -170,20 +170,59 @@ async def test_missing_schema_keeps_startup_consumers_closed_until_probe_recover
 
 
 @pytest.mark.asyncio
-async def test_uncertain_broker_cancellation_leaves_failed_terminal_unacked() -> None:
+async def test_cancel_failure_forces_broker_reset_before_database_recovery() -> None:
     message = _terminal()
     queue = MagicMock()
     queue.cancel = AsyncMock(side_effect=RuntimeError("broker unavailable"))
     service.consumer_tags = {"artists": "original-tag"}
     service.queues = {"artists": queue}
+    connection = MagicMock()
+    connection.close = AsyncMock(side_effect=[RuntimeError("connection close failed"), None])
+    channel = MagicMock()
+    channel.close = AsyncMock(side_effect=RuntimeError("channel close failed"))
+    service.active_connection = connection
+    service.active_channel = channel
+    service.durable_refresh_worker_task = MagicMock()
+    committed = DurableSignal("20260920", 1, frozenset({"artists"}), False, False, False)
+    recorded = AsyncMock(side_effect=[RuntimeError("DB down"), committed, committed, committed])
+    reconnect_attempts = 0
+
+    async def reconnect() -> None:
+        nonlocal reconnect_attempts
+        reconnect_attempts += 1
+        if reconnect_attempts == 1:
+            return  # A stale tag must not make this a successful recovery.
+        service.active_connection = MagicMock()
+        service.active_channel = MagicMock()
+        service.consumer_tags["artists"] = "resumed-tag"
+
     with (
         patch.object(service, "durable_refresh_active", True),
         patch.object(service, "durable_refresh_ready", True),
         patch.object(service, "connection_pool", MagicMock()),
         patch.object(service, "purge_stale_rows", new=AsyncMock()),
-        patch.object(service, "record_durable_signal", new=AsyncMock(side_effect=RuntimeError("DB down"))),
+        patch.object(service, "record_durable_signal", new=recorded),
+        patch.object(service, "probe_durable_schema", new=AsyncMock(return_value=True)),
+        patch.object(service, "reconcile_legacy_latches", new=AsyncMock()),
+        patch.object(service, "read_refresh_health", new=AsyncMock(return_value={"status": "enabled"})),
+        patch.object(service, "_recover_consumers", new=AsyncMock(side_effect=reconnect)) as recover,
     ):
         await on_data_message(message, "artists")
+        assert service.durable_refresh_broker_reset_pending
+        assert service.consumer_tags == {"artists": "original-tag"}
+        assert service.durable_refresh_recovery_signals == {("artists", "20260920")}
+        assert not await service.attempt_durable_recovery()
+        assert service.durable_refresh_paused
+        assert service.durable_refresh_recovery_signals == {("artists", "20260920")}
+        assert await service.attempt_durable_recovery()
+        assert recover.await_count == 2
+        assert service.consumer_tags == {"artists": "resumed-tag"}
+        assert not service.durable_refresh_recovery_signals
+        replay = _terminal()
+        await on_data_message(replay, "artists")
+        replay.ack.assert_awaited_once()
     message.ack.assert_not_awaited()
     message.nack.assert_not_awaited()
-    assert service.durable_refresh_paused
+    assert connection.close.await_count == 2
+    assert channel.close.await_count == 1
+    assert not service.durable_refresh_paused
