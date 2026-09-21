@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from common import normalize_record
 from groovemap_schema.postgres import _COUNTER_BOOTSTRAP, _COUNTER_COLUMNS
 
 from tableinator.graph_counters import (
@@ -227,12 +228,19 @@ def test_release_degree_base_is_the_loaders_half_only() -> None:
 def test_label_stats_counts_a_release_once_however_it_fans_out() -> None:
     """A release with three artists and two genres is one release for its label.
 
-    `label_cypher` counts `count(DISTINCT r)`; the join to `by_artist` and `in_genre` here
-    multiplies rows, so only a DISTINCT keeps the two readings equal.
+    `label_cypher` counts `count(DISTINCT r)`; each correlated aggregate retains that rule.
     """
-    assert "count(DISTINCT on_label.release_id) AS release_count" in COUNTER_BODIES["label_stats"]
-    assert "LEFT JOIN graph.by_artist" in COUNTER_BODIES["label_stats"]
-    assert "LEFT JOIN graph.in_genre" in COUNTER_BODIES["label_stats"]
+    body = COUNTER_BODIES["label_stats"]
+    assert "count(DISTINCT on_label.release_id)" in body
+    assert "count(DISTINCT by_artist.artist_id)" in body
+    assert "count(DISTINCT in_genre.genre_name)" in body
+
+
+def test_label_stats_drives_from_every_label_including_one_without_releases() -> None:
+    body = COUNTER_BODIES["label_stats"]
+    assert "FROM graph.label AS label" in body
+    assert "WHERE on_label.label_id = label.label_id" in body
+    assert "GROUP BY on_label.label_id" not in body
 
 
 @pytest.mark.parametrize(("relation", "vertex"), [("genre_stats", "graph.genre"), ("style_stats", "graph.style")])
@@ -250,8 +258,28 @@ def test_a_vocabulary_row_no_release_names_still_gets_a_row(relation: str, verte
 @pytest.mark.parametrize("relation", ["genre_stats", "style_stats"])
 def test_first_year_stays_null_when_no_release_states_one(relation: str) -> None:
     """`min(r.year)` over an empty match is NULL in Cypher and `min(...)` is NULL here."""
-    assert "min(NULLIF(btrim(release.year), '')::integer)" in COUNTER_BODIES[relation]
-    assert "COALESCE" not in COUNTER_BODIES[relation]
+    body = COUNTER_BODIES[relation]
+    assert "min(btrim(release.year)::integer)" in body
+    assert "btrim(release.year) ~ '^[0-9]+$'" in body
+    assert "btrim(release.year)::numeric > 0" in body
+    assert "^[0-9]{4}$" not in body
+    assert "COALESCE" not in body
+
+
+def test_genre_and_style_counts_use_release_cooccurrence_not_part_of() -> None:
+    genre = COUNTER_BODIES["genre_stats"]
+    style = COUNTER_BODIES["style_stats"]
+    assert "count(DISTINCT in_style.style_name)" in genre
+    assert "JOIN graph.in_style AS in_style ON in_style.release_id = in_genre.release_id" in genre
+    assert "count(DISTINCT in_genre.genre_name)" in style
+    assert "JOIN graph.in_genre AS in_genre ON in_genre.release_id = in_style.release_id" in style
+    assert "graph.part_of" not in genre + style
+
+
+def test_importer_year_rules_remain_the_authoritative_plausibility_gate() -> None:
+    """Counter SQL mirrors Cypher; the importer still rejects implausible persisted years."""
+    assert normalize_record("masters", {"year": "197"})["year"] is None
+    assert normalize_record("releases", {"released": "0000-00-00"})["year"] is None
 
 
 # ── The statements ───────────────────────────────────────────────────────────
