@@ -122,8 +122,13 @@ This design is implemented by `tableinator/durable_refresh.py` against immutable
 defaults to `DERIVED_REFRESH_MODE=durable`; `DERIVED_REFRESH_MODE=inline` is an explicit
 rollback to the old commit-before-ack path while retaining the additive job relations.
 If the durable contract probe or legacy-latch reconciliation fails, the service reports
-degraded health and requeues terminal deliveries: it does not silently ack or fall back
-to an in-memory obligation. This is never a license to ack and `create_task`.
+degraded health and does not subscribe to the queues until recovery. If a terminal
+signal/job commit fails after subscription, it cancels every consumer with broker
+confirmation before nacking that delivery. The broker keeps the message queued;
+a periodic recovery probe retries the failed signal's database commit without
+consuming another delivery attempt, and only then resubscribes. The in-memory copy
+is a recovery hint, never the sole obligation or a reason to ack. This prevents a
+database outage from rapidly exhausting the quorum queue's delivery limit of 20.
 
 The durable producer accepts only real `YYYYMMDD` dump versions. The extractor's
 `started_at` can identify an attempt but cannot order source dumps; later arrival at

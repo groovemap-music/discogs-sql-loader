@@ -203,8 +203,11 @@ belongs to the separate `deployment` repository.
 - `unhealthy` with no consumers: inspect RabbitMQ connectivity and stuck-state logs.
 - Terminal delivery is requeued: the pending batch did not commit; inspect PostgreSQL
   availability before retrying.
-- Durable terminal delivery is requeued: inspect the schema probe and legacy-latch
-  reconciliation logs. Never force an ack while the job relation is unavailable.
+- Durable terminal delivery is requeued: consumers are paused first, so the queued
+  message cannot hot-loop through its 20-delivery limit. Inspect the schema probe,
+  legacy-latch reconciliation, and signal-commit logs. Recovery probes the failed
+  signal without another broker delivery and resubscribes after its commit succeeds.
+  Never force an ack while the job relation is unavailable.
 - `durable_derived_refresh.status=degraded`: inspect `phase`, `retry_due`,
   `lease_expiry`, and `last_sanitized_failure`; the scanner retries without a new
   broker message. A versionless/invalid terminal delivery is refused to the DLQ and

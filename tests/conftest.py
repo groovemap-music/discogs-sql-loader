@@ -1,5 +1,6 @@
 """Pytest configuration for tableinator tests."""
 
+import asyncio
 import uuid
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -166,6 +167,11 @@ def reset_service_state() -> Iterator[None]:
         service.durable_refresh_active = False
         service.durable_refresh_ready = False
         service.durable_refresh_worker_task = None
+        service.durable_refresh_recovery_task = None
+        service.durable_refresh_paused = False
+        service.durable_refresh_recovery_signals = set()
+        service.durable_refresh_resume_types = set()
+        service.durable_refresh_pause_lock = asyncio.Lock()
         service.durable_refresh_health = {"status": "starting"}
 
     reset()

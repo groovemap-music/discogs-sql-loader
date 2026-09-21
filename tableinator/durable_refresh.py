@@ -570,6 +570,9 @@ async def _sample_health_loop(connection_pool: Any, logger: Any, health: dict[st
             if scanner_error is not None:
                 snapshot["status"] = "degraded"
                 snapshot["scanner_error"] = scanner_error
+            if health.get("consumer_pause"):
+                snapshot["status"] = "degraded"
+                snapshot["consumer_pause"] = True
             health.clear()
             health.update(snapshot)
             telemetry.record_derived_refresh_health(health)
