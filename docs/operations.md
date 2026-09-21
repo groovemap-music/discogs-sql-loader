@@ -19,7 +19,10 @@ sequenceDiagram
     R->>L: terminal delivery
     L->>P: flush and guarded cleanup
     P-->>L: commit
+    L->>P: signal and pending job transaction
+    P-->>L: commit
     L-->>R: acknowledge terminal delivery
+    L->>P: scan, claim, refresh, fence, complete
 ```
 
 The input contract is `groovemap.catalog-events` version 1. The default Discogs
@@ -49,7 +52,7 @@ preferred for deployed containers.
 | `POSTGRES_PASSWORD` / `_FILE` | required | PostgreSQL password |
 | `POSTGRES_DATABASE` | required | PostgreSQL database |
 | `POSTGRES_POOL_MIN_SIZE` | `2` | Minimum open PostgreSQL connections |
-| `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum open PostgreSQL connections |
+| `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum open PostgreSQL connections; durable refresh requires at least `4` for the pass, heartbeat, health sampler, and delivery |
 | `RABBITMQ_HOST` | `rabbitmq` | RabbitMQ host |
 | `RABBITMQ_PORT` | `5672` | RabbitMQ AMQP port |
 | `RABBITMQ_USERNAME` / `_FILE` | deployment supplied | RabbitMQ user |
@@ -65,6 +68,7 @@ preferred for deployed containers.
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
 | `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |
+| `DERIVED_REFRESH_MODE` | `durable` | `inline` explicitly rolls back to commit-before-ack refresh; do not use for a full dump without an ack-budget certification |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry disabled) | Collector base URL, e.g. `http://otel-collector:4318`; shared by metrics and traces |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | falls back to the endpoint above | Metrics-only collector override |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | falls back to the endpoint above | Traces-only collector override |
@@ -101,6 +105,8 @@ Instruments recorded from the per-message handler and the batch processor:
 | `groovemap.pipeline.batch.size` | `store=postgresql`, `entity` |
 | `groovemap.pipeline.batch.flush.duration` | `store=postgresql`, `entity`, `outcome=success\|failed` |
 | `groovemap.pipeline.consumers.active` | `source=discogs` |
+| `groovemap.derived_refresh.jobs` / `.duration` | `loader=discogs`, `outcome=completed\|retry\|fenced` |
+| `groovemap.derived_refresh.pending.age` / `.attempts` / `.superseded` | `loader=discogs`, `phase` |
 
 `messaging.client.consumed.messages` and `messaging.client.operation.duration` are recorded
 locally with the same names and attributes the shared `groovemap-runtime` wrappers would emit,
@@ -168,6 +174,14 @@ The health server listens on port `8002`. Its JSON identifies the service as
 `discogs-sql-loader` and reports `starting`, `healthy`, or `unhealthy`, plus the current
 task, per-entity counts, active consumers, and completed files. Container logs are
 written through the shared structured-logging runtime under the same service name.
+With durable refresh enabled, `durable_derived_refresh` reports the current and latest
+completed versions, phase/duration, pending age, attempts, retry due, lease expiry,
+sanitized failure, and superseded count. Missing schema, stale pending or
+`waiting_for_signals` work (after 24 hours, allowing the four queues to drain), a retry,
+or an expired lease makes the health status
+`unhealthy`. The worker scans independently
+of RabbitMQ deliveries; acknowledging a terminal signal means its database job is
+durable, not that the refresh has already finished.
 
 ## Validation
 
@@ -189,5 +203,14 @@ belongs to the separate `deployment` repository.
 - `unhealthy` with no consumers: inspect RabbitMQ connectivity and stuck-state logs.
 - Terminal delivery is requeued: the pending batch did not commit; inspect PostgreSQL
   availability before retrying.
+- Durable terminal delivery is requeued: consumers are paused first, so the queued
+  message cannot hot-loop through its 20-delivery limit. Inspect the schema probe,
+  legacy-latch reconciliation, and signal-commit logs. Recovery probes the failed
+  signal without another broker delivery and resubscribes after its commit succeeds.
+  Never force an ack while the job relation is unavailable.
+- `durable_derived_refresh.status=degraded`: inspect `phase`, `retry_due`,
+  `lease_expiry`, and `last_sanitized_failure`; the scanner retries without a new
+  broker message. A versionless/invalid terminal delivery is refused to the DLQ and
+  recorded in `derived_relation_refresh_last_refused`.
 - Cleanup was refused: confirm whether the producer resumed an existing extraction or
   whether the source dump unexpectedly shrank before changing the safety threshold.

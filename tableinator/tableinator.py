@@ -42,6 +42,14 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
+from tableinator.durable_refresh import (
+    ordered_version,
+    probe_durable_schema,
+    read_refresh_health,
+    reconcile_legacy_latches,
+    record_durable_signal,
+    run_worker_loop,
+)
 from tableinator.extraction_latch import LatchRelation, extraction_latch_key, probe_latch_relation, record_extraction_signal
 from tableinator.graph_counters import refresh_derived_relations
 from tableinator.media import media_for_release
@@ -149,6 +157,21 @@ derived_relation_refresh_last_refused: dict[str, str] | None = None
 # re-running would be correct but would take ACCESS EXCLUSIVE on seven tables for a second
 # full sweep. The `refreshed_at` stamp the winner writes is what makes the loser a no-op.
 derived_refresh_lock = asyncio.Lock()
+# Production initializes these before subscribing to RabbitMQ. Keeping the direct-handler
+# default inline preserves the old path in unit tests and makes `DERIVED_REFRESH_MODE=inline`
+# a reversible deployment rollback while the additive schema objects remain in place.
+durable_refresh_active = False
+durable_refresh_ready = False
+durable_refresh_health: dict[str, Any] = {"status": "starting"}
+durable_refresh_worker_task: asyncio.Task[None] | None = None
+durable_refresh_recovery_task: asyncio.Task[None] | None = None
+durable_refresh_paused = False
+# The broker retains every nacked terminal delivery. These process-local copies are
+# only recovery probes: commit them before reopening consumption, never ack from them.
+durable_refresh_recovery_signals: set[tuple[str, str]] = set()
+durable_refresh_resume_types: set[str] = set()
+durable_refresh_pause_lock = asyncio.Lock()
+durable_refresh_broker_reset_pending = False
 # ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────────────────
 
 # Periodic queue checking settings
@@ -216,7 +239,7 @@ def get_health_data() -> dict[str, Any]:
             active_task = "Initializing PostgreSQL connection"
         else:
             status = "unhealthy"
-    elif is_stuck:
+    elif is_stuck or (durable_refresh_active and (not durable_refresh_ready or durable_refresh_health.get("status") == "degraded")):
         status = "unhealthy"
     else:
         status = "healthy"
@@ -231,7 +254,10 @@ def get_health_data() -> dict[str, Any]:
         "active_consumers": list(consumer_tags.keys()),
         "completed_files": list(completed_files),
         # A refresh that is silently not happening is the failure this field exists to surface.
-        "derived_relation_refresh": "enabled" if extraction_latch is not None else "degraded",
+        "derived_relation_refresh": ("degraded" if not durable_refresh_ready else str(durable_refresh_health.get("status", "starting")))
+        if durable_refresh_active
+        else ("enabled" if extraction_latch is not None else "degraded"),
+        "durable_derived_refresh": durable_refresh_health.copy() if durable_refresh_active else {"status": "inline"},
         # ... and this one surfaces the other shape of that failure: the latch is enabled and
         # a signal was still dropped, because it named no extraction to key on.
         "derived_relation_refresh_last_refused": derived_relation_refresh_last_refused,
@@ -371,6 +397,177 @@ async def cancel_all_consumers() -> None:
     logger.info("✅ Consumers cancelled for shutdown")
 
 
+async def pause_durable_consumers(data_type: str, version: str) -> bool:
+    """Close every delivery tap before requeueing a failed durable terminal.
+
+    A quorum queue counts every nack/redelivery. Leaving a subscriber in place
+    can spend its 20-delivery limit in seconds while PostgreSQL is unavailable.
+    Return false when broker cancellation is uncertain; the caller must leave its
+    message unacked rather than risk a hot requeue.
+    """
+    global durable_refresh_paused, durable_refresh_ready, durable_refresh_broker_reset_pending
+
+    async with durable_refresh_pause_lock:
+        durable_refresh_paused = True
+        durable_refresh_ready = False
+        durable_refresh_recovery_signals.add((data_type, version))
+        durable_refresh_resume_types.update(consumer_tags)
+        durable_refresh_health.update({"status": "degraded", "consumer_pause": True, "last_sanitized_failure": "signal_commit_failed"})
+        for type_name, consumer_tag in list(consumer_tags.items()):
+            queue = queues.get(type_name)
+            if queue is None:
+                logger.error("❌ Cannot confirm durable consumer cancellation", data_type=type_name)
+                durable_refresh_broker_reset_pending = True
+                await _reset_durable_broker()
+                return False
+            try:
+                # Wait for cancel-ok: `nowait=True` would allow an immediate nack
+                # to race a still-live subscriber on the same quorum queue.
+                await queue.cancel(consumer_tag, nowait=False)
+            except Exception as exc:
+                logger.error("❌ Durable consumer cancellation failed", data_type=type_name, error_type=type(exc).__name__)
+                durable_refresh_broker_reset_pending = True
+                await _reset_durable_broker()
+                return False
+            consumer_tags.pop(type_name, None)
+            telemetry.record_consumer_stopped()
+        logger.error("❌ Durable terminal consumption paused until its database commit recovers", data_type=data_type, version=version)
+        return True
+
+
+async def _reset_durable_broker() -> bool:
+    """Close the delivery channel so an unsettled terminal is broker-requeued.
+
+    An uncertain `basic.cancel` is not proof that the consumer stopped. Keep the
+    recovery gate closed until connection/channel closure is confirmed. Never
+    clear a stale tag merely because a database probe now succeeds.
+    """
+    global active_connection, active_channel, durable_refresh_broker_reset_pending
+
+    connection = active_connection
+    channel = active_channel
+    if connection is None and channel is None and consumer_tags:
+        logger.error("❌ Cannot confirm closure of a tagged durable consumer without its delivery channel")
+        return False
+    try:
+        if connection is not None:
+            await connection.close()
+            active_connection = None
+            active_channel = None
+        elif channel is not None:
+            await channel.close()
+            active_channel = None
+    except Exception as exc:
+        logger.error("❌ Could not close uncertain durable delivery channel", error_type=type(exc).__name__)
+        if channel is None:
+            return False
+        try:
+            await channel.close()
+        except Exception as channel_exc:
+            logger.error("❌ Durable channel close also failed", error_type=type(channel_exc).__name__)
+            return False
+        active_channel = None
+    for _ in range(len(consumer_tags)):
+        telemetry.record_consumer_stopped()
+    consumer_tags.clear()
+    durable_refresh_broker_reset_pending = False
+    logger.warning("⚠️ Closed durable delivery channel; broker will requeue unsettled terminals once")
+    return True
+
+
+async def attempt_durable_recovery() -> bool:
+    """Reopen delivery only after schema and every failed signal are committed.
+
+    Replaying a failed signal is idempotent with broker redelivery. If it still
+    cannot commit, leave the broker message queued with no active consumer and
+    retry the database probe later without consuming another delivery attempt.
+    """
+    global durable_refresh_paused, durable_refresh_ready, durable_refresh_worker_task, durable_refresh_broker_reset_pending
+
+    if not durable_refresh_active or shutdown_requested or connection_pool is None:
+        return False
+    async with durable_refresh_pause_lock:
+        if durable_refresh_broker_reset_pending and not await _reset_durable_broker():
+            return False
+        if not await probe_durable_schema(connection_pool, logger):
+            durable_refresh_ready = False
+            durable_refresh_paused = True
+            durable_refresh_health.update({"status": "degraded", "consumer_pause": True, "last_sanitized_failure": "schema_unavailable"})
+            return False
+        try:
+            await reconcile_legacy_latches(connection_pool, DATA_TYPES)
+            for data_type, version in sorted(durable_refresh_recovery_signals):
+                await record_durable_signal(connection_pool, version, data_type, DATA_TYPES)
+            snapshot = await read_refresh_health(connection_pool)
+        except Exception as exc:
+            durable_refresh_ready = False
+            durable_refresh_paused = True
+            durable_refresh_health.update({"status": "degraded", "consumer_pause": True, "last_sanitized_failure": type(exc).__name__})
+            logger.error("❌ Durable recovery probe failed; consumers remain paused", error_type=type(exc).__name__)
+            return False
+        durable_refresh_ready = True
+        durable_refresh_paused = False
+        durable_refresh_health.clear()
+        durable_refresh_health.update(snapshot)
+        if durable_refresh_worker_task is None:
+            durable_refresh_worker_task = asyncio.create_task(
+                run_worker_loop(connection_pool, logger, f"{SERVICE_NAME}-{os.getpid()}", durable_refresh_health)
+            )
+        try:
+            if active_connection is not None and active_channel is not None:
+                for type_name in sorted(durable_refresh_resume_types):
+                    if type_name not in consumer_tags and type_name in queues:
+                        consumer_tags[type_name] = await queues[type_name].consume(make_data_handler(type_name))
+                        telemetry.record_consumer_started()
+            else:
+                await _recover_consumers()
+            missing = durable_refresh_resume_types.difference(consumer_tags)
+            if missing:
+                raise RuntimeError(f"durable consumers did not resume: {sorted(missing)}")
+        except Exception as exc:
+            durable_refresh_paused = True
+            durable_refresh_ready = False
+            uncertain_cancellation = False
+            for type_name, consumer_tag in list(consumer_tags.items()):
+                queue = queues.get(type_name)
+                if queue is None:
+                    logger.error("❌ Missing queue for partial durable resubscription", data_type=type_name)
+                    uncertain_cancellation = True
+                    continue
+                try:
+                    await queue.cancel(consumer_tag, nowait=False)
+                except Exception as cancel_exc:
+                    logger.error("❌ Could not cancel partial durable resubscription", data_type=type_name, error_type=type(cancel_exc).__name__)
+                    uncertain_cancellation = True
+                    continue
+                consumer_tags.pop(type_name, None)
+                telemetry.record_consumer_stopped()
+            if uncertain_cancellation:
+                durable_refresh_broker_reset_pending = True
+                await _reset_durable_broker()
+            durable_refresh_health.update({"status": "degraded", "consumer_pause": True, "last_sanitized_failure": type(exc).__name__})
+            logger.error("❌ Durable consumer resubscription failed", error_type=type(exc).__name__)
+            return False
+        durable_refresh_recovery_signals.clear()
+        durable_refresh_resume_types.clear()
+        logger.info("✅ Durable terminal consumption resumed after database recovery")
+        return True
+
+
+async def durable_recovery_loop() -> None:
+    """Probe a paused handoff periodically without spending broker deliveries."""
+    while not shutdown_requested:
+        if durable_refresh_paused or not durable_refresh_ready:
+            try:
+                await attempt_durable_recovery()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                durable_refresh_health.update({"status": "degraded", "last_sanitized_failure": type(exc).__name__})
+                logger.error("❌ Durable recovery loop failed", error_type=type(exc).__name__)
+        await asyncio.sleep(15)
+
+
 async def close_rabbitmq_connection() -> None:
     """Close the RabbitMQ connection and channel when all consumers are idle."""
     global active_connection, active_channel
@@ -439,6 +636,8 @@ async def periodic_queue_checker() -> None:
     while not shutdown_requested:
         try:
             await asyncio.sleep(STUCK_CHECK_INTERVAL)
+            if durable_refresh_active and (durable_refresh_paused or not durable_refresh_ready):
+                continue
 
             current_time = time.time()
 
@@ -482,6 +681,9 @@ async def _recover_consumers() -> None:
     - Emergency recovery after unexpected consumer death
     """
     global active_connection, active_channel, queues, idle_mode
+
+    if durable_refresh_active and (durable_refresh_paused or not durable_refresh_ready):
+        return
 
     # Close any existing broken connection first
     if active_connection:
@@ -764,6 +966,20 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 record_terminal("failed", "flush_incomplete")
                 return
 
+            if durable_refresh_active:
+                try:
+                    ordered_version(data.get("version"))
+                except ValueError:
+                    derived_relation_refresh_last_refused = {
+                        "at": datetime.now(UTC).isoformat(),
+                        "data_type": data_type,
+                        "reason": "durable extraction_complete lacks a valid ordered YYYYMMDD version",
+                    }
+                    logger.error("❌ Refusing versionless or unordered terminal extraction signal", data_type=data_type)
+                    await message.nack(requeue=False)
+                    record_terminal("failed", "invalid_extraction_version")
+                    return
+
             # Purge stale rows from prior extractions. Skip entirely if any message
             # for this data_type was nacked to the DLQ this run (poison batch,
             # flush-retry exhaustion, or normalize/missing-id failure): a DLQ'd
@@ -794,16 +1010,38 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     )
                     purge_ok = False
 
-            # ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────
-            # Beside the purge, on the same latch, and only once every type has
-            # signalled. The pass reconciles `member_of` and `same_as` against the
-            # documents present now and recomputes the seven counter relations from
-            # the edge tables, in one transaction. It runs AFTER the purge, so the
-            # rows a shrunk dump removed are already gone from the edge tables the
-            # counters sum; a failure nacks this delivery exactly as a failed purge
-            # does, and the whole pass is idempotent so the retry re-runs it safely.
+            # Record the terminal signal only after this type's purge. Durable mode
+            # commits the fourth signal and a scheduled job before ack; its worker
+            # then runs the entire derived pass in a separate fenced transaction.
+            # Explicit inline rollback still runs that pass before ack and nacks on
+            # failure. Both paths use the same latch and refresh implementation.
             refresh_ok = True
-            if purge_ok and connection_pool is not None and extraction_latch is None:
+            durable_handoff_failed = False
+            if purge_ok and durable_refresh_active:
+                if connection_pool is None or not durable_refresh_ready:
+                    logger.error("❌ Durable refresh schema unavailable — requeueing terminal signal", data_type=data_type)
+                    refresh_ok = False
+                    durable_handoff_failed = True
+                else:
+                    try:
+                        durable = await record_durable_signal(connection_pool, data.get("version"), data_type, DATA_TYPES)
+                        logger.info(
+                            "✅ Derived-refresh signal durably committed before acknowledgement",
+                            version=durable.version,
+                            generation=durable.generation,
+                            scheduled=durable.scheduled,
+                            superseded=durable.superseded,
+                            received=sorted(durable.signals),
+                        )
+                    except Exception as refresh_exc:
+                        logger.error(
+                            "❌ Durable signal/job commit failed — requeueing terminal signal",
+                            data_type=data_type,
+                            error_type=type(refresh_exc).__name__,
+                        )
+                        refresh_ok = False
+                        durable_handoff_failed = True
+            elif purge_ok and connection_pool is not None and extraction_latch is None:
                 logger.warning(
                     "⚠️ Skipping the derived-relation refresh — no extraction latch relation is declared",
                     data_type=data_type,
@@ -886,6 +1124,12 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 await message.ack()
                 record_terminal("processed")
             else:
+                if durable_handoff_failed and not await pause_durable_consumers(data_type, ordered_version(data.get("version"))):
+                    # Cancellation was not confirmed. Closing its channel
+                    # requeues once; if closure also failed, recovery keeps
+                    # trying while this delivery remains unsettled.
+                    record_terminal("failed", "durable_consumer_pause_failed")
+                    return
                 await message.nack(requeue=True)
                 record_terminal("failed", "purge_failed" if not purge_ok else "refresh_failed")
             return
@@ -1136,7 +1380,12 @@ async def main() -> None:
         active_channel, \
         connection_check_task, \
         batch_processor, \
-        extraction_latch
+        extraction_latch, \
+        durable_refresh_active, \
+        durable_refresh_ready, \
+        durable_refresh_worker_task, \
+        durable_refresh_recovery_task, \
+        durable_refresh_paused
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -1171,6 +1420,12 @@ async def main() -> None:
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         return
+    if os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline" and config.postgres_pool_max_size < 4:
+        logger.error(
+            "❌ Durable refresh needs at least four PostgreSQL pool connections (refresh transaction, lease heartbeat, health sampler, and delivery)",
+            configured_max=config.postgres_pool_max_size,
+        )
+        return
 
     # Parse host and port from address (POSTGRES_HOST may embed a port, e.g. a pooler)
     host, port = parse_postgres_host_port(config.postgres_host)
@@ -1201,6 +1456,24 @@ async def main() -> None:
         # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
         # read-only. A miss is a logged degraded mode, never a reason to create the table.
         extraction_latch = await probe_latch_relation(connection_pool, logger)
+        durable_refresh_active = os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline"
+        if durable_refresh_active:
+            durable_refresh_ready = await probe_durable_schema(connection_pool, logger)
+            if durable_refresh_ready:
+                try:
+                    await reconcile_legacy_latches(connection_pool, DATA_TYPES)
+                    durable_refresh_health.clear()
+                    durable_refresh_health.update(await read_refresh_health(connection_pool))
+                except Exception as exc:
+                    durable_refresh_ready = False
+                    durable_refresh_health.clear()
+                    durable_refresh_health.update({"status": "degraded", "last_sanitized_failure": type(exc).__name__})
+                    logger.error("❌ Legacy latch reconciliation failed; terminal deliveries will requeue", error_type=type(exc).__name__)
+            if not durable_refresh_ready:
+                durable_refresh_paused = True
+                durable_refresh_resume_types.update(DATA_TYPES)
+                durable_refresh_health.clear()
+                durable_refresh_health.update({"status": "degraded", "last_sanitized_failure": "schema_unavailable"})
         logger.info(
             "✅ Async connection pool initialized (min: %d, max: %d connections)",
             config.postgres_pool_min_size,
@@ -1273,6 +1546,10 @@ async def main() -> None:
         return
 
     async with amqp_connection:
+        if durable_refresh_active and durable_refresh_ready:
+            durable_refresh_worker_task = asyncio.create_task(
+                run_worker_loop(connection_pool, logger, f"{SERVICE_NAME}-{os.getpid()}", durable_refresh_health)
+            )
         channel = await amqp_connection.channel()
         active_channel = channel
 
@@ -1327,11 +1604,15 @@ async def main() -> None:
             await queue.bind(exchange)
             queues[data_type] = queue
 
-        # Start consumers for all data types
-        for data_type in DATA_TYPES:
-            handler = make_data_handler(data_type)
-            consumer_tags[data_type] = await queues[data_type].consume(handler)
-            telemetry.record_consumer_started()
+        # Missing durable schema is a hard subscription gate. Merely requeueing
+        # terminal deliveries while subscribed burns the quorum delivery limit.
+        if not durable_refresh_active or durable_refresh_ready:
+            for data_type in DATA_TYPES:
+                handler = make_data_handler(data_type)
+                consumer_tags[data_type] = await queues[data_type].consume(handler)
+                telemetry.record_consumer_started()
+        if durable_refresh_active:
+            durable_refresh_recovery_task = asyncio.create_task(durable_recovery_loop())
 
         logger.info(
             f"🚀 {SERVICE_NAME} started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
@@ -1367,6 +1648,18 @@ async def main() -> None:
             # below: a still-subscribed consumer keeps being handed messages it
             # can only leave unacked (discogsography-lnn4).
             await cancel_all_consumers()
+
+            if durable_refresh_recovery_task is not None:
+                durable_refresh_recovery_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await durable_refresh_recovery_task
+                durable_refresh_recovery_task = None
+
+            if durable_refresh_worker_task is not None:
+                durable_refresh_worker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await durable_refresh_worker_task
+                durable_refresh_worker_task = None
 
             # Cancel progress reporting
             progress_task.cancel()

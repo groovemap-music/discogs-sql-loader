@@ -117,7 +117,46 @@ deployment profile, repeatedly, before anyone chooses inline semantics.
 
 ## Durable handoff required before removing inline work
 
-This is a follow-up implementation design, not a license to ack and `create_task`.
+This design is implemented by `tableinator/durable_refresh.py` against immutable
+`database-schema` pin `96da0291ccb30a86af94d0ee8dcf959bd47ada6b`. Production now
+defaults to `DERIVED_REFRESH_MODE=durable`; `DERIVED_REFRESH_MODE=inline` is an explicit
+rollback to the old commit-before-ack path while retaining the additive job relations.
+If the durable contract probe or legacy-latch reconciliation fails, the service reports
+degraded health and does not subscribe to the queues until recovery. If a terminal
+signal/job commit fails after subscription, it cancels every consumer with broker
+confirmation before nacking that delivery. The broker keeps the message queued;
+a periodic recovery probe retries the failed signal's database commit without
+consuming another delivery attempt, and only then resubscribes. The in-memory copy
+is a recovery hint, never the sole obligation or a reason to ack. This prevents a
+database outage from rapidly exhausting the quorum queue's delivery limit of 20.
+If broker cancellation cannot be confirmed (including a missing queue mapping or
+failed rollback of a partial resubscription), the service closes the delivery
+connection/channel to requeue unsettled messages once. Recovery remains paused
+until that close succeeds and the required consumers are actually resubscribed;
+a stale local consumer tag is never treated as proof of recovery.
+
+The durable producer accepts only real `YYYYMMDD` dump versions. The extractor's
+`started_at` can identify an attempt but cannot order source dumps; later arrival at
+this consumer is not evidence of a newer extraction. The first accepted signal locks
+the loader cursor and assigns a generation. Startup reconciles complete legacy
+NULL-generation latches into jobs without requiring a fresh RabbitMQ delivery, while
+an older legacy latch is fenced by a newer accepted source version. A fourth signal
+and pending job commit before ack. Duplicate redelivery keeps the same job. The
+worker scans at startup and every 15 seconds, claims under the cursor lock, waits on
+a per-loader transaction advisory lock for the full pass, heartbeats its token/epoch
+lease, and rechecks both cursor and lease under lock just before the atomic commit.
+Expired leases enter bounded retry with a health-visible failure and an alert log.
+
+The `/health` payload's `durable_derived_refresh` object exposes current and last
+completed versions, phase/duration, pending age, attempts, retry due, lease expiry,
+sanitized failure, and superseded count. A stale pending, retrying, or expired leased
+job degrades readiness. Low-cardinality OpenTelemetry measurements mirror worker
+transitions, duration, pending age, attempts, and superseded count. Versionless or
+unordered terminal deliveries are refused to the dead-letter exchange and recorded
+in `derived_relation_refresh_last_refused`; they are never marked completed.
+
+The original design requirements follow for audit:
+
 `public.loader_extraction_latch` already durably records the four signals and stamps
 `refreshed_at` only in the refresh transaction. The handoff should build a persistent
 job state on that schema-owned latch (or a schema-owned job relation keyed by
@@ -149,8 +188,9 @@ last sanitized failure, and timestamps. No loader issues DDL. Required invariant
    have been acked. Refuse or dead-letter versionless terminal messages with an
    explicit alert; do not report them completed.
 
-The follow-up needs crash injection at every boundary (pre-commit, post-commit /
+The implementation's tests inject failure at every boundary (pre-commit, post-commit /
 pre-ack, mid-refresh, post-refresh/pre-stamp, lease expiry), duplicate delivery,
 two workers, a later extraction, restart with no new messages, schema absence,
-and a slow refresh over 1,800 s. Until those gates pass, **retain the current inline,
-commit-before-ack behavior** and treat a real full dump as at risk of broker timeout.
+and a simulated slow refresh over 1,800 s. For rollback, the current inline,
+commit-before-ack behavior remains available by explicit mode selection, but a real
+full dump still cannot be certified under the broker timeout in that mode.

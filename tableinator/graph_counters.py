@@ -35,7 +35,8 @@ documented refresh contract assigns both path relations to this completed-extrac
 **4. The path degree refresh.** `graph.refresh_vertex_degree()` must run after the MEMBER_OF
 refresh because that union is one of the ten relations it sums. The extraction latch is
 stamped only after both functions succeed, on the same transaction as the reconciliation
-and counters, so any failure rolls the entire pass back and a redelivery retries it.
+and counters, so any failure rolls the entire pass back. Inline mode nacks the delivery;
+the durable worker instead retains a retryable job.
 
 Where each counter comes from, and the function it mirrors:
 
@@ -77,17 +78,19 @@ one of these seven tables waits for the whole transaction; that is the schema's 
 in `graph.bootstrap_fill` and for the same reason — `ON CONFLICT DO NOTHING` converges
 upward only, so a row the documents no longer justify would survive every re-run.
 
-**And the whole pass runs inline on the still-unacked `extraction_complete` delivery**,
-beside the stale-row purge, so a dump-scale pass spends that delivery's ack budget.
+Historically the whole pass ran inline on the still-unacked `extraction_complete`
+delivery, beside the stale-row purge, so a dump-scale pass spent that delivery's
+ack budget. The default durable path now schedules it transactionally before ack
+and supplies the commit fence through `before_refresh`/`before_commit` below;
+`DERIVED_REFRESH_MODE=inline` retains the old rollback behavior.
 `graphinator` acks the trigger BEFORE its own post-import maintenance starts and runs it
 detached with its own retry, because holding the delivery across unbounded work trips
 RabbitMQ's 30-minute consumer ack timeout, which closes the SHARED channel with
 PRECONDITION_FAILED: all four consumers die, the signal is redelivered, the sweep restarts
 from scratch, and after `x-delivery-limit=20` redeliveries the trigger is dead-lettered and
-maintenance never completes at all (discogsography-zjja). The durable latch in
-`tableinator.extraction_latch` is what makes detaching possible here without losing the
-trigger, since the coordination state no longer lives in the delivery. Doing it is a
-follow-on bead, and wants a measurement of a full dump first.
+maintenance never completes at all (discogsography-zjja). The latch and schema-owned
+job in `tableinator.durable_refresh` make the worker restart-safe; the measurement
+and cutover gates are in `docs/derived-refresh-ack-budget.md`.
 """
 
 from __future__ import annotations
@@ -102,7 +105,7 @@ from tableinator.graph_derivation import EDGE_COLUMNS, derive_document
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
 
 __all__ = [
@@ -491,7 +494,15 @@ async def refresh_counter_relations(cursor: Any, logger: Any) -> dict[str, int]:
     return counts
 
 
-async def refresh_derived_relations(connection_pool: Any, logger: Any, version: str, latch: LatchRelation | None = None) -> dict[str, int]:
+async def refresh_derived_relations(
+    connection_pool: Any,
+    logger: Any,
+    version: str,
+    latch: LatchRelation | None = None,
+    *,
+    before_refresh: Callable[[Any], Awaitable[None]] | None = None,
+    before_commit: Callable[[Any], Awaitable[None]] | None = None,
+) -> dict[str, int]:
     """Reconcile edges and recompute counters and path relations, in one transaction.
 
     One transaction for every step, because `artist_degree` sums `member_of` and
@@ -508,6 +519,10 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
         version: The extraction this pass is running for, from `extraction_latch_key`.
         latch: The declared latch relation to stamp, or None for a caller driving the pass
             directly rather than off a signal.
+        before_refresh: Optional transaction-scoped serialization and early fence for a
+            durable worker. Runs before any relation is changed.
+        before_commit: Optional final fence and atomic job/latch completion. Runs after
+            every relation refresh but before this transaction commits.
 
     Returns:
         The row count written per counter relation.
@@ -519,6 +534,8 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
         # would commit on its own and a failure mid-pass would leave counter tables empty.
         await conn.set_autocommit(False)
         async with conn.transaction(), conn.cursor() as cursor:
+            if before_refresh is not None:
+                await before_refresh(cursor)
             reconciled = await reconcile_additive_edges(cursor, logger)
             counts = await refresh_counter_relations(cursor, logger)
             for function in PATH_REFRESH_FUNCTIONS:
@@ -529,6 +546,8 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
                     function=f"{GRAPH_SCHEMA}.{function}",
                     duration_seconds=round(time.perf_counter() - function_started, 3),
                 )
+            if before_commit is not None:
+                await before_commit(cursor)
             if latch is not None:
                 await mark_extraction_refreshed(cursor, latch, version)
 

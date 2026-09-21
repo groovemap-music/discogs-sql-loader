@@ -20,6 +20,7 @@
   "extraction_latch": {
     "columns": {
       "loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+      "loader_extraction_latch.generation": "BIGINT NULL (legacy rows retain NULL until the loader cutover)",
       "loader_extraction_latch.loader": "TEXT NOT NULL",
       "loader_extraction_latch.refreshed_at": "TIMESTAMPTZ",
       "loader_extraction_latch.signals": "TEXT[] NOT NULL DEFAULT '{}'",
@@ -49,6 +50,35 @@
     "schema": "public",
     "shape": "table",
     "storage_only": true
+  },
+  "derived_refresh_job": {
+    "availability": "unconditional on PostgreSQL 18 and 19",
+    "consumers": [
+      "discogs-sql-loader",
+      "musicbrainz-sql-loader"
+    ],
+    "cursor": {
+      "relation": "public.loader_derived_refresh_cursor",
+      "primary_key": ["loader"],
+      "columns": ["generation", "version", "created_at", "updated_at"],
+      "meaning": "The latest accepted extraction for each loader. Serialize first-signal generation assignment with SELECT FOR UPDATE on this row. A worker locks it again just before commit and may publish only if its generation and version are still current."
+    },
+    "job": {
+      "relation": "public.loader_derived_refresh_job",
+      "primary_key": ["loader", "version"],
+      "unique_generation": ["loader", "generation"],
+      "latch_foreign_key": ["loader", "version", "generation"],
+      "states": ["pending", "leased", "retry", "completed", "superseded"],
+      "columns": ["attempt_count", "next_attempt_at", "lease_owner", "lease_token", "lease_epoch", "lease_expires_at", "last_error", "created_at", "updated_at", "started_at", "completed_at", "superseded_at"],
+      "claim_index": "(next_attempt_at, loader, generation) WHERE state IN ('pending', 'retry')",
+      "expiry_index": "(lease_expires_at, loader, generation) WHERE state = 'leased'"
+    },
+    "kind": "additive",
+    "introduced_in_contract_version": 1,
+    "owner": "database-schema declares DDL; each loader owns only its discriminator's rows",
+    "semantics": "The future loader commits the final signal and pending job before acknowledging its delivery. It scans due and expired jobs at startup and periodically, claims transactionally with row locking, and fences on both lease token/epoch and the per-loader cursor at the refresh transaction's commit. Refresh, latch stamp, and completed state commit atomically. A failure rolls back or schedules bounded retry; a superseded generation cannot stamp refreshed_at. No delivery may be acknowledged while its sole refresh obligation is in process memory.",
+    "rollout": "Schema first. Existing latch rows have NULL generation and remain readable by the current inline writer; the loader cutover must reconcile any unfinished legacy latch before acknowledging a terminal signal under the new protocol. Neither relation schedules work until a loader adopts it. Reverting the loader to inline behavior is safe while retaining these additive objects.",
+    "failure_visibility": "The loader must expose pending age, current and last completed versions, attempt count, lease expiry, retry due, sanitized last failure, and superseded count; the schema stores these facts but does not report health itself."
   },
   "graph_schema": {
     "availability": "unconditional",

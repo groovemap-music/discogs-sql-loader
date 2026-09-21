@@ -42,6 +42,10 @@ coverage: test
 test-integration:
     bash scripts/test-integration.sh
 
+# Advisory SQL/PGQ tier on the immutable PostgreSQL 19 Beta 3 image.
+test-integration-pg19:
+    POSTGRES_INTEGRATION_IMAGE=postgres:19beta3-alpine@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc bash scripts/test-integration.sh
+
 # Cross-store parity against discogs-graph-enricher: the same fixture events into this
 # loader's PostgreSQL and the enricher's Neo4j, then a per-label comparison of the two
 # graphs. Starts both pinned containers and removes them, and their anonymous volumes,
