@@ -238,7 +238,9 @@ async def _truncate(connection: psycopg.AsyncConnection[Any]) -> None:
     # Emptied, never dropped: the latch relation belongs to the promoted schema now, and the
     # session applies that schema once. Dropping it here would take it away from every test
     # that ran after this one.
-    await connection.execute("TRUNCATE {}.{}".format(*LATCH_RELATION))
+    # The promoted durable job now has a composite FK to the latch, so both
+    # relations must be truncated in one statement even when the job is empty.
+    await connection.execute("TRUNCATE public.loader_derived_refresh_job, {}.{}".format(*LATCH_RELATION))
 
 
 async def _write_batch(connection: psycopg.AsyncConnection[Any], data_type: str, documents: Any, suffix: str = "v1") -> None:

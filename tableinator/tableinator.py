@@ -42,6 +42,14 @@ from tableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from tableinator.config import TableinatorConfig
+from tableinator.durable_refresh import (
+    ordered_version,
+    probe_durable_schema,
+    read_refresh_health,
+    reconcile_legacy_latches,
+    record_durable_signal,
+    run_worker_loop,
+)
 from tableinator.extraction_latch import LatchRelation, extraction_latch_key, probe_latch_relation, record_extraction_signal
 from tableinator.graph_counters import refresh_derived_relations
 from tableinator.media import media_for_release
@@ -149,6 +157,13 @@ derived_relation_refresh_last_refused: dict[str, str] | None = None
 # re-running would be correct but would take ACCESS EXCLUSIVE on seven tables for a second
 # full sweep. The `refreshed_at` stamp the winner writes is what makes the loser a no-op.
 derived_refresh_lock = asyncio.Lock()
+# Production initializes these before subscribing to RabbitMQ. Keeping the direct-handler
+# default inline preserves the old path in unit tests and makes `DERIVED_REFRESH_MODE=inline`
+# a reversible deployment rollback while the additive schema objects remain in place.
+durable_refresh_active = False
+durable_refresh_ready = False
+durable_refresh_health: dict[str, Any] = {"status": "starting"}
+durable_refresh_worker_task: asyncio.Task[None] | None = None
 # ── end gm-discogs-sql-loader-2eg.3 ──────────────────────────────────────────
 
 # Periodic queue checking settings
@@ -216,7 +231,7 @@ def get_health_data() -> dict[str, Any]:
             active_task = "Initializing PostgreSQL connection"
         else:
             status = "unhealthy"
-    elif is_stuck:
+    elif is_stuck or (durable_refresh_active and (not durable_refresh_ready or durable_refresh_health.get("status") == "degraded")):
         status = "unhealthy"
     else:
         status = "healthy"
@@ -231,7 +246,10 @@ def get_health_data() -> dict[str, Any]:
         "active_consumers": list(consumer_tags.keys()),
         "completed_files": list(completed_files),
         # A refresh that is silently not happening is the failure this field exists to surface.
-        "derived_relation_refresh": "enabled" if extraction_latch is not None else "degraded",
+        "derived_relation_refresh": ("degraded" if not durable_refresh_ready else str(durable_refresh_health.get("status", "starting")))
+        if durable_refresh_active
+        else ("enabled" if extraction_latch is not None else "degraded"),
+        "durable_derived_refresh": durable_refresh_health.copy() if durable_refresh_active else {"status": "inline"},
         # ... and this one surfaces the other shape of that failure: the latch is enabled and
         # a signal was still dropped, because it named no extraction to key on.
         "derived_relation_refresh_last_refused": derived_relation_refresh_last_refused,
@@ -764,6 +782,20 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 record_terminal("failed", "flush_incomplete")
                 return
 
+            if durable_refresh_active:
+                try:
+                    ordered_version(data.get("version"))
+                except ValueError:
+                    derived_relation_refresh_last_refused = {
+                        "at": datetime.now(UTC).isoformat(),
+                        "data_type": data_type,
+                        "reason": "durable extraction_complete lacks a valid ordered YYYYMMDD version",
+                    }
+                    logger.error("❌ Refusing versionless or unordered terminal extraction signal", data_type=data_type)
+                    await message.nack(requeue=False)
+                    record_terminal("failed", "invalid_extraction_version")
+                    return
+
             # Purge stale rows from prior extractions. Skip entirely if any message
             # for this data_type was nacked to the DLQ this run (poison batch,
             # flush-retry exhaustion, or normalize/missing-id failure): a DLQ'd
@@ -794,16 +826,35 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     )
                     purge_ok = False
 
-            # ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────
-            # Beside the purge, on the same latch, and only once every type has
-            # signalled. The pass reconciles `member_of` and `same_as` against the
-            # documents present now and recomputes the seven counter relations from
-            # the edge tables, in one transaction. It runs AFTER the purge, so the
-            # rows a shrunk dump removed are already gone from the edge tables the
-            # counters sum; a failure nacks this delivery exactly as a failed purge
-            # does, and the whole pass is idempotent so the retry re-runs it safely.
+            # Record the terminal signal only after this type's purge. Durable mode
+            # commits the fourth signal and a scheduled job before ack; its worker
+            # then runs the entire derived pass in a separate fenced transaction.
+            # Explicit inline rollback still runs that pass before ack and nacks on
+            # failure. Both paths use the same latch and refresh implementation.
             refresh_ok = True
-            if purge_ok and connection_pool is not None and extraction_latch is None:
+            if purge_ok and durable_refresh_active:
+                if connection_pool is None or not durable_refresh_ready:
+                    logger.error("❌ Durable refresh schema unavailable — requeueing terminal signal", data_type=data_type)
+                    refresh_ok = False
+                else:
+                    try:
+                        durable = await record_durable_signal(connection_pool, data.get("version"), data_type, DATA_TYPES)
+                        logger.info(
+                            "✅ Derived-refresh signal durably committed before acknowledgement",
+                            version=durable.version,
+                            generation=durable.generation,
+                            scheduled=durable.scheduled,
+                            superseded=durable.superseded,
+                            received=sorted(durable.signals),
+                        )
+                    except Exception as refresh_exc:
+                        logger.error(
+                            "❌ Durable signal/job commit failed — requeueing terminal signal",
+                            data_type=data_type,
+                            error_type=type(refresh_exc).__name__,
+                        )
+                        refresh_ok = False
+            elif purge_ok and connection_pool is not None and extraction_latch is None:
                 logger.warning(
                     "⚠️ Skipping the derived-relation refresh — no extraction latch relation is declared",
                     data_type=data_type,
@@ -1136,7 +1187,10 @@ async def main() -> None:
         active_channel, \
         connection_check_task, \
         batch_processor, \
-        extraction_latch
+        extraction_latch, \
+        durable_refresh_active, \
+        durable_refresh_ready, \
+        durable_refresh_worker_task
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -1171,6 +1225,12 @@ async def main() -> None:
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         return
+    if os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline" and config.postgres_pool_max_size < 4:
+        logger.error(
+            "❌ Durable refresh needs at least four PostgreSQL pool connections (refresh transaction, lease heartbeat, health sampler, and delivery)",
+            configured_max=config.postgres_pool_max_size,
+        )
+        return
 
     # Parse host and port from address (POSTGRES_HOST may embed a port, e.g. a pooler)
     host, port = parse_postgres_host_port(config.postgres_host)
@@ -1201,6 +1261,22 @@ async def main() -> None:
         # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
         # read-only. A miss is a logged degraded mode, never a reason to create the table.
         extraction_latch = await probe_latch_relation(connection_pool, logger)
+        durable_refresh_active = os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline"
+        if durable_refresh_active:
+            durable_refresh_ready = await probe_durable_schema(connection_pool, logger)
+            if durable_refresh_ready:
+                try:
+                    await reconcile_legacy_latches(connection_pool, DATA_TYPES)
+                    durable_refresh_health.clear()
+                    durable_refresh_health.update(await read_refresh_health(connection_pool))
+                except Exception as exc:
+                    durable_refresh_ready = False
+                    durable_refresh_health.clear()
+                    durable_refresh_health.update({"status": "degraded", "last_sanitized_failure": type(exc).__name__})
+                    logger.error("❌ Legacy latch reconciliation failed; terminal deliveries will requeue", error_type=type(exc).__name__)
+            if not durable_refresh_ready:
+                durable_refresh_health.clear()
+                durable_refresh_health.update({"status": "degraded", "last_sanitized_failure": "schema_unavailable"})
         logger.info(
             "✅ Async connection pool initialized (min: %d, max: %d connections)",
             config.postgres_pool_min_size,
@@ -1273,6 +1349,10 @@ async def main() -> None:
         return
 
     async with amqp_connection:
+        if durable_refresh_active and durable_refresh_ready:
+            durable_refresh_worker_task = asyncio.create_task(
+                run_worker_loop(connection_pool, logger, f"{SERVICE_NAME}-{os.getpid()}", durable_refresh_health)
+            )
         channel = await amqp_connection.channel()
         active_channel = channel
 
@@ -1367,6 +1447,12 @@ async def main() -> None:
             # below: a still-subscribed consumer keeps being handed messages it
             # can only leave unacked (discogsography-lnn4).
             await cancel_all_consumers()
+
+            if durable_refresh_worker_task is not None:
+                durable_refresh_worker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await durable_refresh_worker_task
+                durable_refresh_worker_task = None
 
             # Cancel progress reporting
             progress_task.cancel()

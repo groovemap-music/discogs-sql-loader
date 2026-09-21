@@ -28,12 +28,11 @@ never reach four, and the refresh silently never runs for that dump.
 create or migrate database objects, `tests/test_service_contract.py` guards that sentence,
 and `database-schema` owns every executable definition. The latch relation is declared
 there; what happens here is a read of `information_schema` and `pg_constraint` at startup to
-find it and check its shape. When it is
-present the loader runs as described above. When it is absent the loader runs in a degraded
-mode that records no signal and fires no refresh, says so in the log and in the health
-payload, and never tries to make the relation itself. The counters simply stay as the last
-successful pass left them, which is the failure that can be seen and fixed rather than the
-one that writes a table nobody declared.
+find it and check its shape. The retained `DERIVED_REFRESH_MODE=inline` rollback path
+runs as described above; if absent, that path logs and reports degraded health rather
+than creating DDL. The default durable path separately probes the job contract and
+requeues terminal deliveries when it is missing or incompatible: no durable refresh
+obligation may disappear behind an ack.
 
 `public.extraction_history` cannot serve as that relation: it is keyed on a UUID and a
 `users` row the loader has neither of. `public.app_config` holds the encrypted Discogs

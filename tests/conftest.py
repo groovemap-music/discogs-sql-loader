@@ -68,6 +68,9 @@ def service_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "RABBITMQ_PORT": "5672",
         "RABBITMQ_USERNAME": "guest",
         "STARTUP_DELAY": "0",
+        # Existing isolated service tests exercise the retained rollback path.
+        # Durable-mode tests opt in explicitly; production defaults to durable.
+        "DERIVED_REFRESH_MODE": "inline",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -160,6 +163,10 @@ def reset_service_state() -> Iterator[None]:
         service.completed_files = set()
         service.queues = {}
         service.idle_mode = False
+        service.durable_refresh_active = False
+        service.durable_refresh_ready = False
+        service.durable_refresh_worker_task = None
+        service.durable_refresh_health = {"status": "starting"}
 
     reset()
     yield

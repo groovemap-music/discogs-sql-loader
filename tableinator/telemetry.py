@@ -45,6 +45,11 @@ PIPELINE_MESSAGE_DURATION = "groovemap.pipeline.message.duration"
 PIPELINE_BATCH_SIZE = "groovemap.pipeline.batch.size"
 PIPELINE_BATCH_FLUSH_DURATION = "groovemap.pipeline.batch.flush.duration"
 PIPELINE_CONSUMERS_ACTIVE = "groovemap.pipeline.consumers.active"
+DERIVED_REFRESH_JOBS = "groovemap.derived_refresh.jobs"
+DERIVED_REFRESH_PENDING_AGE = "groovemap.derived_refresh.pending.age"
+DERIVED_REFRESH_ATTEMPTS = "groovemap.derived_refresh.attempts"
+DERIVED_REFRESH_DURATION = "groovemap.derived_refresh.duration"
+DERIVED_REFRESH_SUPERSEDED = "groovemap.derived_refresh.superseded"
 
 # messaging.client.* -- the OTEL semantic-convention names the shared
 # ``process_message_with_retry`` wrapper would emit. tableinator consumes via
@@ -89,6 +94,28 @@ def _build_instruments() -> dict[str, Any]:
         PIPELINE_CONSUMERS_ACTIVE: meter.create_up_down_counter(
             PIPELINE_CONSUMERS_ACTIVE,
             description="Active RabbitMQ consumers held by this service.",
+        ),
+        DERIVED_REFRESH_JOBS: meter.create_counter(
+            DERIVED_REFRESH_JOBS,
+            description="Durable derived-refresh job transitions, by outcome.",
+        ),
+        DERIVED_REFRESH_PENDING_AGE: meter.create_histogram(
+            DERIVED_REFRESH_PENDING_AGE,
+            unit="s",
+            description="Age of the newest outstanding derived-refresh job at a scanner observation.",
+        ),
+        DERIVED_REFRESH_ATTEMPTS: meter.create_histogram(
+            DERIVED_REFRESH_ATTEMPTS,
+            description="Claim attempts recorded on the outstanding derived-refresh job.",
+        ),
+        DERIVED_REFRESH_DURATION: meter.create_histogram(
+            DERIVED_REFRESH_DURATION,
+            unit="s",
+            description="Duration of a completed or failed derived-refresh attempt.",
+        ),
+        DERIVED_REFRESH_SUPERSEDED: meter.create_histogram(
+            DERIVED_REFRESH_SUPERSEDED,
+            description="Persisted superseded-job count at a scanner observation.",
         ),
         MESSAGING_CONSUMED_MESSAGES: meter.create_counter(
             MESSAGING_CONSUMED_MESSAGES,
@@ -177,6 +204,29 @@ def record_consumer_stopped() -> None:
         _instrument(PIPELINE_CONSUMERS_ACTIVE).add(-1, {"source": SOURCE})
     except Exception:  # pragma: no cover - defensive
         logger.debug("Could not record %s stop", PIPELINE_CONSUMERS_ACTIVE, exc_info=True)
+
+
+def record_derived_refresh_transition(outcome: str, duration_s: float) -> None:
+    """Count a durable worker result without a high-cardinality version label."""
+    try:
+        attributes = {"loader": SOURCE, "outcome": outcome}
+        _instrument(DERIVED_REFRESH_JOBS).add(1, attributes)
+        _instrument(DERIVED_REFRESH_DURATION).record(duration_s, attributes)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not record derived-refresh transition", exc_info=True)
+
+
+def record_derived_refresh_health(health: dict[str, Any]) -> None:
+    """Record database-backed age, attempts, and supersession on each scan."""
+    try:
+        attributes = {"loader": SOURCE, "phase": str(health.get("phase") or "idle")}
+        age = health.get("pending_age_seconds")
+        if age is not None:
+            _instrument(DERIVED_REFRESH_PENDING_AGE).record(float(age), attributes)
+        _instrument(DERIVED_REFRESH_ATTEMPTS).record(int(health.get("attempt_count") or 0), attributes)
+        _instrument(DERIVED_REFRESH_SUPERSEDED).record(int(health.get("superseded_count") or 0), attributes)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not record derived-refresh health", exc_info=True)
 
 
 def record_consumed_message(destination: str, duration_s: float, error_type: str | None = None) -> None:
