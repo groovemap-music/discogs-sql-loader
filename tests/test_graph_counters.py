@@ -541,6 +541,10 @@ async def test_the_pass_reports_its_row_counts_and_duration() -> None:
     assert set(fields["rows"]) == set(REFRESH_ORDER)
     assert set(fields["reconciled"]) == set(ADDITIVE_RELATIONS)
     assert fields["duration_seconds"] >= 0
+    for function in PATH_REFRESH_FUNCTIONS:
+        stage = logger.fields_for(f"Refreshed graph.{function}")
+        assert stage["function"] == f"graph.{function}"
+        assert stage["duration_seconds"] >= 0
 
 
 @pytest.mark.asyncio
