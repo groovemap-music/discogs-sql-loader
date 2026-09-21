@@ -37,7 +37,7 @@ from tableinator.extraction_latch import (
     probe_latch_relation,
     record_extraction_signal,
 )
-from tableinator.graph_counters import REFRESH_ORDER, refresh_derived_relations
+from tableinator.graph_counters import PATH_REFRESH_RELATIONS, REFRESH_ORDER, refresh_derived_relations
 from tableinator.graph_derivation import EDGE_COLUMNS, VERTEX_COLUMNS
 from tableinator.media import media_for_release
 
@@ -233,7 +233,7 @@ async def counter_connection() -> AsyncIterator[psycopg.AsyncConnection[Any]]:
 
 async def _truncate(connection: psycopg.AsyncConnection[Any]) -> None:
     # Every relation name here is one of this module's own constants, never input.
-    relations = ", ".join(f"graph.{relation}" for relation in (*EDGE_COLUMNS, *VERTEX_COLUMNS, *REFRESH_ORDER))
+    relations = ", ".join(f"graph.{relation}" for relation in (*EDGE_COLUMNS, *VERTEX_COLUMNS, *REFRESH_ORDER, *PATH_REFRESH_RELATIONS))
     await connection.execute(f"TRUNCATE {relations}")
     await connection.execute(f"TRUNCATE {', '.join(ENTITY_TABLES)}")
     # Emptied, never dropped: the latch relation belongs to the promoted schema now, and the
@@ -357,6 +357,29 @@ async def test_the_refresh_reports_the_rows_it_wrote(counter_connection: psycopg
         "artist_genre": len(EXPECTED_ARTIST_GENRE),
         "label_genre": len(EXPECTED_LABEL_GENRE),
     }
+
+
+@pytest.mark.asyncio
+async def test_the_promoted_path_refreshes_build_the_member_union_then_vertex_degrees(
+    counter_connection: psycopg.AsyncConnection[Any],
+) -> None:
+    """The real promoted functions populate both loader-owned pathfinder relations."""
+    await _load_catalog(counter_connection)
+
+    await _refresh(counter_connection)
+
+    member_of = await _rows(
+        counter_connection,
+        "SELECT member_artist_id, group_artist_id, source FROM graph.artist_member_of ORDER BY 1, 2, 3",
+    )
+    artist_degrees = await _rows(
+        counter_connection,
+        "SELECT key, degree FROM graph.vertex_degree WHERE kind = 'a' ORDER BY key",
+    )
+    assert member_of == [(A2, A1, "discogs")]
+    # Pathfinder degree excludes SAME_AS: its ten-relation surface gives A3 only
+    # BY plus ALIAS_OF, while the other three artist counts match artist_degree.
+    assert artist_degrees == [(A1, 5), (A2, 2), (A3, 2), (A4, 1)]
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@
 `groovemap-database-schema` is pinned as a dev dependency at the revision recorded in
 `contracts/persistence/v1/source.json`. Applying its initializer is what proves this
 loader builds against a schema that actually creates the `graph` schema's tables — the
-27 relations `contracts/persistence/v1/compatibility.json` declares with
+relations `contracts/persistence/v1/compatibility.json` declares with
 `graph_schema.relations[*].shape == "table"` under `graph_schema.schema` (`graph`) — rather
 than merely vendoring a contract copy nothing exercises.
 """
