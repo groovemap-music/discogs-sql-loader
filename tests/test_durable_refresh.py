@@ -170,12 +170,13 @@ async def test_missing_schema_keeps_startup_consumers_closed_until_probe_recover
 
 
 @pytest.mark.asyncio
-async def test_cancel_failure_forces_broker_reset_before_database_recovery() -> None:
+@pytest.mark.parametrize("missing_queue", [False, True])
+async def test_uncertain_cancellation_forces_broker_reset_before_database_recovery(missing_queue: bool) -> None:
     message = _terminal()
     queue = MagicMock()
     queue.cancel = AsyncMock(side_effect=RuntimeError("broker unavailable"))
     service.consumer_tags = {"artists": "original-tag"}
-    service.queues = {"artists": queue}
+    service.queues = {} if missing_queue else {"artists": queue}
     connection = MagicMock()
     connection.close = AsyncMock(side_effect=[RuntimeError("connection close failed"), None])
     channel = MagicMock()
@@ -225,4 +226,55 @@ async def test_cancel_failure_forces_broker_reset_before_database_recovery() -> 
     message.nack.assert_not_awaited()
     assert connection.close.await_count == 2
     assert channel.close.await_count == 1
+    assert queue.cancel.await_count == (0 if missing_queue else 1)
     assert not service.durable_refresh_paused
+
+
+@pytest.mark.asyncio
+async def test_partial_resubscription_cancel_failure_requires_broker_reset() -> None:
+    artists = MagicMock()
+    artists.consume = AsyncMock(return_value="artist-first-tag")
+    artists.cancel = AsyncMock(side_effect=RuntimeError("cancel outcome unknown"))
+    labels = MagicMock()
+    labels.consume = AsyncMock(side_effect=RuntimeError("subscribe failed"))
+    service.queues = {"artists": artists, "labels": labels}
+    connection = MagicMock()
+    connection.close = AsyncMock()
+    service.active_connection = connection
+    service.active_channel = MagicMock()
+    service.durable_refresh_paused = True
+    service.durable_refresh_resume_types = {"artists", "labels"}
+    service.durable_refresh_recovery_signals = {("artists", "20260920")}
+    service.durable_refresh_worker_task = MagicMock()
+    committed = DurableSignal("20260920", 1, frozenset({"artists"}), False, False, False)
+    recorded = AsyncMock(return_value=committed)
+
+    async def reconnect() -> None:
+        service.active_connection = MagicMock()
+        service.active_channel = MagicMock()
+        service.consumer_tags.update({"artists": "artist-new-tag", "labels": "label-new-tag"})
+
+    with (
+        patch.object(service, "durable_refresh_active", True),
+        patch.object(service, "connection_pool", MagicMock()),
+        patch.object(service, "probe_durable_schema", new=AsyncMock(return_value=True)),
+        patch.object(service, "reconcile_legacy_latches", new=AsyncMock()),
+        patch.object(service, "read_refresh_health", new=AsyncMock(return_value={"status": "enabled"})),
+        patch.object(service, "record_durable_signal", new=recorded),
+        patch.object(service, "purge_stale_rows", new=AsyncMock()),
+        patch.object(service, "_recover_consumers", new=AsyncMock(side_effect=reconnect)) as recover,
+    ):
+        assert not await service.attempt_durable_recovery()
+        artists.cancel.assert_awaited_once_with("artist-first-tag", nowait=False)
+        connection.close.assert_awaited_once()
+        assert service.consumer_tags == {}
+        assert service.durable_refresh_paused
+        assert service.durable_refresh_recovery_signals == {("artists", "20260920")}
+        assert not service.durable_refresh_broker_reset_pending
+        assert await service.attempt_durable_recovery()
+        recover.assert_awaited_once()
+        assert service.consumer_tags == {"artists": "artist-new-tag", "labels": "label-new-tag"}
+        replay = _terminal()
+        await on_data_message(replay, "artists")
+        replay.ack.assert_awaited_once()
+    assert recorded.await_count == 3  # First probe, recovery probe, broker replay.

@@ -417,6 +417,8 @@ async def pause_durable_consumers(data_type: str, version: str) -> bool:
             queue = queues.get(type_name)
             if queue is None:
                 logger.error("❌ Cannot confirm durable consumer cancellation", data_type=type_name)
+                durable_refresh_broker_reset_pending = True
+                await _reset_durable_broker()
                 return False
             try:
                 # Wait for cancel-ok: `nowait=True` would allow an immediate nack
@@ -444,6 +446,9 @@ async def _reset_durable_broker() -> bool:
 
     connection = active_connection
     channel = active_channel
+    if connection is None and channel is None and consumer_tags:
+        logger.error("❌ Cannot confirm closure of a tagged durable consumer without its delivery channel")
+        return False
     try:
         if connection is not None:
             await connection.close()
@@ -477,7 +482,7 @@ async def attempt_durable_recovery() -> bool:
     cannot commit, leave the broker message queued with no active consumer and
     retry the database probe later without consuming another delivery attempt.
     """
-    global durable_refresh_paused, durable_refresh_ready, durable_refresh_worker_task
+    global durable_refresh_paused, durable_refresh_ready, durable_refresh_worker_task, durable_refresh_broker_reset_pending
 
     if not durable_refresh_active or shutdown_requested or connection_pool is None:
         return False
@@ -522,18 +527,24 @@ async def attempt_durable_recovery() -> bool:
         except Exception as exc:
             durable_refresh_paused = True
             durable_refresh_ready = False
+            uncertain_cancellation = False
             for type_name, consumer_tag in list(consumer_tags.items()):
                 queue = queues.get(type_name)
-                if queue is not None:
-                    try:
-                        await queue.cancel(consumer_tag, nowait=False)
-                    except Exception as cancel_exc:
-                        # Any surviving handler will leave its delivery unacked
-                        # if cancellation remains uncertain.
-                        logger.error("❌ Could not cancel partial durable resubscription", data_type=type_name, error_type=type(cancel_exc).__name__)
-                        continue
+                if queue is None:
+                    logger.error("❌ Missing queue for partial durable resubscription", data_type=type_name)
+                    uncertain_cancellation = True
+                    continue
+                try:
+                    await queue.cancel(consumer_tag, nowait=False)
+                except Exception as cancel_exc:
+                    logger.error("❌ Could not cancel partial durable resubscription", data_type=type_name, error_type=type(cancel_exc).__name__)
+                    uncertain_cancellation = True
+                    continue
                 consumer_tags.pop(type_name, None)
                 telemetry.record_consumer_stopped()
+            if uncertain_cancellation:
+                durable_refresh_broker_reset_pending = True
+                await _reset_durable_broker()
             durable_refresh_health.update({"status": "degraded", "consumer_pause": True, "last_sanitized_failure": type(exc).__name__})
             logger.error("❌ Durable consumer resubscription failed", error_type=type(exc).__name__)
             return False
