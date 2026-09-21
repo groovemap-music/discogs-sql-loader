@@ -25,6 +25,7 @@ from tableinator.graph_counters import (
     ADDITIVE_RELATIONS,
     COUNTER_BODIES,
     COUNTER_COLUMNS,
+    PATH_REFRESH_FUNCTIONS,
     REFRESH_ORDER,
     reconcile_additive_edges,
     refresh_counter_relations,
@@ -64,7 +65,12 @@ class RecordingCursor:
     exactly as PostgreSQL would deliver it.
     """
 
-    def __init__(self, counts: dict[str, int] | None = None, pages: dict[str, list[list[Any]]] | None = None) -> None:
+    def __init__(
+        self,
+        counts: dict[str, int] | None = None,
+        pages: dict[str, list[list[Any]]] | None = None,
+        fail_once_on: str | None = None,
+    ) -> None:
         self.calls: list[tuple[str, Any]] = []
         self.copied: dict[str, list[tuple[Any, ...]]] = {}
         self.rowcount = 0
@@ -72,10 +78,14 @@ class RecordingCursor:
         self._pages = {table: list(pages_) for table, pages_ in (pages or {}).items()}
         self._one: tuple[Any, ...] | None = None
         self._all: list[Any] = []
+        self._fail_once_on = fail_once_on
 
     async def execute(self, statement: Any, parameters: Any = None) -> None:
         text = statement if isinstance(statement, str) else statement.as_string(None)
         self.calls.append((text, parameters))
+        if self._fail_once_on is not None and self._fail_once_on in text:
+            self._fail_once_on = None
+            raise RuntimeError(f"scripted failure on {text}")
         self.rowcount = 0
         if text.startswith("SELECT count(*) FROM"):
             self._one = (self._counts.get(_first_identifier(text), 0),)
@@ -141,13 +151,21 @@ class FakeConnection:
     def __init__(self, cursor: RecordingCursor) -> None:
         self._cursor = cursor
         self.autocommit = True
+        self.commits = 0
+        self.rollbacks = 0
 
     async def set_autocommit(self, value: bool) -> None:
         self.autocommit = value
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
-        yield
+        try:
+            yield
+        except BaseException:
+            self.rollbacks += 1
+            raise
+        else:
+            self.commits += 1
 
     @asynccontextmanager
     async def cursor(self) -> AsyncIterator[RecordingCursor]:
@@ -167,12 +185,17 @@ class FakePool:
 
 
 def test_every_counter_body_is_the_pinned_schemas_own() -> None:
-    """The runtime copy and `_COUNTER_BOOTSTRAP` are one text, character for character."""
-    assert COUNTER_BODIES == _COUNTER_BOOTSTRAP
+    """The seven runtime copies match their pinned schema bodies character for character.
+
+    The promoted schema also carries vertex_degree in this map, but the loader invokes its
+    schema-owned refresh function instead of copying that eighth body into runtime code.
+    """
+    assert {relation: _COUNTER_BOOTSTRAP[relation] for relation in REFRESH_ORDER} == COUNTER_BODIES
+    assert set(_COUNTER_BOOTSTRAP) - set(COUNTER_BODIES) == {"vertex_degree"}
 
 
 def test_every_counter_column_list_is_the_pinned_schemas_own() -> None:
-    assert COUNTER_COLUMNS == _COUNTER_COLUMNS
+    assert {relation: _COUNTER_COLUMNS[relation] for relation in REFRESH_ORDER} == COUNTER_COLUMNS
 
 
 def test_the_refresh_covers_exactly_the_seven_counter_relations() -> None:
@@ -422,6 +445,52 @@ async def test_the_additive_edges_are_reconciled_before_the_degrees_sum_them() -
 
 
 @pytest.mark.asyncio
+async def test_the_path_relations_refresh_once_in_dependency_order_before_the_latch_stamp() -> None:
+    """The degree refresh sums the union, and the stamp certifies both completed exactly once."""
+    from tableinator.extraction_latch import LatchRelation
+
+    cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
+    latch = LatchRelation(schema="public", table="loader_extraction_latch")
+
+    await refresh_derived_relations(FakePool(cursor), RecordingLogger(), "20260101", latch)
+
+    counter = cursor.index_of('TRUNCATE "graph"."label_genre"')
+    member_of = cursor.index_of("SELECT * FROM graph.refresh_artist_member_of()")
+    degree = cursor.index_of("SELECT * FROM graph.refresh_vertex_degree()")
+    stamp = cursor.index_of("SET refreshed_at = NOW()")
+    assert counter < member_of < degree < stamp
+    for function in PATH_REFRESH_FUNCTIONS:
+        assert len(cursor.indexes_of(f"SELECT * FROM graph.{function}()")) == 1  # noqa: S608 -- fixed internal names
+
+
+@pytest.mark.asyncio
+async def test_a_path_refresh_failure_rolls_back_without_a_stamp_and_the_retry_repeats_the_pass() -> None:
+    """The latch remains eligible and the retry re-runs both ordered schema refreshes."""
+    from tableinator.extraction_latch import LatchRelation
+
+    cursor = RecordingCursor(
+        counts={"artists": 2, "releases": 1},
+        pages={"artists": [ARTIST_DOCUMENTS]},
+        fail_once_on="graph.refresh_vertex_degree()",
+    )
+    pool = FakePool(cursor)
+    latch = LatchRelation(schema="public", table="loader_extraction_latch")
+
+    with pytest.raises(RuntimeError, match="refresh_vertex_degree"):
+        await refresh_derived_relations(pool, RecordingLogger(), "20260101", latch)
+
+    assert pool.connection_double.rollbacks == 1
+    assert not cursor.indexes_of("SET refreshed_at = NOW()")
+
+    await refresh_derived_relations(pool, RecordingLogger(), "20260101", latch)
+
+    assert pool.connection_double.commits == 1
+    assert len(cursor.indexes_of("SELECT * FROM graph.refresh_artist_member_of()")) == 2
+    assert len(cursor.indexes_of("SELECT * FROM graph.refresh_vertex_degree()")) == 2
+    assert len(cursor.indexes_of("SET refreshed_at = NOW()")) == 1
+
+
+@pytest.mark.asyncio
 async def test_the_whole_pass_runs_on_one_non_autocommit_transaction() -> None:
     """The pool hands out an AUTOCOMMIT connection; without this every TRUNCATE commits alone."""
     cursor = RecordingCursor(counts={"artists": 2, "releases": 1}, pages={"artists": [ARTIST_DOCUMENTS]})
@@ -458,7 +527,7 @@ async def test_the_extraction_is_stamped_on_the_passs_own_transaction() -> None:
 
     stamp = cursor.index_of("SET refreshed_at = NOW()")
     assert cursor.calls[stamp][1] == {"version": "20260101", "loader": LOADER_DISCRIMINATOR}
-    assert stamp > cursor.index_of('TRUNCATE "graph"."label_genre"'), "the stamp must follow the last relation it certifies"
+    assert stamp > cursor.index_of("SELECT * FROM graph.refresh_vertex_degree()"), "the stamp must follow the last relation it certifies"
 
 
 @pytest.mark.asyncio

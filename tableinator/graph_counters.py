@@ -7,7 +7,7 @@ signals — the same latch `graphinator` waits on before it starts its own post-
 `extraction_complete_signals.issuperset(DATA_TYPES)` because the four fanout queues drain
 at very different rates and releases finishes last).
 
-Two things run here, in this order, and the order is load-bearing.
+Four things run here, in this order, and the order is load-bearing.
 
 **1. The additive-edge reconciliation.** `member_of` and `same_as` are the two relations
 `graph_writer` can only write additively: neither has a column naming one asserting
@@ -26,6 +26,16 @@ Those bodies are copied verbatim below rather than imported, because `database-s
 DEV dependency of this loader and runtime code cannot reach it;
 `tests/test_graph_counters.py` holds the copy byte-identical to the pinned original, so a
 schema revision that changes a definition fails `just check` rather than drifting silently.
+
+**3. The cross-provenance MEMBER_OF refresh.** `graph.refresh_artist_member_of()` rebuilds
+the path functions' artist-to-artist relation from the reconciled Discogs membership and
+the MusicBrainz relationship projection. It follows the counters because the schema's
+documented refresh contract assigns both path relations to this completed-extraction pass.
+
+**4. The path degree refresh.** `graph.refresh_vertex_degree()` must run after the MEMBER_OF
+refresh because that union is one of the ten relations it sums. The extraction latch is
+stamped only after both functions succeed, on the same transaction as the reconciliation
+and counters, so any failure rolls the entire pass back and a redelivery retries it.
 
 Where each counter comes from, and the function it mirrors:
 
@@ -114,6 +124,8 @@ __all__ = [
     "COUNTER_BODIES",
     "COUNTER_COLUMNS",
     "GRAPH_SCHEMA",
+    "PATH_REFRESH_FUNCTIONS",
+    "PATH_REFRESH_RELATIONS",
     "REFRESH_ORDER",
     "reconcile_additive_edges",
     "refresh_counter_relations",
@@ -121,6 +133,12 @@ __all__ = [
 ]
 
 GRAPH_SCHEMA: Final = "graph"
+
+# The schema-owned path refresh functions, in their required dependency order. The degree
+# relation sums artist_member_of, so reversing these would publish a degree snapshot of the
+# previous union. Both calls remain inside refresh_derived_relations' transaction.
+PATH_REFRESH_FUNCTIONS: Final = ("refresh_artist_member_of", "refresh_vertex_degree")
+PATH_REFRESH_RELATIONS: Final = ("artist_member_of", "vertex_degree")
 
 # How many documents one reconciliation round trip reads. The whole point of paging is that
 # the asserted set is accumulated in PostgreSQL rather than in this process, so this bounds
@@ -248,10 +266,10 @@ COUNTER_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     "label_genre": ("label_id", "genre_name", "release_count"),
 }
 
-# Fill order, straight off `COUNTER_BODIES`, which is the schema's own `_COUNTER_BOOTSTRAP`
-# order. Every body is a sum over the edge tables, so all seven necessarily run after the
-# edges are written and after the reconciliation above; among themselves the order is free,
-# and keeping the schema's makes the two texts diffable.
+# Fill order, straight off `COUNTER_BODIES`, preserving the order of these seven entries in
+# the schema's `_COUNTER_BOOTSTRAP`. Its eighth entry is vertex_degree, refreshed through the
+# schema-owned function below rather than copied here. Every body is a sum over edge tables,
+# so all seven necessarily run after the reconciliation; among themselves the order is free.
 REFRESH_ORDER: Final[tuple[str, ...]] = tuple(COUNTER_BODIES)
 
 
@@ -475,24 +493,15 @@ async def refresh_counter_relations(cursor: Any, logger: Any) -> dict[str, int]:
 
 
 async def refresh_derived_relations(connection_pool: Any, logger: Any, version: str, latch: LatchRelation | None = None) -> dict[str, int]:
-    """Reconcile the additive edges and recompute every counter, in one transaction.
+    """Reconcile edges and recompute counters and path relations, in one transaction.
 
-    One transaction for all three steps, because `artist_degree` sums `member_of` and
+    One transaction for every step, because `artist_degree` sums `member_of` and
     `same_as`: a reconciliation that committed separately would leave a window in which the
-    degrees count edges the sweep has already decided are gone. The extraction is stamped
-    refreshed on the same transaction, so a pass that rolls back leaves it unstamped and the
-    next delivery of any of its four signals runs it again. A failure anywhere leaves every
-    relation exactly as it was, and the caller retries the whole pass.
-
-    **Deferred: the path refresh functions (gm-discogs-sql-loader-vkb).**
-    `graph.refresh_artist_member_of()` and `graph.refresh_vertex_degree()` name this pass as
-    their refresh owner, and belong here — after the counters, on this same transaction, so
-    they either land with the counters they are consistent with or not at all. They are not
-    called yet because `gm-database-schema-820` declares them and has not landed; the pinned
-    revision (`8a343c8`) carries the latch relation and nothing else. Calling a function the
-    promoted schema does not declare would fail the pass and nack every fourth signal, which
-    is strictly worse than the counters this pass already refreshes. The repin that picks up
-    820 owns adding the two calls and the tests that assert their order.
+    degrees count edges the sweep has already decided are gone. The path MEMBER_OF union is
+    rebuilt after the counters, then vertex_degree after that union because it sums it. The
+    extraction is stamped refreshed on the same transaction, so a pass that rolls back leaves
+    it unstamped and the next delivery of any of its four signals runs it again. A failure
+    anywhere leaves every relation exactly as it was, and the caller retries the whole pass.
 
     Args:
         connection_pool: The loader's `AsyncPostgreSQLPool`.
@@ -513,6 +522,8 @@ async def refresh_derived_relations(connection_pool: Any, logger: Any, version: 
         async with conn.transaction(), conn.cursor() as cursor:
             reconciled = await reconcile_additive_edges(cursor, logger)
             counts = await refresh_counter_relations(cursor, logger)
+            for function in PATH_REFRESH_FUNCTIONS:
+                await cursor.execute(f"SELECT * FROM {GRAPH_SCHEMA}.{function}()")  # noqa: S608
             if latch is not None:
                 await mark_extraction_refreshed(cursor, latch, version)
 

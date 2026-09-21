@@ -30,7 +30,7 @@
       "discogs-sql-loader",
       "musicbrainz-sql-loader"
     ],
-    "design_decision": "Named public.loader_extraction_latch and shaped with a loader discriminator so the loader family can share one relation, matching discogs-sql-loader's tableinator/extraction_latch.py startup probe: it checks LATCH_CANDIDATES (public.loader_extraction_latch first, graph.extraction_latch second) against information_schema, requires the five non-key columns at their exact information_schema types, and — when the relation carries a loader column — keys and scopes every statement on it (its own _key_columns() and ON CONFLICT (loader, version)). Declaring the loader column and the composite primary key here up front means the loader's repin needs no statement changes, only removing its own candidate-name tolerance.",
+    "design_decision": "Named public.loader_extraction_latch and shaped with a loader discriminator so the loader family can share one relation, matching discogs-sql-loader's tableinator/extraction_latch.py startup probe: it checks public.loader_extraction_latch against information_schema, requires the loader column (REQUIRED_COLUMNS) along with the other non-key columns at their exact information_schema types, and scopes every statement to loader = 'discogs' (its own _key_columns() and ON CONFLICT (loader, version)). It verifies via pg_constraint that a PRIMARY KEY or UNIQUE constraint spans exactly (loader, version); a bare unique index is declined by design. Declaring the loader column and the composite primary key here up front means the loader's repin needs no statement changes. musicbrainz-sql-loader will write loader = 'musicbrainz' rows into the same relation when it adopts the pattern.",
     "introduced_in_contract_version": 1,
     "kind": "additive",
     "loader_values": {
@@ -59,6 +59,7 @@
         "alias_of",
         "artist_degree",
         "artist_genre",
+        "artist_member_of",
         "by_artist",
         "company",
         "credited_on",
@@ -82,11 +83,12 @@
         "release_degree_base",
         "same_as",
         "style",
-        "style_stats"
+        "style_stats",
+        "vertex_degree"
       ],
       "function": "graph.bootstrap_fill",
       "kind": "additive",
-      "note": "A one-off fill deriving every loader-written table from the catalog documents, using the same definitions those relations published as views before they were tables. It is NOT authoritative: the owner recorded against each relation writes it and supersedes this fill on its first pass. It exists so an environment can be populated once, before a loader has run, so a read rewrite is not blocked on the dual-write. Nothing calls it; applying the schema declares it and writes no row. Each relation is emptied and refilled in one transaction, so re-running converges in both directions and a row no document justifies is removed. It reports a row count per relation. One known divergence: a company with no Discogs id is keyed on its name case-folded, and this fill folds with SQL lower where the loader applies Python casefold, so a handful of characters key differently and the loader's row is the correct one."
+      "note": "A one-off fill deriving every loader-written table from the catalog documents, using the same definitions those relations published as views before they were tables. It is NOT authoritative: the owner recorded against each relation writes it and supersedes this fill on its first pass. It exists so an environment can be populated once, before a loader has run, so a read rewrite is not blocked on the dual-write. Nothing calls it; applying the schema declares it and writes no row. Each relation is emptied and refilled in one transaction, so re-running converges in both directions and a row no document justifies is removed. It reports a row count per relation. graph.artist_member_of is derived from the relations above it rather than from a document, so the fill shares one body with graph.refresh_artist_member_of and the two cannot disagree; graph.vertex_degree is derived the same way, from the ten path relations, and shares its body with graph.refresh_vertex_degree. Those two relations are the ones with a named refresh owner, which the fill does not supersede. One known divergence: a company with no Discogs id is keyed on its name case-folded, and this fill folds with SQL lower where the loader applies Python casefold, so a handful of characters key differently and the loader's row is the correct one."
     },
     "counter_properties": {
       "availability": "unconditional",
@@ -135,11 +137,54 @@
     },
     "documentation": "docs/architecture.md#graph-schema",
     "edge_relations": 38,
+    "explore_function": {
+      "availability": "unconditional",
+      "clamped_to": [
+        1,
+        3
+      ],
+      "declared_as": "graph.explore_traversal(from_kind \"char\", from_key text, hops int DEFAULT 2, row_limit int DEFAULT 100) RETURNS TABLE (id text, name text, type text, path_names text[], rel_types text[], dist int)",
+      "default_hops": 2,
+      "default_row_limit": 100,
+      "function": "graph.explore_traversal",
+      "kind": "additive",
+      "note": "The bounded breadth-first replacement for catalog-api's get_explore_traversal Cypher. It walks the same undirected BY, ON, IS, ALIAS_OF, MEMBER_OF, and DERIVED_FROM surface as graph.find_shortest_path, recording one parent pointer per discovered vertex and walking those pointers back to project path_names and rel_types. It returns only Artist, Label, Genre, and Style discoveries; Release and Master vertices remain valid intermediate path nodes. Breadth-first discovery is non-decreasing by distance, so the walk stops once row_limit qualifying vertices have been discovered rather than materialising the full three-hop traversal before limiting. The row limit is mandatory: NULL is rejected because the spike measured the unbounded three-hop translation at 21.4 seconds and the bounded procedural form at roughly 15 ms locally, about 1,400 times faster. hops is clamped to [1, 3], preserving catalog-api's existing Explore contract. The function reuses the session-local graph_path_seen relation as its seen set and frontier, creates no persistent relation, reads graph.artist_member_of for the cross-provenance MEMBER_OF edge, and does not read graph.vertex_degree because a one-sided breadth-first walk has no search side to choose.",
+      "qualifying_vertex_kinds": [
+        "artist",
+        "label",
+        "genre",
+        "style"
+      ],
+      "row_limit": {
+        "mandatory": true,
+        "minimum": 0,
+        "null_rejected": true
+      },
+      "seen_set": "pg_temp.graph_path_seen",
+      "traverses": [
+        "graph.by_artist",
+        "graph.master_by_artist",
+        "graph.on_label",
+        "graph.in_genre",
+        "graph.in_style",
+        "graph.master_in_genre",
+        "graph.master_in_style",
+        "graph.derived_from",
+        "graph.alias_of",
+        "graph.artist_member_of"
+      ],
+      "undirected": true,
+      "writes": "nothing"
+    },
     "functions": [
       "graph.bootstrap_fill",
       "graph.credit_role_category",
+      "graph.explore_traversal",
+      "graph.find_shortest_path",
       "graph.mb_relationship_type",
-      "graph.medium_label"
+      "graph.medium_label",
+      "graph.refresh_artist_member_of",
+      "graph.refresh_vertex_degree"
     ],
     "introduced_in_contract_version": 1,
     "key_columns": {
@@ -149,7 +194,69 @@
       "type": "text"
     },
     "kind": "additive",
-    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
+    "member_of_union": {
+      "availability": "unconditional",
+      "function": "graph.refresh_artist_member_of",
+      "key": [
+        "member_artist_id",
+        "group_artist_id",
+        "source"
+      ],
+      "kind": "additive",
+      "note": "Neo4j holds a Discogs band membership and a MusicBrainz member-of-band assertion in one MEMBER_OF relationship space, so shortestPath traverses both without knowing which is which. On the relational side they are two relations in two key spaces: graph.member_of is Discogs-only and keyed on Discogs artist ids, while the MusicBrainz half lives in musicbrainz.relationships keyed on MBIDs and reaches a Discogs id only through musicbrainz.artists.discogs_artist_id. Spike gm-database-schema-gkt.1 measured 22,577 Discogs rows against 36,189 MusicBrainz ones, so 61.6% of that edge class is MusicBrainz provenance and a traversal over graph.member_of alone returns different paths from the Cypher it replaces. This relation resolves the crossing once at build time, with source in the key so the same membership asserted by both providers is two rows rather than a collision. It binds no property-graph label: a second artist-to-artist edge label overlapping member_of would double-count every Discogs membership in a pattern that matched both. The refresh is truncate-and-insert, so it converges in both directions and reports a row count per provenance; discogs-sql-loader calls it on the extraction_complete latch it already handles, the same latch the counter relations are recomputed on.",
+      "refresh_latch": "extraction_complete",
+      "refresh_owner": "discogs-sql-loader",
+      "relation": "graph.artist_member_of",
+      "reverse_index": "(group_artist_id, member_artist_id)",
+      "sources": [
+        "graph.member_of",
+        "graph.mb_rel_artist_artist"
+      ]
+    },
+    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, one more is the cross-provenance MEMBER_OF union recorded under graph_schema.member_of_union, one more is the per-vertex degree recorded under graph_schema.vertex_degree, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
+    "path_function": {
+      "availability": "unconditional",
+      "clamped_to": [
+        1,
+        10
+      ],
+      "declared_as": "graph.find_shortest_path(from_kind \"char\", from_key text, to_kind \"char\", to_key text, max_depth int DEFAULT 6) RETURNS TABLE (found boolean, depth int, nodes text[], rels text[])",
+      "default_max_depth": 6,
+      "function": "graph.find_shortest_path",
+      "kind": "additive",
+      "nodes": "One entry per vertex from the source to the target, each the pair kind:key. The key half is what the Cypher returns per node, coalesce(node.id, node.name), so a Genre or a Style is its name and every other vertex is its Discogs id; the kind half is the one-byte discriminator graph.vertex_degree is keyed on. The pair is what makes the answer unambiguous, because an Artist and a Release can hold the same numeric key and a bare id could not say which vertex a hop went through.",
+      "note": "The one Cypher call this schema cannot express as a view: shortestPath over BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM, ported from spike gm-database-schema-gkt.1's prototype. It is a vertex-at-a-time bidirectional search. It expands one vertex of the smaller-summed-degree frontier at a time in ascending graph.vertex_degree order, probes each expanded vertex against the whole of the opposite seen set, and returns at first touch. First touch is exact because the probe compares against the opposite SEEN set rather than the opposite FRONTIER: with df and db the depths each side is complete to, a touch at depth b <= db from a frontier vertex at df witnesses a walk of length df + 1 + b, the invariant says no path of length <= df + db exists, and the two bounds meet at df + db + 1. A side's completed depth therefore advances only when its level finishes, the expansion writes rows for the side being expanded and no other so the opposite seen set is frozen for the level, and the distance is read off the recorded depths rather than asserted, so a mistake in that argument shows up as a disagreement with Neo4j instead of as a silently wrong answer. It writes no graph relation and no persistent relation of any kind: its only state is one session-scoped seen set. A search that finds nothing returns one row with found false and the other three columns null, where the Cypher returns no row at all. The depth clamp is catalog-api's MIN_PATH_DEPTH, MAX_PATH_DEPTH and DEFAULT_PATH_DEPTH unchanged; spike gm-database-schema-gkt.1 recommended a cap of 4 instead, because at cap 10 a distance-6 pair costs 4.1 s on its cloud machine against 10.5 ms at cap 4 and nothing in the catalog is answerable at 5 or 6 inside the request budget. The owner chose 10 anyway, for exact parity with the Cypher this replaces, and accepts seconds beyond depth 4 for it; lowering the default is a change to the callers' contract rather than to this function.",
+      "reads": [
+        "graph.vertex_degree"
+      ],
+      "rels": "One entry per hop, so one shorter than nodes, each the Neo4j relationship type of that hop: BY, ON, IS, ALIAS_OF, MEMBER_OF, or DERIVED_FROM. It is the type and never the provenance. graph.artist_member_of carries source, but Neo4j holds both provenances in one relationship space and reports one type, and projecting source would cost a heap fetch on every backward hop because the reverse index (group_artist_id, member_artist_id) does not cover it.",
+      "seen_set": {
+        "created_by": "graph.find_shortest_path, on its first call in a session",
+        "key": [
+          "side",
+          "kind",
+          "key"
+        ],
+        "note": "One request-scoped relation and no second frontier relation: the frontier is side = s AND depth = d over the relation being written anyway, which the secondary index makes an index-only scan of the level. The spike measured a separate queue costing a second heap insert, a second index insert and a sequence nextval for every vertex discovered, and dropping it cut the worst measured case by about two fifths. It is TEMPORARY rather than UNLOGGED because two concurrent searches against one unlogged table would corrupt each other, and ON COMMIT DELETE ROWS because the spike's per-call TRUNCATE was about 4 ms of a 5.2 ms floor. It is not an hstore and not an array: a PL/pgSQL variable is passed into a SQL statement by value and re-serialised on every statement, so those representations are faster below a few thousand vertices and do not finish at all above a hundred thousand. A consumer never names this relation; it is recorded so that a session holding one after a search is understood as expected state rather than as a leak.",
+        "relation": "pg_temp.graph_path_seen",
+        "secondary_index": "(side, depth, kind, key)",
+        "shape": "TEMPORARY table, ON COMMIT DELETE ROWS"
+      },
+      "traverses": [
+        "graph.by_artist",
+        "graph.master_by_artist",
+        "graph.on_label",
+        "graph.in_genre",
+        "graph.in_style",
+        "graph.master_in_genre",
+        "graph.master_in_style",
+        "graph.derived_from",
+        "graph.alias_of",
+        "graph.artist_member_of"
+      ],
+      "undirected": true,
+      "writes": "nothing"
+    },
     "property_graph": {
       "absent_on": "PostgreSQL 18, and PostgreSQL 19 with the switch off",
       "availability": "conditional",
@@ -160,13 +267,13 @@
       "consumer_rule": "consumers must not assume it exists; probe pg_class for a relation named catalog in schema graph, of relkind g, and fall back to the views, which are always present",
       "documentation": "docs/architecture.md#property-graph",
       "edge_tables": 38,
-      "element_tables": "Fifty-five of the sixty-four graph relations. The nine that bind no element hold rows or counters for a label that binds a view joining them, plus graph.release_degree_base, whose rows the graph reaches through graph.release_degree.",
+      "element_tables": "Fifty-five of the sixty-six graph relations. The eleven that bind no element hold rows or counters for a label that binds a view joining them, plus graph.release_degree_base, whose rows the graph reaches through graph.release_degree, graph.artist_member_of, which is a union built for the path functions rather than a relationship type Neo4j carries, and graph.vertex_degree, which is an expansion-ordering heuristic for those same functions rather than a property of any node.",
       "kind": "additive",
       "name": "graph.catalog",
       "note": "A SQL/PGQ declaration over the graph schema's tables and views, applied after the rest of the PostgreSQL schema. A closed gate is logged and is not a failure. There is no IF NOT EXISTS for a property graph and this initializer never drops one except through a shape migration that re-declares it on the same run, so an existing graph.catalog is otherwise left as it is and a changed declaration does not roll out on its own.",
       "vertex_tables": 17
     },
-    "relation_count": 64,
+    "relation_count": 66,
     "relations": {
       "alias_of": {
         "owner": "discogs-sql-loader",
@@ -185,6 +292,10 @@
         "shape": "table"
       },
       "artist_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "artist_member_of": {
         "owner": "discogs-sql-loader",
         "shape": "table"
       },
@@ -420,13 +531,51 @@
         "owner": "discogs-sql-loader",
         "shape": "view"
       },
+      "vertex_degree": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
       "wants": {
         "owner": "catalog-api",
         "shape": "view"
       }
     },
     "schema": "graph",
-    "tables": 27,
+    "tables": 29,
+    "vertex_degree": {
+      "availability": "unconditional",
+      "counts_a_dual_provenance_membership": "twice",
+      "function": "graph.refresh_vertex_degree",
+      "key": [
+        "kind",
+        "key"
+      ],
+      "kind": "additive",
+      "note": "One bigint per vertex of the path traversal surface, holding its undirected degree. It decides expansion order only - which side of a bidirectional search to expand next, and which vertex of that side's frontier to expand first - and changes no answer. Spike gm-database-schema-gkt.1 measured the distance-5 variance falling from 1,774 ms to 334 ms with it and unchanged answers; it does not help distance 6 and made it slightly worse, so it is a variance reducer rather than a fix. It is 97 MB at catalog scale against the 1,649 MB spike gm-database-schema-9c8.3 priced for a dense adjacency copy. kind is a one-byte discriminator rather than a prefix on the key because the pathfinder's node identity is the pair and an equality on a concatenated token cannot use the edge tables' text indexes. Only a vertex carrying an edge has a row; a lookup that misses reads as degree zero. A membership both provenances assert counts twice, because graph.artist_member_of carries source in its key and an expansion of that vertex really does scan two rows. It binds no property-graph label: it is an ordering heuristic for the path functions, not a property of any Neo4j node. The refresh is truncate-and-insert, so it converges in both directions and reports a row count per vertex kind; discogs-sql-loader calls it on the extraction_complete latch it already handles, the same latch the counter relations are recomputed on and after graph.refresh_artist_member_of, which writes one of the ten relations it sums.",
+      "refresh_latch": "extraction_complete",
+      "refresh_owner": "discogs-sql-loader",
+      "relation": "graph.vertex_degree",
+      "sources": [
+        "graph.by_artist",
+        "graph.master_by_artist",
+        "graph.on_label",
+        "graph.in_genre",
+        "graph.in_style",
+        "graph.master_in_genre",
+        "graph.master_in_style",
+        "graph.derived_from",
+        "graph.alias_of",
+        "graph.artist_member_of"
+      ],
+      "vertex_kinds": {
+        "a": "artist",
+        "g": "genre",
+        "l": "label",
+        "m": "master",
+        "r": "release",
+        "s": "style"
+      }
+    },
     "vertex_relations": 17,
     "view_evolution": {
       "allowed": "appending a column to the end of an existing view",

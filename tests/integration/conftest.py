@@ -1,7 +1,7 @@
 """Integration-suite setup: the promoted schema every PostgreSQL test writes against.
 
 The loader's graph writes are schema-qualified to `graph`, so the `graph` schema and its
-twenty-seven tables have to exist before any integration test runs — including the ones
+declared tables have to exist before any integration test runs — including the ones
 that build their own synthetic entity tables in a throwaway schema, because a
 schema-qualified write ignores the `search_path` they set. Applying the pinned
 `groovemap-database-schema` initializer once per session is what puts them there, and it

@@ -60,11 +60,11 @@ that nacks the delivery and is redelivered until the trigger is dead-lettered, l
 whoever deployed the schema has stopped watching. Asked once at startup, that same mismatch
 is one log line and the degraded mode instead.
 
-**Deferred here (gm-discogs-sql-loader-vkb).** The pinned revision does not yet declare
-`graph.refresh_artist_member_of()` or `graph.refresh_vertex_degree()` — those ship with
-`gm-database-schema-820`, which is still in flight — so the `extraction_complete` pass does
-not call them yet. The repin that picks them up owns adding those two calls after the
-counters, inside the pass's transaction.
+The completed pass also refreshes the two pathfinder relations the promoted schema assigns
+to this loader. `graph.refresh_artist_member_of()` runs after the existing counters, then
+`graph.refresh_vertex_degree()` runs because it sums that union. Only after both succeed does
+the same transaction stamp `refreshed_at`; a failure therefore leaves the durable latch
+eligible for redelivery and restores every relation to its pre-pass state.
 """
 
 from __future__ import annotations
