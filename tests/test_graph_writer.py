@@ -43,6 +43,9 @@ _RELEASE = {
     "extraartists": [{"id": "1", "name": "Nigel Godrich", "role": "Producer"}],
     "companies": {"items": [{"discogs_id": "9", "name": "Sony DADC", "role": "Pressed By", "role_category": "manufacture"}]},
     "media": {"items": [{"medium": "vinyl_12", "family": "vinyl", "qty": 2}]},
+    # The raw xmltodict wrapper a real dump has: `discogs-ingestion` never recurses into
+    # `tracklist`, so a single track is `{"track": {...}}`, not `{"track": [{...}]}`.
+    "tracklist": {"track": {"position": "A1", "extraartists": {"artist": {"id": "2", "name": "Jonny Greenwood", "role": "Engineer"}}}},
 }
 
 
@@ -146,6 +149,29 @@ async def test_the_generated_role_category_is_never_named_in_an_insert() -> None
 
 
 @pytest.mark.asyncio
+async def test_a_track_credit_is_deleted_document_scoped_like_credited_on() -> None:
+    """`track_credited_on` is release-scoped, same as `credited_on`."""
+    cursor = RecordingCursor()
+
+    await write_document_graph(cursor, "releases", [("r1", _RELEASE)])
+
+    assert cursor.index_of('DELETE FROM "graph"."track_credited_on"') < cursor.index_of('INTO "graph"."track_credited_on"')
+    assert cursor.rows_for('DELETE FROM "graph"."track_credited_on"') == (["r1"],)
+
+
+@pytest.mark.asyncio
+async def test_the_generated_role_category_is_never_named_in_a_track_credit_insert() -> None:
+    """`graph.track_credited_on.role_category` is GENERATED, same as `credited_on`'s."""
+    cursor = RecordingCursor()
+
+    await write_document_graph(cursor, "releases", [("r1", _RELEASE)])
+
+    statement = next(s for s in cursor.statements() if 'INTO "graph"."track_credited_on"' in s)
+    assert '"role_category"' not in statement
+    assert cursor.rows_for('INTO "graph"."track_credited_on"') == [("Jonny Greenwood", "r1", 1, 0, "A1", "Engineer")]
+
+
+@pytest.mark.asyncio
 async def test_the_plain_role_category_of_credited_to_is_written() -> None:
     cursor = RecordingCursor()
 
@@ -195,6 +221,8 @@ class TestPurge:
             "credited_on",
             "credited_to",
             "issued_on",
+            "track_credited_on",
+            "track_by_artist",
         ]
 
     @pytest.mark.asyncio

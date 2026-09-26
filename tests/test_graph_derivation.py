@@ -64,7 +64,19 @@ class TestReleaseEntityEdges:
         """The relations the enricher prunes are the ones written as a replace."""
         document = derive_document("releases", "r1", {"artists": [{"id": "1"}]})
 
-        assert document.replaced == frozenset({"by_artist", "on_label", "derived_from", "in_genre", "in_style", "credited_on", "issued_on"})
+        assert document.replaced == frozenset(
+            {
+                "by_artist",
+                "on_label",
+                "derived_from",
+                "in_genre",
+                "in_style",
+                "credited_on",
+                "issued_on",
+                "track_credited_on",
+                "track_by_artist",
+            }
+        )
 
 
 class TestUsableIds:
@@ -227,6 +239,151 @@ class TestCredits:
         assert "credited_on" in document.replaced
 
 
+class TestTrackCredits:
+    """`_TRACK_CREDIT_SOURCE` in `groovemap_schema.postgres`: track and sub-track `extraartists`.
+
+    `discogs-ingestion`'s `normalize_release` never recurses into `tracklist`, so every
+    fixture here keeps the raw xmltodict wrapper a real dump has: one child collapses to a
+    bare object under the key, several are a real array.
+    """
+
+    def test_a_single_track_wrapped_as_a_bare_object_derives_the_same_row_as_an_array(self) -> None:
+        single = {"tracklist": {"track": {"position": "A1", "extraartists": {"artist": {"id": "5", "name": "Geoff Emerick", "role": "Engineer"}}}}}
+        many = {"tracklist": {"track": [{"position": "A1", "extraartists": {"artist": [{"id": "5", "name": "Geoff Emerick", "role": "Engineer"}]}}]}}
+
+        assert _rows("releases", "r1", single, "track_credited_on") == _rows("releases", "r1", many, "track_credited_on")
+        assert _rows("releases", "r1", single, "track_credited_on") == [("Geoff Emerick", "r1", 1, 0, "A1", "Engineer")]
+
+    def test_a_track_with_no_extraartists_key_derives_nothing(self) -> None:
+        assert _rows("releases", "r1", {"tracklist": {"track": {"position": "A1"}}}, "track_credited_on") == []
+
+    def test_track_ordinal_is_a_one_based_position_not_the_dump_string(self) -> None:
+        """A heading entry's `position` is empty, so the key cannot be built from it."""
+        data = {
+            "tracklist": {
+                "track": [
+                    {"position": "", "extraartists": {"artist": {"name": "First", "role": "Engineer"}}},
+                    {"position": "", "extraartists": {"artist": {"name": "Second", "role": "Engineer"}}},
+                ]
+            }
+        }
+        assert _rows("releases", "r1", data, "track_credited_on") == [
+            ("First", "r1", 1, 0, "", "Engineer"),
+            ("Second", "r1", 2, 0, "", "Engineer"),
+        ]
+
+    def test_a_sub_track_credit_gets_its_own_ordinal_and_position(self) -> None:
+        """A medley's own credits carry `sub_track_ordinal`; the track's own credit is `0`."""
+        data = {
+            "tracklist": {
+                "track": {
+                    "position": "A",
+                    "extraartists": {"artist": {"name": "Track Engineer", "role": "Engineer"}},
+                    "sub_tracks": {
+                        "track": [
+                            {"position": "A1", "extraartists": {"artist": {"name": "Medley Engineer", "role": "Engineer"}}},
+                            {"position": "A2", "extraartists": {"artist": {"name": "Medley Engineer", "role": "Mixed By"}}},
+                        ]
+                    },
+                }
+            }
+        }
+        assert _rows("releases", "r1", data, "track_credited_on") == [
+            ("Track Engineer", "r1", 1, 0, "A", "Engineer"),
+            ("Medley Engineer", "r1", 1, 1, "A1", "Engineer"),
+            ("Medley Engineer", "r1", 1, 2, "A2", "Mixed By"),
+        ]
+
+    def test_a_credit_needs_both_a_name_and_a_role_on_a_track_too(self) -> None:
+        data = {"tracklist": {"track": {"extraartists": {"artist": [{"name": "No Role"}, {"role": "No Name"}]}}}}
+
+        assert _rows("releases", "r1", data, "track_credited_on") == []
+
+    def test_a_non_mapping_track_element_is_skipped_but_still_counts_toward_the_ordinal(self) -> None:
+        data = {"tracklist": {"track": ["not-a-mapping", {"extraartists": {"artist": {"name": "x", "role": "y"}}}]}}
+
+        assert _rows("releases", "r1", data, "track_credited_on") == [("x", "r1", 2, 0, None, "y")]
+
+    def test_track_credited_on_never_names_the_generated_role_category(self) -> None:
+        """`graph.track_credited_on.role_category` is GENERATED, same as `credited_on`'s."""
+        assert EDGE_COLUMNS["track_credited_on"] == (
+            "person_name",
+            "release_id",
+            "track_ordinal",
+            "sub_track_ordinal",
+            "track_position",
+            "role",
+        )
+
+    def test_track_and_release_credits_both_reach_same_as_and_person(self) -> None:
+        """Neither `same_as` nor `person` carries a column that keys the two sources apart."""
+        data = {
+            "extraartists": [{"id": "5", "name": "Release Credit", "role": "Producer"}],
+            "tracklist": {"track": {"position": "A1", "extraartists": {"artist": {"id": "6", "name": "Track Credit", "role": "Engineer"}}}},
+        }
+        document = derive_document("releases", "r1", data)
+
+        assert document.edges["same_as"] == [("Release Credit", "5"), ("Track Credit", "6")]
+        assert document.vertices["person"] == [("Release Credit",), ("Track Credit",)]
+
+    def test_a_track_credit_with_no_usable_artist_id_mints_no_same_as_row(self) -> None:
+        data = {"tracklist": {"track": {"extraartists": {"artist": {"id": "0", "name": "No Same As", "role": "Engineer"}}}}}
+        document = derive_document("releases", "r1", data)
+
+        assert "same_as" not in document.edges
+        assert document.vertices["person"] == [("No Same As",)]
+
+    def test_track_credited_on_is_replaced_per_release_like_credited_on(self) -> None:
+        document = derive_document("releases", "r1", {"tracklist": {"track": {"extraartists": {"artist": {"name": "x", "role": "y"}}}}})
+
+        assert "track_credited_on" in document.replaced
+
+
+class TestTrackPerformers:
+    """`_TRACK_PERFORMER_SOURCE`: the formal `<artists>` performer named on a track."""
+
+    def test_a_performer_wrapped_as_a_bare_object_derives_the_same_row_as_an_array(self) -> None:
+        single = {"tracklist": {"track": {"position": "A1", "artists": {"artist": {"id": "9"}}}}}
+        many = {"tracklist": {"track": [{"position": "A1", "artists": {"artist": [{"id": "9"}]}}]}}
+
+        assert _rows("releases", "r1", single, "track_by_artist") == _rows("releases", "r1", many, "track_by_artist")
+        assert _rows("releases", "r1", single, "track_by_artist") == [("r1", 1, 0, "A1", "9")]
+
+    def test_the_no_entity_sentinel_and_blanks_are_dropped(self) -> None:
+        data = {"tracklist": {"track": {"artists": {"artist": [{"id": "0"}, {"id": ""}, {"id": "9"}]}}}}
+
+        assert _rows("releases", "r1", data, "track_by_artist") == [("r1", 1, 0, None, "9")]
+
+    def test_a_sub_track_performer_gets_its_own_ordinal_and_position(self) -> None:
+        data = {"tracklist": {"track": {"sub_tracks": {"track": {"position": "A1a", "artists": {"artist": {"id": "9"}}}}}}}
+
+        assert _rows("releases", "r1", data, "track_by_artist") == [("r1", 1, 1, "A1a", "9")]
+
+    def test_track_by_artist_stores_the_artist_id_directly_with_no_name_resolution(self) -> None:
+        assert EDGE_COLUMNS["track_by_artist"] == ("release_id", "track_ordinal", "sub_track_ordinal", "track_position", "artist_id")
+
+    def test_track_by_artist_is_replaced_per_release_like_by_artist(self) -> None:
+        document = derive_document("releases", "r1", {"tracklist": {"track": {"artists": {"artist": {"id": "9"}}}}})
+
+        assert "track_by_artist" in document.replaced
+
+
+class TestTracklistUnwrap:
+    """The xmltodict wrapper shapes `_xmltodict_array` unwraps, and their edge cases."""
+
+    @pytest.mark.parametrize("tracklist", [None, "not-a-dict", 7, {"no_track_key": True}])
+    def test_a_malformed_or_absent_tracklist_derives_nothing(self, tracklist: Any) -> None:
+        assert _rows("releases", "r1", {"tracklist": tracklist}, "track_credited_on") == []
+        assert _rows("releases", "r1", {"tracklist": tracklist}, "track_by_artist") == []
+
+    def test_a_null_child_key_derives_nothing_rather_than_raising(self) -> None:
+        assert _rows("releases", "r1", {"tracklist": {"track": None}}, "track_credited_on") == []
+
+    def test_a_bare_scalar_tracklist_wraps_as_one_element_and_is_skipped(self) -> None:
+        """`unwrap_container`'s own defensive fallback: no known Discogs shape reaches it."""
+        assert _rows("releases", "r1", {"tracklist": "not-a-dict"}, "track_credited_on") == []
+
+
 class TestCompanyIdentity:
     """`company_projection.company_identity` and `credited_to_rows` (ADR 0011)."""
 
@@ -386,7 +543,7 @@ class TestColumnContracts:
     """The column blocks this module writes, against what the schema declares."""
 
     def test_every_relation_this_loader_owns_has_a_column_block(self) -> None:
-        """Fourteen edge tables; `part_of`, `in_family`, and `sublabel_of` stay views."""
+        """Sixteen edge tables; `part_of`, `in_family`, and `sublabel_of` stay views."""
         assert set(EDGE_COLUMNS) == {
             "by_artist",
             "on_label",
@@ -402,6 +559,8 @@ class TestColumnContracts:
             "same_as",
             "credited_to",
             "issued_on",
+            "track_credited_on",
+            "track_by_artist",
         }
         assert set(VERTEX_COLUMNS) == {"genre", "style", "person", "media_family", "medium", "company"}
 

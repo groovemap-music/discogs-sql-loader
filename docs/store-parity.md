@@ -75,6 +75,15 @@ holds an `Artist` for a band member whose own document has not arrived yet, whil
 a vertex appears, not in what the graph asserts, and every edge naming such an id is
 compared in full regardless.
 
+Two more relations the loader owns — `track_credited_on` and `track_by_artist`
+(gm-database-schema-ug3v, gm-discogs-sql-loader-b2a) — are outside the comparison for a
+different reason: they were declared for the FastRP embedding pipeline's chw.2 spike after
+this enricher last moved, so there is no Neo4j relationship to read them back from at all.
+`NO_ENRICHER_COUNTERPART` in the suite names both explicitly rather than letting them pass
+by having nothing to compare against; `tests/test_graph_derivation.py` holds them instead to
+the schema's own `_TRACK_CREDIT_SOURCE` / `_TRACK_PERFORMER_SOURCE` bootstrap projection,
+which is their reference implementation.
+
 ## The fixture
 
 Two rounds of events over one small catalog, small enough to reason about by hand:

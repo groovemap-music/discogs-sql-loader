@@ -17,6 +17,7 @@ implementation. The mapping is one-to-one:
 | `credited_to`, `company` | `company_projection.credited_to_rows` / `company_identity` |
 | `issued_on`, `medium`, `media_family` | `media_projection.issued_on_rows` / `resolve_media_block` |
 | `genre`, `style` | the `MERGE (:Genre)` / `MERGE (:Style)` statements of both entity projections |
+| `track_credited_on`, `track_by_artist` | no enricher counterpart; mirrors `groovemap_schema.postgres`'s `_TRACK_CREDIT_SOURCE` / `_TRACK_PERFORMER_SOURCE` |
 
 `database-schema`'s `_phase0_relation_bodies()` states the same rules in SQL and is what
 `graph.bootstrap_fill()` runs, so where a Python truthiness test and a SQL predicate could
@@ -27,6 +28,17 @@ Three relations the enricher writes are deliberately absent. `part_of`, `in_fami
 `sublabel_of` are VIEWS at the pinned schema revision, so a label document derives no rows
 at all and the genre/style/medium vertex rows this module writes are what makes the first
 two resolve.
+
+`track_credited_on` and `track_by_artist` are a fourth kind of absence: they were declared
+by `database-schema` (gm-database-schema-ug3v) for the FastRP embedding pipeline chw.2's
+spike calls for, after `Neo4j`/`discogs-graph-enricher` last moved, so there is no enricher
+function to mirror and no cross-store parity claim to make for them — `tests/integration/
+test_store_parity.py` excludes both by name rather than by omission. The schema's own
+`_TRACK_CREDIT_SOURCE` / `_TRACK_PERFORMER_SOURCE` bodies are the reference implementation
+instead, and this module's `_track_credits` / `_track_performers` mirror them field for
+field, including the raw xmltodict wrapper `tracklist`, `sub_tracks`, and a track's own
+`extraartists`/`artists` are still in — `discogs-ingestion`'s `normalize_release` unwraps
+every release-level array this schema reads but never recurses into a track.
 """
 
 from __future__ import annotations
@@ -99,6 +111,8 @@ EDGE_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     "same_as": ("person_name", "artist_id"),
     "credited_to": ("release_id", "company_id", "role", "role_category", "source"),
     "issued_on": ("release_id", "medium_id", "source", "qty"),
+    "track_credited_on": ("person_name", "release_id", "track_ordinal", "sub_track_ordinal", "track_position", "role"),
+    "track_by_artist": ("release_id", "track_ordinal", "sub_track_ordinal", "track_position", "artist_id"),
 }
 
 
@@ -200,7 +214,11 @@ def derive_release(data_id: str, data: dict[str, Any]) -> DocumentGraph:
     Mirrors `entity_projection.process_release` statement for statement: BY, ON,
     DERIVED_FROM, IS(Genre), and IS(Style) are pruned there and so are replaced here;
     ISSUED_ON is pruned through `PRUNE_ISSUED_ON_CYPHER` and CREDITED_TO through
-    `PRUNE_CREDITED_TO_CYPHER`.
+    `PRUNE_CREDITED_TO_CYPHER`. `track_credited_on` and `track_by_artist` (gm-database-
+    schema-ug3v) have no enricher counterpart to mirror; `_track_credits` and
+    `_track_performers` mirror the schema's own `_TRACK_CREDIT_SOURCE` /
+    `_TRACK_PERFORMER_SOURCE` instead, and are release-scoped the same way `credited_on`
+    and `by_artist` are, so they are replaced here for the same reason.
 
     Two relations are written additively. `credited_on` is release-scoped and could be
     replaced, and is — the enricher leaves a superseded credit behind, and a
@@ -211,7 +229,10 @@ def derive_release(data_id: str, data: dict[str, Any]) -> DocumentGraph:
     prunes SAME_AS either. Like `member_of`, that leaves it able to outlive the last
     release that asserted it, which is the one place it can disagree with the phase 0
     body; see `derive_artist` for why the sweep belongs to the `extraction_complete` pass
-    rather than to a document.
+    rather than to a document. A person named only on a track, never on the release itself,
+    resolves to an artist id and mints a `person` vertex the same way: `same_as` and
+    `person` fold the track-level credits in alongside the release-level ones rather than
+    keying them apart, because neither relation carries a column that would let it.
 
     A release carrying no canonical `companies` block leaves `credited_to` untouched —
     neither deleted nor written. That is `company_projection.resolve_companies_block`: such
@@ -221,6 +242,8 @@ def derive_release(data_id: str, data: dict[str, Any]) -> DocumentGraph:
     genres = _tag_names(data.get("genres"))
     styles = _tag_names(data.get("styles"))
     credits = _credits(data.get("extraartists"))
+    track_credits = _track_credits(data.get("tracklist"))
+    track_performers = _track_performers(data.get("tracklist"))
     media_items = _media_rows(media_for_release(data))
     companies_block = data.get("companies")
     company_rows = _company_rows(companies_block) if isinstance(companies_block, dict) else []
@@ -228,7 +251,14 @@ def derive_release(data_id: str, data: dict[str, Any]) -> DocumentGraph:
     vertices: dict[str, list[tuple[Any, ...]]] = {}
     _put(vertices, "genre", [(name,) for name in genres])
     _put(vertices, "style", [(name,) for name in styles])
-    _put(vertices, "person", _unique([(name,) for name, _role, _artist_id in credits]))
+    _put(
+        vertices,
+        "person",
+        _unique(
+            [(name,) for name, _role, _artist_id in credits]
+            + [(name,) for _track_ordinal, _sub_track_ordinal, _position, name, _role, _artist_id in track_credits]
+        ),
+    )
     _put(vertices, "media_family", _unique([(family,) for _medium, family, _label, _qty in media_items]))
     _put(vertices, "medium", [(medium, family, label) for medium, family, label, _qty in media_items])
     _put(vertices, "company", [(company_id, name, _discogs_label_id(company_id)) for company_id, name, _role, _category in company_rows])
@@ -244,7 +274,10 @@ def derive_release(data_id: str, data: dict[str, Any]) -> DocumentGraph:
     _put(
         edges,
         "same_as",
-        _unique([(name, artist_id) for name, _role, artist_id in credits if artist_id is not None]),
+        _unique(
+            [(name, artist_id) for name, _role, artist_id in credits if artist_id is not None]
+            + [(name, artist_id) for _track_ordinal, _sub_track_ordinal, _position, name, _role, artist_id in track_credits if artist_id is not None]
+        ),
     )
     _put(edges, "issued_on", [(data_id, medium, DISCOGS_SOURCE, qty) for medium, _family, _label, qty in media_items])
     _put(
@@ -252,8 +285,38 @@ def derive_release(data_id: str, data: dict[str, Any]) -> DocumentGraph:
         "credited_to",
         [(data_id, company_id, role, category, DISCOGS_SOURCE) for company_id, _name, role, category in company_rows],
     )
+    _put(
+        edges,
+        "track_credited_on",
+        _unique(
+            [
+                (name, data_id, track_ordinal, sub_track_ordinal, position, role)
+                for track_ordinal, sub_track_ordinal, position, name, role, _artist_id in track_credits
+            ]
+        ),
+    )
+    _put(
+        edges,
+        "track_by_artist",
+        _unique(
+            [
+                (data_id, track_ordinal, sub_track_ordinal, position, artist_id)
+                for track_ordinal, sub_track_ordinal, position, artist_id in track_performers
+            ]
+        ),
+    )
 
-    replaced = {"by_artist", "on_label", "derived_from", "in_genre", "in_style", "credited_on", "issued_on"}
+    replaced = {
+        "by_artist",
+        "on_label",
+        "derived_from",
+        "in_genre",
+        "in_style",
+        "credited_on",
+        "issued_on",
+        "track_credited_on",
+        "track_by_artist",
+    }
     if isinstance(companies_block, dict):
         replaced.add("credited_to")
     return DocumentGraph(vertices, edges, frozenset(replaced))
@@ -323,6 +386,108 @@ def _entity_id(value: Any) -> str | None:
     else:
         return None
     return None if not text or text == NO_ENTITY_ID else text
+
+
+def _xmltodict_array(container: Any, key: str) -> list[Any]:
+    """Return the array CONTAINER's xmltodict wrapper unwraps to under KEY.
+
+    `discogs-ingestion`'s `normalize_release` (`unwrap_container` in `src/discogs/
+    normalize.rs`) flattens every release-level array this schema reads — `artists`,
+    `labels`, `extraartists`, `companies`, `identifiers`, `formats`, `genres`, `styles` —
+    but never recurses into `tracklist` or anything nested inside a track: a track's or
+    sub-track's own `extraartists`/`artists`, and `sub_tracks` itself, are still exactly
+    the raw Discogs XML converts to. Mirrors `_xmltodict_array` in `groovemap_schema.
+    postgres`, field for field:
+
+    - CONTAINER already a list: returned as-is (a future producer that normalizes
+      `tracklist` the way it normalizes everything else costs this function nothing).
+    - CONTAINER a dict carrying KEY: that value, itself unwrapped the same way
+      `unwrap_container` unwraps it — a list kept, `None` emptied, anything else (the
+      single-child case) wrapped as one element.
+    - CONTAINER a dict without KEY, or `None`: empty.
+    - Anything else (a bare scalar where a dict was expected): wrapped as a single-element
+      list, `unwrap_container`'s own defensive fallback — no known Discogs shape reaches it.
+    """
+    if isinstance(container, list):
+        return container
+    if isinstance(container, dict):
+        if key not in container:
+            return []
+        inner = container[key]
+        if isinstance(inner, list):
+            return inner
+        return [] if inner is None else [inner]
+    return [] if container is None else [container]
+
+
+def _track_position(track: dict[str, Any]) -> str | None:
+    """Return a track or sub-track's raw `position` label, or None.
+
+    `track.value ->> 'position'` in the schema: the dump's own string, kept verbatim and
+    untrimmed for display, never part of a key. A non-string value reads the same as an
+    absent one.
+    """
+    position = track.get("position")
+    return position if isinstance(position, str) else None
+
+
+def _track_credits(tracklist: Any) -> list[tuple[int, int, str | None, str, str, str | None]]:
+    """Return `(track_ordinal, sub_track_ordinal, track_position, person_name, role,
+    artist_id)` for every usable `extraartists` credit on a track or one of its sub-tracks.
+
+    Mirrors `_TRACK_CREDIT_SOURCE` in `groovemap_schema.postgres`. `track_ordinal` and
+    `sub_track_ordinal` are 1-based positions `enumerate` assigns over what
+    `_xmltodict_array` unwraps — the same thing `WITH ORDINALITY` counts in the SQL body —
+    rather than the dump's own `position` string, which can be empty or repeated.
+    `sub_track_ordinal` is `0` for a credit on the track itself. `artist_id` is carried
+    through unused by `track_credited_on`, which never stores it, for `same_as` to resolve
+    exactly as a release-level credit's id does.
+    """
+    rows: list[tuple[int, int, str | None, str, str, str | None]] = []
+    for track_ordinal, track in enumerate(_xmltodict_array(tracklist, "track"), start=1):
+        if not isinstance(track, dict):
+            continue
+        position = _track_position(track)
+        rows.extend(
+            (track_ordinal, 0, position, name, role, artist_id)
+            for name, role, artist_id in _credits(_xmltodict_array(track.get("extraartists"), "artist"))
+        )
+        for sub_track_ordinal, sub_track in enumerate(_xmltodict_array(track.get("sub_tracks"), "track"), start=1):
+            if not isinstance(sub_track, dict):
+                continue
+            sub_position = _track_position(sub_track)
+            rows.extend(
+                (track_ordinal, sub_track_ordinal, sub_position, name, role, artist_id)
+                for name, role, artist_id in _credits(_xmltodict_array(sub_track.get("extraartists"), "artist"))
+            )
+    return rows
+
+
+def _track_performers(tracklist: Any) -> list[tuple[int, int, str | None, str]]:
+    """Return `(track_ordinal, sub_track_ordinal, track_position, artist_id)` for every
+    usable formal `<artists>` performer named on a track or one of its sub-tracks.
+
+    Mirrors `_TRACK_PERFORMER_SOURCE`: the same id-bearing shape `by_artist` reads from
+    `releases.data->'artists'` at release level, most often naming a different artist than
+    the release's own credit on a various-artists compilation. `_element_ids` drops the
+    same falsy id and Discogs "no entity" `0` sentinel `by_artist` drops, for the same
+    reason; the ordinal keying and xmltodict unwrap are `_track_credits`'s own.
+    """
+    rows: list[tuple[int, int, str | None, str]] = []
+    for track_ordinal, track in enumerate(_xmltodict_array(tracklist, "track"), start=1):
+        if not isinstance(track, dict):
+            continue
+        position = _track_position(track)
+        rows.extend((track_ordinal, 0, position, artist_id) for artist_id in _element_ids(_xmltodict_array(track.get("artists"), "artist")))
+        for sub_track_ordinal, sub_track in enumerate(_xmltodict_array(track.get("sub_tracks"), "track"), start=1):
+            if not isinstance(sub_track, dict):
+                continue
+            sub_position = _track_position(sub_track)
+            rows.extend(
+                (track_ordinal, sub_track_ordinal, sub_position, artist_id)
+                for artist_id in _element_ids(_xmltodict_array(sub_track.get("artists"), "artist"))
+            )
+    return rows
 
 
 def _tag_names(value: Any) -> list[str]:

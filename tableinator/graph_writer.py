@@ -70,6 +70,8 @@ _DOCUMENT_SCOPE: Final[dict[str, tuple[str, bool]]] = {
     "master_in_genre": ("master_id", False),
     "master_in_style": ("master_id", False),
     "alias_of": ("artist_id", False),
+    "track_credited_on": ("release_id", False),
+    "track_by_artist": ("release_id", False),
 }
 
 # The relations each entity table's purge sweeps, and the columns that reach them. A purge
@@ -88,7 +90,18 @@ _DOCUMENT_SCOPE: Final[dict[str, tuple[str, bool]]] = {
 # `graph.medium` and `graph.media_family` are co-owned with `musicbrainz-sql-loader`, and a
 # genre surviving the last release that named it costs one row.
 _PURGE_SCOPE: Final[dict[str, tuple[str, ...]]] = {
-    "releases": ("by_artist", "on_label", "derived_from", "in_genre", "in_style", "credited_on", "credited_to", "issued_on"),
+    "releases": (
+        "by_artist",
+        "on_label",
+        "derived_from",
+        "in_genre",
+        "in_style",
+        "credited_on",
+        "credited_to",
+        "issued_on",
+        "track_credited_on",
+        "track_by_artist",
+    ),
     "masters": ("master_by_artist", "master_in_genre", "master_in_style"),
     "artists": ("alias_of",),
     "labels": (),
