@@ -40,7 +40,7 @@ dev = [
     "build>=1.6.0",
     "commitizen>=4.18.0",
     "cyclonedx-bom>=7.3.1",
-    "groovemap-database-schema==0.3.0",
+    "groovemap-database-schema==0.4.1",
     "mypy>=2.3.1",
     "pip-audit>=2.10.1",
     "pip-licenses>=5.5.5",
@@ -60,7 +60,7 @@ exclude-newer = "2 days"
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" }
-groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "96da0291ccb30a86af94d0ee8dcf959bd47ada6b" }
+groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "26d03e66c0b815d15870768a92b7d49521658838" }
 
 [tool.ruff]
 extend-exclude = ["tableinator/catalog_contract.py"]

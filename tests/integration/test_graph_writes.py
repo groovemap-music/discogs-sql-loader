@@ -119,6 +119,17 @@ RELEASES = [
                 ]
             },
             "formats": [{"name": "Vinyl", "qty": "2", "descriptions": {"description": ["LP", "Album"]}}],
+            # `discogs-ingestion` never recurses into `tracklist`, so a single track and its
+            # single sub-track credit keep the raw xmltodict wrapper: a bare object under
+            # `track`/`artist`, not a one-element array.
+            "tracklist": {
+                "track": {
+                    "position": "A1",
+                    "extraartists": {"artist": {"id": "gw-a4", "name": "Track Engineer", "role": "Engineer"}},
+                    "artists": {"artist": {"id": "gw-a5"}},
+                    "sub_tracks": {"track": [{"position": "A1a", "extraartists": {"artist": {"name": "Medley Producer", "role": "Producer"}}}]},
+                }
+            },
         },
     ),
     (
@@ -132,6 +143,17 @@ RELEASES = [
             # No canonical `companies` block: a pre-cutover record is silent about company
             # credits rather than asserting it has none, so it writes no `credited_to` row.
             "formats": [{"name": "CD", "qty": "1", "descriptions": {"description": ["Album"]}}],
+            # The other wrapper shape: several tracks make `track` a real array, and so does
+            # a track's own `extraartists`/`artists`.
+            "tracklist": {
+                "track": [
+                    {
+                        "position": "B1",
+                        "extraartists": {"artist": [{"id": "gw-a6", "name": "Another Engineer", "role": "Engineer"}]},
+                        "artists": {"artist": [{"id": "gw-a1"}]},
+                    }
+                ]
+            },
         },
     ),
 ]
@@ -149,15 +171,17 @@ EXPECTED_EDGES = {
     "member_of": 2,  # the reciprocal pair collapsed
     "alias_of": 1,
     "credited_on": 3,  # one person under two roles is two edges; the roleless credit none
-    "same_as": 1,
+    "same_as": 3,  # First Member/gw-a2, Track Engineer/gw-a4, Another Engineer/gw-a6
     "credited_to": 2,
     "issued_on": 2,
+    "track_credited_on": 3,  # gw-r1's track credit and sub-track credit, gw-r2's track credit
+    "track_by_artist": 2,  # one track performer per release
 }
 
 EXPECTED_VERTICES = {
     "genre": 2,
     "style": 2,
-    "person": 2,
+    "person": 5,  # First Member, A Producer, Track Engineer, Medley Producer, Another Engineer
     "media_family": 2,  # vinyl and optical
     "medium": 2,
     "company": 2,
@@ -235,7 +259,7 @@ async def _load_catalog(connection: psycopg.AsyncConnection[Any], suffix: str = 
 
 @pytest.mark.asyncio
 async def test_the_batch_path_writes_every_relation_the_loader_owns(graph_connection: psycopg.AsyncConnection[Any]) -> None:
-    """One pass over the fixture catalog fills all fourteen edges and all six vertices."""
+    """One pass over the fixture catalog fills all sixteen edges and all six vertices."""
     await _load_catalog(graph_connection)
 
     assert await _counts(graph_connection, EXPECTED_EDGES) == EXPECTED_EDGES
@@ -357,6 +381,8 @@ async def test_the_stale_row_purge_removes_the_edges_of_the_documents_it_deletes
         "on_label": 1,
         "in_genre": 2,
         "issued_on": 1,
+        "track_credited_on": 2,  # gw-r2's track credit purged with the rest of its document
+        "track_by_artist": 1,
     }
 
 

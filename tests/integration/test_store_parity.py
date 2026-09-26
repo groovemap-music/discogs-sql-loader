@@ -113,6 +113,13 @@ ENTITY_TABLES: Final = ("artists", "labels", "masters", "releases")
 # write, and `sublabel_of` reads `public.labels` directly.
 VIEW_RELATIONS: Final = frozenset({"part_of", "in_family", "sublabel_of"})
 
+# `track_credited_on` and `track_by_artist` (gm-database-schema-ug3v, gm-discogs-sql-
+# loader-b2a) were declared for the FastRP embedding pipeline's chw.2 spike after this
+# enricher last moved, so there is no Neo4j relationship to read them back from and no
+# cross-store parity claim to make for them here. `tests/test_graph_derivation.py` holds
+# them to the schema's own `_TRACK_CREDIT_SOURCE` / `_TRACK_PERFORMER_SOURCE` instead.
+NO_ENRICHER_COUNTERPART: Final = frozenset({"track_credited_on", "track_by_artist"})
+
 
 # ── ADR 0012's label mapping, made executable ────────────────────────────────
 
@@ -615,9 +622,15 @@ def _mapping_for(relation: str) -> str:
 
 
 def test_the_mapping_covers_every_relation_the_loader_writes() -> None:
-    """A relation the loader gains without a mapping entry would go uncompared."""
+    """A relation the loader gains without a mapping entry would go uncompared.
+
+    `NO_ENRICHER_COUNTERPART` is the one deliberate exception: a relation the loader owns
+    that the pinned enricher has no relationship for at all, so it is excluded by name
+    rather than silently passing because nothing reads it back on the Neo4j side.
+    """
     mapped = {edge.relation for edge in RELATION_MAPPING}
-    assert set(EDGE_COLUMNS) <= mapped, f"unmapped edge relations: {sorted(set(EDGE_COLUMNS) - mapped)}"
+    unmapped = set(EDGE_COLUMNS) - mapped - NO_ENRICHER_COUNTERPART
+    assert not unmapped, f"unmapped edge relations: {sorted(unmapped)}"
     assert mapped - set(EDGE_COLUMNS) == VIEW_RELATIONS
     assert {vertex.relation for vertex in VERTEX_MAPPING} == set(VERTEX_COLUMNS)
 
