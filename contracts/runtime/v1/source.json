@@ -7,8 +7,8 @@
     "rabbitmq"
   ],
   "package": "groovemap-runtime",
-  "source_commit": "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef",
+  "source_commit": "9bac0220df80fdb550fde78d4db8228ca4273625",
   "source_repository": "https://github.com/groovemap-music/python-libraries",
-  "source_tree": "02baa5f8c14e03154ec412921fbdec4f3d70641c",
+  "source_tree": "e37921b1e8c4365a6f2adab0292832ed27097608",
   "version": "0.1.0"
 }

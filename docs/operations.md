@@ -67,6 +67,8 @@ preferred for deployed containers.
 | `STARTUP_IDLE_TIMEOUT` | `30` seconds | Delay before entering quiet idle mode |
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
+| `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size that rolls the `/logs/discogs-sql-loader.log` file sink over; a non-numeric or non-positive override falls back to the default |
+| `LOG_FILE_BACKUP_COUNT` | `5` | Rotated backups of that file sink retained; a non-numeric or non-positive override falls back to the default |
 | `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |
 | `DERIVED_REFRESH_MODE` | `durable` | `inline` explicitly rolls back to commit-before-ack refresh; do not use for a full dump without an ack-budget certification |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry disabled) | Collector base URL, e.g. `http://otel-collector:4318`; shared by metrics and traces |
@@ -173,7 +175,9 @@ flush so RabbitMQ does not keep delivering messages that the process cannot sett
 The health server listens on port `8002`. Its JSON identifies the service as
 `discogs-sql-loader` and reports `starting`, `healthy`, or `unhealthy`, plus the current
 task, per-entity counts, active consumers, and completed files. Container logs are
-written through the shared structured-logging runtime under the same service name.
+written through the shared structured-logging runtime under the same service name, to
+`/logs/discogs-sql-loader.log`; that file sink is a size-capped `RotatingFileHandler`
+bounded by `LOG_FILE_MAX_BYTES` / `LOG_FILE_BACKUP_COUNT` (see Configuration above).
 With durable refresh enabled, `durable_derived_refresh` reports the current and latest
 completed versions, phase/duration, pending age, attempts, retry due, lease expiry,
 sanitized failure, and superseded count. Missing schema, stale pending or
