@@ -7,8 +7,8 @@ set -euo pipefail
 #
 # Both images are pinned by digest to the same ones `database-schema`,
 # `discogs-graph-enricher`, and `catalog-api` pin, so every hive proves parity against
-# one pair of engines. PostgreSQL 18 is enough here: the comparison reads the `graph`
-# tables and views directly and needs no property-graph catalog object.
+# one pair of engines. The comparison reads ordinary PostgreSQL `graph` tables and views
+# directly and compares them with the authoritative Neo4j projection.
 
 # The reference implementation this lane compares against, pinned to a revision so a
 # parity run states exactly which enricher it proved the loader equal to.

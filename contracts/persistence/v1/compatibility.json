@@ -224,7 +224,7 @@
           ]
         }
       },
-      "note": "graphinator writes these onto the Neo4j node of the same name, so the property graph publishes them on the same label rather than on a second one a rewrite would have to learn. SQL/PGQ admits one element table per label unless every table exposes an identical property set, so the label binds a view joining its storage relation to its counter relation; the counter relation is unique on the join column, so the planner removes the join for a query that reads no counter. A count reads zero where the loader has not computed one; first_year stays null. graph.release_degree is the one counter that stays a label of its own, because its live half is a pair of lateral counts no unique key makes removable."
+      "note": "graphinator writes these onto the Neo4j node of the same name. The relational contract publishes them through a view joining its storage relation to its counter relation; the counter relation is unique on the join column, so the planner removes the join for a query that reads no counter. A count reads zero where the loader has not computed one; first_year stays null. graph.release_degree remains a separate relation because its live half is a pair of lateral counts no unique key makes removable."
     },
     "documentation": "docs/architecture.md#graph-schema",
     "edge_relations": 40,
@@ -281,7 +281,7 @@
     "key_columns": {
       "availability": "unconditional",
       "kind": "additive",
-      "note": "Every key column of every graph relation is text. PostgreSQL 19 beta 3 cannot resolve an equality operator for a character varying property-graph vertex key, so the four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start. This retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements the phase 0 views appended for the same reason; nothing but CREATE PROPERTY GRAPH ever read them and they were never declared as properties.",
+      "note": "Every key column of every graph relation is text. The four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start. This keeps ordinary SQL joins consistent and retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements.",
       "type": "text"
     },
     "kind": "additive",
@@ -347,22 +347,6 @@
       ],
       "undirected": true,
       "writes": "nothing"
-    },
-    "property_graph": {
-      "absent_on": "PostgreSQL 18, and PostgreSQL 19 with the switch off",
-      "availability": "conditional",
-      "conditions": [
-        "server_version_num >= 190000",
-        "the SCHEMA_PROPERTY_GRAPH environment switch is enabled"
-      ],
-      "consumer_rule": "consumers must not assume it exists; probe pg_class for a relation named catalog in schema graph, of relkind g, and fall back to the views, which are always present",
-      "documentation": "docs/architecture.md#property-graph",
-      "edge_tables": 40,
-      "element_tables": "Fifty-seven of the sixty-eight graph relations. The eleven that bind no element hold rows or counters for a label that binds a view joining them, plus graph.release_degree_base, whose rows the graph reaches through graph.release_degree, graph.artist_member_of, which is a union built for the path functions rather than a relationship type Neo4j carries, and graph.vertex_degree, which is an expansion-ordering heuristic for those same functions rather than a property of any node.",
-      "kind": "additive",
-      "name": "graph.catalog",
-      "note": "A SQL/PGQ declaration over the graph schema's tables and views, applied after the rest of the PostgreSQL schema. A closed gate is logged and is not a failure. There is no IF NOT EXISTS for a property graph and this initializer never drops one except through a shape migration that re-declares it on the same run, so an existing graph.catalog is otherwise left as it is and a changed declaration does not roll out on its own.",
-      "vertex_tables": 17
     },
     "relation_count": 68,
     "relations": {

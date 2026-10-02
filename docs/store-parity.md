@@ -1,8 +1,9 @@
 # Cross-store parity with the graph enricher
 
-Phase 4 of the property-graph migration retires `discogs-graph-enricher` once this loader
-writes the same graph into PostgreSQL that the enricher writes into Neo4j. That is a claim
-about two stores, and it is demonstrated rather than assumed by one opt-in lane:
+Neo4j remains the authoritative graph store. This loader also writes ordinary graph
+relations into PostgreSQL for relational analytics consumers, and those writes must stay
+aligned with the graph that `discogs-graph-enricher` writes into Neo4j. That cross-store
+claim is demonstrated by one opt-in lane:
 
 ```bash
 just test-parity

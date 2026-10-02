@@ -1,7 +1,7 @@
 """The loader's edge sets, held against the graph enricher's, on one catalog of events.
 
-Phase 4 of the property-graph migration retires `discogs-graph-enricher` once this loader
-writes the same graph. That is a claim about two stores, so it cannot be checked inside
+Neo4j remains the authoritative graph store while this loader writes ordinary graph
+relations into PostgreSQL for relational consumers. Their parity cannot be checked inside
 either one: `tests/test_graph_derivation.py` holds each rule to the enricher function it
 mirrors by reading both implementations, and `tests/integration/test_graph_writes.py`
 counts what reaches PostgreSQL. Neither would notice the two agreeing about the wrong
