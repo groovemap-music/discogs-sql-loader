@@ -26,6 +26,7 @@ assert digest(ROOT / "tableinator/catalog_contract.py") == catalog_source["bindi
 assert digest(ROOT / "contracts/persistence/v1/compatibility.json") == persistence_source["contract_sha256"]
 assert compatibility["contract"] == "groovemap.persistence"
 assert compatibility["version"] == 1
+assert "property_graph" not in compatibility["graph_schema"]
 assert compatibility["application_runtime"]["tested_version"] == "0.1.0"
 runtime_dependency = pyproject["tool"]["uv"]["sources"]["groovemap-runtime"]
 assert runtime_source["package"] == "groovemap-runtime"
