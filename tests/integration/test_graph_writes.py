@@ -4,8 +4,8 @@
 without a database. This suite is the other half: it plays a small but complete catalog
 through both write paths against the promoted schema's own tables and asserts the row
 count of every relation the loader owns, so a rule that derives the right tuples but
-writes them to the wrong relation — or writes an edge the property graph cannot resolve
-because its vertex is missing — fails here rather than in production.
+writes them to the wrong relation — or writes an edge whose endpoint relation cannot
+resolve its vertex — fails here rather than in production.
 """
 
 import os
