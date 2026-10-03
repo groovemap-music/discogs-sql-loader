@@ -1710,7 +1710,7 @@ class TestCancelAfterDelay:
             await asyncio.sleep(0.15)
 
         # Should have cancelled
-        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=True)
+        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=False, timeout=tableinator.tableinator.CONSUMER_CANCEL_TIMEOUT)
         mock_record_stopped.assert_called_once_with()
 
     @pytest.mark.asyncio
@@ -3074,7 +3074,7 @@ class TestRecoverConsumersTableinator:
         t.active_connection = None
         t.active_channel = None
         t.consumer_tags = {}
-        t.completed_files = set()
+        t.completed_files = set(t.DATA_TYPES)
         t.queues = {}
         t.last_message_time = dict.fromkeys(["artists", "labels", "masters", "releases"], 0.0)
 
@@ -3102,6 +3102,7 @@ class TestRecoverConsumersTableinator:
             await t._recover_consumers()
 
         assert set(t.consumer_tags.keys()) == {"artists", "labels", "masters", "releases"}
+        assert t.completed_files == set(t.DATA_TYPES) - {"artists"}
 
         # Reset shared module state
         t.consumer_tags = {}
@@ -3895,7 +3896,7 @@ class TestMainFullRun:
             await real_sleep(0)
 
         # Seed a pending consumer-cancellation task so the cancel loop body runs.
-        pending_task = MagicMock()
+        pending_task = asyncio.create_task(asyncio.Event().wait())
 
         try:
             with (
@@ -3924,7 +3925,7 @@ class TestMainFullRun:
                 await main()
 
             # The pending consumer-cancellation task was cancelled during teardown.
-            pending_task.cancel.assert_called_once()
+            assert pending_task.cancelled()
             # The pool close was attempted (and its failure swallowed).
             mock_pool.close.assert_awaited()
         finally:

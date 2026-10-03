@@ -159,6 +159,7 @@ def reset_service_state() -> Iterator[None]:
         service.connection_params = {}
         service.message_counts = {"artists": 0, "labels": 0, "masters": 0, "releases": 0}
         service.last_message_time = {"artists": 0.0, "labels": 0.0, "masters": 0.0, "releases": 0.0}
+        service.consumer_cancellation_failed = False
         service.consumer_tags = {}
         service.consumer_cancel_tasks = {}
         service.completed_files = set()
