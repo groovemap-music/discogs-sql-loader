@@ -599,32 +599,12 @@ async def durable_recovery_loop() -> None:
 
 
 async def close_rabbitmq_connection() -> None:
-    """Close the RabbitMQ connection and channel when all consumers are idle."""
-    global active_connection, active_channel
-
-    try:
-        if active_channel:
-            try:
-                await asyncio.wait_for(active_channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
-                logger.info("🔧 Closed RabbitMQ channel - all consumers idle")
-            except Exception as e:
-                logger.warning("⚠️ Error closing channel", error=str(e))
-            active_channel = None
-
-        if active_connection:
-            try:
-                await asyncio.wait_for(active_connection.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
-                logger.info("🔧 Closed RabbitMQ connection - all consumers idle")
-            except Exception as e:
-                logger.warning("⚠️ Error closing connection", error=str(e))
-            active_connection = None
-
+    """Close idle transports without discarding unconfirmed cleanup state."""
+    if await _close_recovery_broker():
         logger.info(
             f"✅ RabbitMQ connection closed. Will check for new messages every {QUEUE_CHECK_INTERVAL}s",
             QUEUE_CHECK_INTERVAL=QUEUE_CHECK_INTERVAL,
         )
-    except Exception as e:
-        logger.error("❌ Error closing RabbitMQ connection", error=str(e))
 
 
 async def check_all_consumers_idle() -> bool:
@@ -710,6 +690,50 @@ async def periodic_queue_checker() -> None:
             # Continue running despite errors
 
 
+async def _close_recovery_broker() -> bool:
+    """Retain retryable transport state until broker closure is confirmed."""
+    global active_connection, active_channel, queues, consumer_cancellation_failed
+
+    connection, channel = active_connection, active_channel
+    if connection is None and channel is None:
+        if consumer_tags:
+            consumer_cancellation_failed = True
+            logger.error("❌ Cannot confirm recovery cleanup without the tagged transport")
+            return False
+        return True
+
+    channel_closed = channel is None
+    try:
+        if channel is not None:
+            try:
+                await asyncio.wait_for(channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
+                channel_closed = True
+            except Exception as exc:
+                logger.warning("⚠️ Recovery channel close failed", error_type=type(exc).__name__)
+        if connection is not None:
+            # Connection closure also confirms all of its channels and consumers stopped.
+            await asyncio.wait_for(connection.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
+        elif not channel_closed:
+            consumer_cancellation_failed = True
+            return False
+    except asyncio.CancelledError:
+        consumer_cancellation_failed = True
+        raise
+    except Exception as exc:
+        consumer_cancellation_failed = True
+        logger.warning("⚠️ Recovery connection close failed", error_type=type(exc).__name__)
+        return False
+
+    active_connection = None
+    active_channel = None
+    queues = {}
+    for _ in range(len(consumer_tags)):
+        telemetry.record_consumer_stopped()
+    consumer_tags.clear()
+    consumer_cancellation_failed = False
+    return True
+
+
 async def _recover_consumers() -> None:
     """Recover consumers by reconnecting to RabbitMQ and restarting consumption.
 
@@ -717,28 +741,28 @@ async def _recover_consumers() -> None:
     - Normal recovery after idle period
     - Emergency recovery after unexpected consumer death
     """
-    global active_connection, active_channel, queues, idle_mode
+    global active_connection, active_channel, queues, idle_mode, consumer_cancellation_failed
 
     if durable_refresh_active and (durable_refresh_paused or not durable_refresh_ready):
         return
 
-    # Close any existing broken connection first
-    if active_connection:
-        try:
-            await asyncio.wait_for(active_connection.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
-        except Exception as e:
-            logger.warning("⚠️ Error closing broken connection during recovery", error=str(e))
-        active_connection = None
-        active_channel = None
-
-    # Temporarily connect to check queue depths
-    try:
-        temp_connection = await rabbitmq_manager.connect()
-        temp_channel = await temp_connection.channel()
-    except Exception as e:
-        logger.error("❌ Failed to connect to RabbitMQ for recovery", error=str(e))
+    # Never create replacement consumers while the old transport is unconfirmed.
+    if not await _close_recovery_broker():
         return
 
+    # Own the temporary transport immediately, including a failed channel-open path.
+    try:
+        active_connection = await rabbitmq_manager.connect()
+        active_channel = await active_connection.channel()
+    except asyncio.CancelledError:
+        consumer_cancellation_failed = True
+        raise
+    except Exception as e:
+        logger.error("❌ Failed to connect to RabbitMQ for recovery", error_type=type(e).__name__)
+        await _close_recovery_broker()
+        return
+
+    temp_channel = active_channel
     try:
         # Check each queue for pending messages
         queues_with_messages = []
@@ -760,8 +784,6 @@ async def _recover_consumers() -> None:
             )
 
             # Re-establish full connection and start consuming
-            active_connection = temp_connection
-            active_channel = temp_channel
 
             # Set QoS - scale with batch_size in batch mode, couple to the PostgreSQL
             # pool capacity in non-batch mode (see channel_prefetch).
@@ -849,31 +871,15 @@ async def _recover_consumers() -> None:
             # Don't close temp_connection since we're using it as active_connection
         else:
             logger.info("⏳ No messages in any queue, connection remains closed")
-            # Close the temporary connection
-            await temp_channel.close()
-            await temp_connection.close()
+            await _close_recovery_broker()
 
+    except asyncio.CancelledError:
+        # Cancellation can interrupt an RPC after the broker acted; keep retry state.
+        consumer_cancellation_failed = True
+        raise
     except Exception as e:
-        logger.error("❌ Error during consumer recovery", error=str(e))
-        # Make sure to close temporary connection on error
-        try:
-            await temp_channel.close()
-            await temp_connection.close()
-        except Exception as close_error:
-            logger.warning(
-                "⚠️ Error closing temporary connection after recovery failure",
-                error=str(close_error),
-            )
-        active_connection = None
-        active_channel = None
-        queues = {}
-        # Clear stale consumer tags: any consumers registered before the error
-        # died with the now-closed connection. Leaving them behind would keep
-        # len(consumer_tags) > 0 forever, permanently gating off both recovery
-        # routes (stuck-check requires 0 tags) while health still reads healthy.
-        for _ in range(len(consumer_tags)):
-            telemetry.record_consumer_stopped()
-        consumer_tags.clear()
+        logger.error("❌ Error during consumer recovery", error_type=type(e).__name__)
+        await _close_recovery_broker()
 
 
 async def purge_stale_rows(data_type: str, started_at: str, record_count: int | None = None) -> None:

@@ -192,3 +192,120 @@ asyncio.run(main())
         os.kill(process.pid, signal.SIGTERM)
         _stdout, stderr = process.communicate(timeout=3)
     assert process.returncode == 0, stderr
+
+
+async def _hanging_close() -> None:
+    await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hang", [False, True])
+async def test_recovery_retains_old_transport_until_confirmed_close(hang: bool) -> None:
+    """An old close failure cannot authorize replacement consumers or healthy state."""
+    failure = _hanging_close if hang else RuntimeError("close failed")
+    connection = AsyncMock(close=AsyncMock(side_effect=failure))
+    channel = AsyncMock(close=AsyncMock(side_effect=failure))
+    queue = AsyncMock()
+    service.active_connection, service.active_channel = connection, channel
+    service.consumer_tags["artists"] = "old-tag"
+    service.queues["artists"] = queue
+    service.connection_pool = MagicMock()
+    manager = AsyncMock()
+    with (
+        patch.object(service, "CONSUMER_CANCEL_TIMEOUT", 0.01),
+        patch.object(service, "rabbitmq_manager", manager),
+        patch.object(service.telemetry, "record_consumer_stopped") as stopped,
+    ):
+        await asyncio.wait_for(service._recover_consumers(), timeout=0.2)
+        manager.connect.assert_not_awaited()
+        assert service.active_connection is connection
+        assert service.active_channel is channel
+        assert service.queues == {"artists": queue}
+        assert service.consumer_tags == {"artists": "old-tag"}
+        assert service.consumer_cancellation_failed
+        assert service.get_health_data()["status"] == "unhealthy"
+        stopped.assert_not_called()
+
+        connection.close.side_effect = None
+        channel.close.side_effect = None
+        manager.connect.side_effect = RuntimeError("offline")
+        await service._recover_consumers()
+        manager.connect.assert_awaited_once()
+        assert service.active_connection is None
+        assert service.active_channel is None
+        assert service.queues == {}
+        assert service.consumer_tags == {}
+        assert not service.consumer_cancellation_failed
+        stopped.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hang", [False, True])
+async def test_partial_registration_retains_failed_cleanup_and_retries(hang: bool) -> None:
+    """A broker may still run the first consumer when registering the second fails."""
+    failure = _hanging_close if hang else RuntimeError("close failed")
+    registered_queue = AsyncMock(consume=AsyncMock(return_value="new-artists"))
+
+    def declare_queue(**kwargs: object) -> MagicMock:
+        if kwargs.get("passive"):
+            queue = MagicMock()
+            queue.declaration_result.message_count = 1
+            return queue
+        name = str(kwargs.get("name"))
+        if name.endswith("-artists"):
+            return registered_queue
+        if name.endswith("-labels"):
+            return AsyncMock(consume=AsyncMock(side_effect=RuntimeError("registration failed")))
+        return AsyncMock()
+
+    channel = AsyncMock(declare_queue=AsyncMock(side_effect=declare_queue), close=AsyncMock(side_effect=failure))
+    connection = AsyncMock(channel=AsyncMock(return_value=channel), close=AsyncMock(side_effect=failure))
+    manager = AsyncMock(connect=AsyncMock(return_value=connection))
+    service.connection_pool = MagicMock()
+    with (
+        patch.object(service, "CONSUMER_CANCEL_TIMEOUT", 0.01),
+        patch.object(service, "rabbitmq_manager", manager),
+        patch.object(service.telemetry, "record_consumer_stopped") as stopped,
+    ):
+        await asyncio.wait_for(service._recover_consumers(), timeout=0.2)
+        assert service.active_connection is connection
+        assert service.active_channel is channel
+        assert service.queues["artists"] is registered_queue
+        assert service.consumer_tags == {"artists": "new-artists"}
+        assert service.consumer_cancellation_failed
+        assert service.get_health_data()["status"] == "unhealthy"
+        stopped.assert_not_called()
+        # The checker must keep retrying even though a tag and transport remain.
+        with patch.object(service, "STUCK_CHECK_INTERVAL", 0):
+            checker = asyncio.create_task(service.periodic_queue_checker())
+            await asyncio.sleep(0.03)
+            service.shutdown_requested = True
+            await asyncio.wait_for(checker, timeout=0.2)
+        assert service.consumer_tags == {"artists": "new-artists"}
+        manager.connect.assert_awaited_once()
+
+        # Once cleanup is confirmed, remove the old metric/tag once and permit reconnect.
+        connection.close.side_effect = None
+        channel.close.side_effect = None
+        manager.connect.side_effect = RuntimeError("offline")
+        await service._recover_consumers()
+        assert manager.connect.await_count == 2
+        assert service.consumer_tags == {}
+        assert service.queues == {}
+        assert service.active_connection is None
+        assert not service.consumer_cancellation_failed
+        stopped.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_channel_open_keeps_temporary_connection_for_cleanup_retry() -> None:
+    """A new connection is owned before opening its channel can fail."""
+    connection = AsyncMock(channel=AsyncMock(side_effect=RuntimeError("channel unavailable")), close=AsyncMock(side_effect=_hanging_close))
+    with (
+        patch.object(service, "CONSUMER_CANCEL_TIMEOUT", 0.01),
+        patch.object(service, "rabbitmq_manager", AsyncMock(connect=AsyncMock(return_value=connection))),
+    ):
+        await asyncio.wait_for(service._recover_consumers(), timeout=0.2)
+    assert service.active_connection is connection
+    assert service.active_channel is None
+    assert service.consumer_cancellation_failed
