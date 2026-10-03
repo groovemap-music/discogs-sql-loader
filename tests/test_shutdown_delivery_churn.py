@@ -34,7 +34,7 @@ async def test_shutdown_cancels_every_consumer_before_connection_close() -> None
     ):
         await service.cancel_all_consumers()
         assert {call.args[0] for call in queue.cancel.call_args_list} == set(tags.values())
-        assert all(call.kwargs["nowait"] is True for call in queue.cancel.call_args_list)
+        assert all(call.kwargs["nowait"] is False for call in queue.cancel.call_args_list)
         assert service.consumer_tags == {}
         assert mock_record_stopped.call_count == len(tags)
 
@@ -59,4 +59,5 @@ async def test_missing_queue_handle_is_tolerated() -> None:
         patch.object(service, "logger"),
     ):
         await service.cancel_all_consumers()
-        assert service.consumer_tags == {}
+        assert service.consumer_tags == {"artists": "tag-artists"}
+        assert service.consumer_cancellation_failed

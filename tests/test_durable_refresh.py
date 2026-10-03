@@ -110,7 +110,7 @@ async def test_repeated_commit_failure_pauses_broker_before_nack_then_recovers()
 
     async def nack_after_cancel(*, requeue: bool) -> None:
         assert requeue
-        queue.cancel.assert_awaited_once_with("original-tag", nowait=False)
+        queue.cancel.assert_awaited_once_with("original-tag", nowait=False, timeout=service.CONSUMER_CANCEL_TIMEOUT)
 
     message.nack.side_effect = nack_after_cancel
     with (
@@ -265,7 +265,7 @@ async def test_partial_resubscription_cancel_failure_requires_broker_reset() -> 
         patch.object(service, "_recover_consumers", new=AsyncMock(side_effect=reconnect)) as recover,
     ):
         assert not await service.attempt_durable_recovery()
-        artists.cancel.assert_awaited_once_with("artist-first-tag", nowait=False)
+        artists.cancel.assert_awaited_once_with("artist-first-tag", nowait=False, timeout=service.CONSUMER_CANCEL_TIMEOUT)
         connection.close.assert_awaited_once()
         assert service.consumer_tags == {}
         assert service.durable_refresh_paused
