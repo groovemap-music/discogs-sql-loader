@@ -31,6 +31,21 @@ sequenceDiagram
 disables cancellation. Duplicate completion messages do not schedule duplicate tasks,
 and cancellation failures are logged without preventing the remaining teardown.
 
+Every cancellation waits for broker `cancel-ok` (`nowait=False`) with a five-second
+RPC and task deadline. A type stays in `consumer_tags` until confirmation; missing
+queue handles and timeouts retain the uncertain tag and mark health unhealthy.
+The periodic checker then closes the uncertain delivery channel with a bounded
+wait and only resubscribes after closure is confirmed. Durable pause/resubscribe
+cancellations use the same deadlines.
+
+Shutdown first cancels and joins pending grace timers. It stops attempting RPCs
+on the first failed cancel and closes the uncertain channel before batch teardown,
+so a broken channel cannot spend one full timeout for every remaining subscriber.
+A new data record resets its type's completion marker and cancels the previous
+run's grace timer. Timer cleanup removes only its own reference, so a canceled old
+timer cannot erase a replacement timer. Recovery also resets completion for types
+with pending messages; initially empty types reset when their first record arrives.
+
 After every entity completes, the service closes its RabbitMQ connection. It reconnects
 on the next periodic queue check when new messages are available. The interval is
 controlled by `QUEUE_CHECK_INTERVAL` and defaults to one hour.
@@ -51,5 +66,5 @@ that teardown never acknowledges or negative-acknowledges those late messages.
 Run the focused coverage with:
 
 ```bash
-uv run pytest tests/test_file_completion.py tests/test_shutdown_delivery_churn.py -q
+uv run pytest tests/test_consumer_cancellation.py tests/test_file_completion.py tests/test_shutdown_delivery_churn.py -q
 ```

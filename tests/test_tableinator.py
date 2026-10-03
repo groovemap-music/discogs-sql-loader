@@ -1710,7 +1710,7 @@ class TestCancelAfterDelay:
             await asyncio.sleep(0.15)
 
         # Should have cancelled
-        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=True)
+        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=False, timeout=tableinator.tableinator.CONSUMER_CANCEL_TIMEOUT)
         mock_record_stopped.assert_called_once_with()
 
     @pytest.mark.asyncio
@@ -1966,31 +1966,25 @@ class TestGetHealthData:
         tableinator.tableinator.connection_pool = None
 
 
-class TestCloseRabbitMQConnectionOuterException:
-    """Test outer exception handling in close_rabbitmq_connection."""
+class TestCloseRabbitMQConnectionFailure:
+    """Idle teardown must retain a channel whose closure was not confirmed."""
 
     @pytest.mark.asyncio
-    async def test_handles_outer_exception(self) -> None:
-        """Test handling of unexpected exceptions in outer try block."""
-        import tableinator.tableinator
+    async def test_retains_failed_channel_for_retry(self) -> None:
+        import tableinator.tableinator as service
 
-        # Set up a scenario where accessing active_channel raises an exception
-        # This simulates an error before we even try to close anything
-        mock_channel = MagicMock()
-        # Make the channel raise an exception when accessed in any way
-        # that would happen before the nested try blocks
-        type(mock_channel).__bool__ = MagicMock(side_effect=RuntimeError("Unexpected error"))
-
-        tableinator.tableinator.active_channel = mock_channel
-        tableinator.tableinator.active_connection = None
-
-        with patch("tableinator.tableinator.logger") as mock_logger:
+        channel = AsyncMock(close=AsyncMock(side_effect=RuntimeError("close failed")))
+        service.active_channel = channel
+        with patch.object(service, "logger") as logger:
             await close_rabbitmq_connection()
-
-        # Should log the error
-        mock_logger.error.assert_called_once()
-        call_args = mock_logger.error.call_args
-        assert "Error closing RabbitMQ connection" in call_args[0][0]
+        assert service.active_channel is channel
+        assert service.consumer_cancellation_failed
+        logger.warning.assert_called_once()
+        assert logger.warning.call_args.kwargs["error_type"] == "RuntimeError"
+        channel.close.side_effect = None
+        await close_rabbitmq_connection()
+        assert service.active_channel is None
+        assert not service.consumer_cancellation_failed
 
 
 class TestOnDataMessageProgressLogging:
@@ -3074,7 +3068,7 @@ class TestRecoverConsumersTableinator:
         t.active_connection = None
         t.active_channel = None
         t.consumer_tags = {}
-        t.completed_files = set()
+        t.completed_files = set(t.DATA_TYPES)
         t.queues = {}
         t.last_message_time = dict.fromkeys(["artists", "labels", "masters", "releases"], 0.0)
 
@@ -3102,6 +3096,7 @@ class TestRecoverConsumersTableinator:
             await t._recover_consumers()
 
         assert set(t.consumer_tags.keys()) == {"artists", "labels", "masters", "releases"}
+        assert t.completed_files == set(t.DATA_TYPES) - {"artists"}
 
         # Reset shared module state
         t.consumer_tags = {}
@@ -3430,7 +3425,7 @@ class TestRecoverConsumersExceptionHandling:
 
     @pytest.mark.asyncio
     async def test_active_connection_close_raises_exception(self) -> None:
-        """Test exception from active_connection.close() is suppressed (lines 337-338)."""
+        """Failed closure keeps the old connection and prevents reconnecting."""
         import tableinator.tableinator
 
         mock_conn = AsyncMock()
@@ -3447,8 +3442,9 @@ class TestRecoverConsumersExceptionHandling:
 
             await _recover_consumers()
 
-        # active_connection should be None even though close() raised
-        assert tableinator.tableinator.active_connection is None
+        assert tableinator.tableinator.active_connection is mock_conn
+        assert tableinator.tableinator.consumer_cancellation_failed
+        mock_rm.connect.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_cleanup_exception_suppressed_on_recovery_error(self) -> None:
@@ -3473,8 +3469,11 @@ class TestRecoverConsumersExceptionHandling:
             mock_rm.connect = AsyncMock(return_value=mock_temp_conn)
             from tableinator.tableinator import _recover_consumers
 
-            # Should not raise - all exceptions suppressed
             await _recover_consumers()
+
+        assert tableinator.tableinator.active_connection is mock_temp_conn
+        assert tableinator.tableinator.active_channel is mock_temp_channel
+        assert tableinator.tableinator.consumer_cancellation_failed
 
 
 class TestProgressReporterAdditionalPaths:
@@ -3895,7 +3894,7 @@ class TestMainFullRun:
             await real_sleep(0)
 
         # Seed a pending consumer-cancellation task so the cancel loop body runs.
-        pending_task = MagicMock()
+        pending_task = asyncio.create_task(asyncio.Event().wait())
 
         try:
             with (
@@ -3924,7 +3923,7 @@ class TestMainFullRun:
                 await main()
 
             # The pending consumer-cancellation task was cancelled during teardown.
-            pending_task.cancel.assert_called_once()
+            assert pending_task.cancelled()
             # The pool close was attempted (and its failure swallowed).
             mock_pool.close.assert_awaited()
         finally:
