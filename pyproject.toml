@@ -20,9 +20,9 @@ classifiers = [
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-    "aio-pika>=10.0.1",
+    "aio-pika>=10.1.1",
     "groovemap-runtime[otel,postgres,rabbitmq]==0.1.0",
-    "orjson>=3.12.0",
+    "orjson>=3.13.0",
     "psycopg[binary]>=3.3.5",
     "structlog>=26.1.0",
 ]
@@ -37,11 +37,11 @@ Issues = "https://github.com/groovemap-music/discogs-sql-loader/issues"
 
 [dependency-groups]
 dev = [
-    "build>=1.6.0",
-    "commitizen>=4.18.0",
-    "cyclonedx-bom>=7.3.1",
+    "build>=1.6.1",
+    "commitizen>=4.19.2",
+    "cyclonedx-bom>=7.5.0",
     "groovemap-database-schema==0.4.1",
-    "mypy>=2.3.1",
+    "mypy>=2.4.0",
     "pip-audit>=2.10.1",
     "pip-licenses>=5.5.5",
     "pytest>=9.1.1",
@@ -49,7 +49,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
-    "ruff>=0.16.6",
+    "ruff>=0.17.1",
 ]
 
 [tool.hatch.build.targets.wheel]
