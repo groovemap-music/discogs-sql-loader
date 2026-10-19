@@ -465,20 +465,20 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aio-pika", specifier = ">=10.0.1" },
+    { name = "aio-pika", specifier = ">=10.1.1" },
     { name = "groovemap-runtime", extras = ["otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=9bac0220df80fdb550fde78d4db8228ca4273625" },
-    { name = "orjson", specifier = ">=3.12.0" },
+    { name = "orjson", specifier = ">=3.13.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.5" },
     { name = "structlog", specifier = ">=26.1.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "build", specifier = ">=1.6.0" },
-    { name = "commitizen", specifier = ">=4.18.0" },
-    { name = "cyclonedx-bom", specifier = ">=7.3.1" },
+    { name = "build", specifier = ">=1.6.1" },
+    { name = "commitizen", specifier = ">=4.19.2" },
+    { name = "cyclonedx-bom", specifier = ">=7.5.0" },
     { name = "groovemap-database-schema", git = "https://github.com/groovemap-music/database-schema.git?rev=9a50949b1810f3e61adae2f89b86acec2e20c4a3" },
-    { name = "mypy", specifier = ">=2.3.1" },
+    { name = "mypy", specifier = ">=2.4.0" },
     { name = "pip-audit", specifier = ">=2.10.1" },
     { name = "pip-licenses", specifier = ">=5.5.5" },
     { name = "pytest", specifier = ">=9.1.1" },
@@ -486,7 +486,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
-    { name = "ruff", specifier = ">=0.16.6" },
+    { name = "ruff", specifier = ">=0.17.1" },
 ]
 
 [[package]]
