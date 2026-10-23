@@ -56,7 +56,10 @@ dev = [
 packages = ["tableinator"]
 
 [tool.uv]
-exclude-newer = "2 days"
+exclude-newer = "7 days"
+# Security exception: certifi 2026.10.19 fixes PYSEC-2026-4320 and is inside the
+# 7-day window. Remove after 2026-10-27T02:24:17Z, when the window covers it.
+exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "9bac0220df80fdb550fde78d4db8228ca4273625" }
