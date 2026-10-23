@@ -59,7 +59,9 @@ packages = ["tableinator"]
 exclude-newer = "7 days"
 # Security exception: certifi 2026.10.19 fixes PYSEC-2026-4320 and is inside the
 # 7-day window. Remove after 2026-10-27T02:24:17Z, when the window covers it.
-exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
+# Security exception: filelock 4.2.1 fixes CVE-2026-112940 and is inside the
+# 7-day window. Remove after 2026-10-24T16:48:15Z, when the window covers it.
+exclude-newer-package = { certifi = "2026-10-20T02:24:17Z", filelock = "2026-10-17T16:48:15Z" }
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "9bac0220df80fdb550fde78d4db8228ca4273625" }
