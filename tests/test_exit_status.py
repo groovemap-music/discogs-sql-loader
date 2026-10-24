@@ -72,7 +72,7 @@ def _pool_ok() -> Any:
     return patch("tableinator.tableinator.AsyncPostgreSQLPool", return_value=pool)
 
 
-def _probes() -> list[Any]:  # noqa: N802
+def _probes() -> list[Any]:
     return [
         _pool_ok(),
         patch("tableinator.tableinator.probe_latch_relation", AsyncMock(return_value=None)),
