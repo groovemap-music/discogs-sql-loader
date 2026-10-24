@@ -66,6 +66,7 @@ preferred for deployed containers.
 | `STUCK_CHECK_INTERVAL` | `30` seconds | Consumer recovery check interval |
 | `STARTUP_IDLE_TIMEOUT` | `30` seconds | Delay before entering quiet idle mode |
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
+| `HEALTH_PORT` | `8002` | Health server port; `8002` is the role port for every SQL loader. An invalid value (non-numeric or outside `1`-`65535`) fails startup with a configuration error instead of falling back |
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
 | `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size that rolls the `/logs/discogs-sql-loader.log` file sink over; a non-numeric or non-positive override falls back to the default |
 | `LOG_FILE_BACKUP_COUNT` | `5` | Rotated backups of that file sink retained; a non-numeric or non-positive override falls back to the default |
@@ -172,7 +173,8 @@ flush so RabbitMQ does not keep delivering messages that the process cannot sett
 
 ## Health and logs
 
-The health server listens on port `8002`. Its JSON identifies the service as
+The health server listens on port `8002`, the role port for every SQL loader, unless
+`HEALTH_PORT` overrides it (the image `HEALTHCHECK` follows the override). Its JSON identifies the service as
 `discogs-sql-loader` and reports `starting`, `healthy`, or `unhealthy`, plus the current
 task, per-entity counts, active consumers, and completed files. Container logs are
 written through the shared structured-logging runtime under the same service name, to

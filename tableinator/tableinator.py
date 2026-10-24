@@ -1460,17 +1460,18 @@ async def main() -> None:
         )
         await asyncio.sleep(startup_delay)
 
-    # Start health server
-    health_server = HealthServer(8002, get_health_data)
-    health_server.start_background()
-    logger.info("🏥 Health server started on port 8002")
-
     # Initialize configuration
     try:
         config = TableinatorConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         return
+
+    # Start health server
+    health_server = HealthServer(config.health_port, get_health_data)
+    health_server.start_background()
+    logger.info(f"🏥 Health server started on port {config.health_port}", health_port=config.health_port)
+
     if os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline" and config.postgres_pool_max_size < 4:
         logger.error(
             "❌ Durable refresh needs at least four PostgreSQL pool connections (refresh transaction, lease heartbeat, health sampler, and delivery)",
