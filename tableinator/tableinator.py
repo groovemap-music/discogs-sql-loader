@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import sys
 import time
 from asyncio import run
 from datetime import UTC, datetime
@@ -1420,6 +1421,10 @@ async def progress_reporter() -> None:
             )
 
 
+class StartupFailure(Exception):
+    """Startup gave up; ``cli()`` turns this into exit status 1 so Docker restarts the service."""
+
+
 async def main() -> None:
     global \
         connection_pool, \
@@ -1465,7 +1470,7 @@ async def main() -> None:
         config = TableinatorConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
-        return
+        raise StartupFailure("configuration error") from e
 
     # Start health server
     health_server = HealthServer(config.health_port, get_health_data)
@@ -1477,7 +1482,7 @@ async def main() -> None:
             "❌ Durable refresh needs at least four PostgreSQL pool connections (refresh transaction, lease heartbeat, health sampler, and delivery)",
             configured_max=config.postgres_pool_max_size,
         )
-        return
+        raise StartupFailure("postgres pool max size below durable refresh minimum")
 
     # Parse host and port from address (POSTGRES_HOST may embed a port, e.g. a pooler)
     host, port = parse_postgres_host_port(config.postgres_host)
@@ -1533,7 +1538,7 @@ async def main() -> None:
         )
     except Exception as e:
         logger.error("❌ Failed to initialize connection pool", error=str(e))
-        return
+        raise StartupFailure("connection pool initialization failed") from e
 
     # Initialize async batch processor if enabled
     if BATCH_MODE:
@@ -1591,11 +1596,16 @@ async def main() -> None:
                     max_attempts=max_startup_retries,
                     error=str(e),
                 )
-                return
+                raise StartupFailure("AMQP broker unreachable") from e
 
     if amqp_connection is None:
+        if shutdown_requested:
+            # A signal arrived while still connecting: a requested stop, not a failed start.
+            logger.info("🛑 Shutdown requested before the AMQP connection was established")
+            shutdown_telemetry()
+            return
         logger.error("❌ No AMQP connection available")
-        return
+        raise StartupFailure("no AMQP connection available")
 
     async with amqp_connection:
         if durable_refresh_active and durable_refresh_ready:
@@ -1764,15 +1774,28 @@ async def main() -> None:
 
 
 def cli() -> None:
-    """Run the async service from its console-script entry point."""
+    """Run the async service from its console-script entry point.
+
+    A start that gives up (StartupFailure) or an unhandled error exits 1 so Docker's
+    ``restart: on-failure`` fires; a signal-driven shutdown returns normally and exits 0.
+    """
+    exit_code = 0
     try:
         run(main())
     except KeyboardInterrupt:
         logger.warning("⚠️ Application interrupted")
+    except StartupFailure as e:
+        logger.error("❌ Startup failed", reason=str(e))
+        exit_code = 1
     except Exception as e:
         logger.error("❌ Application error", error=str(e))
+        exit_code = 1
     finally:
+        if exit_code:
+            shutdown_telemetry()
         logger.info(f"✅ {SERVICE_NAME} shutdown complete")
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

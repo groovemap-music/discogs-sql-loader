@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tableinator.config import DEFAULT_HEALTH_PORT, TableinatorConfig
-from tableinator.tableinator import main
+from tableinator.tableinator import StartupFailure, main
 
 
 DOCKERFILE = (Path(__file__).parent.parent / "Dockerfile").read_text()
@@ -64,6 +64,7 @@ async def test_main_does_not_start_health_server_on_invalid_port() -> None:
         patch("tableinator.tableinator.setup_logging"),
         patch("tableinator.tableinator.HealthServer") as health_server,
         patch("tableinator.tableinator.logger") as logger,
+        pytest.raises(StartupFailure),
     ):
         await main()
     health_server.assert_not_called()
