@@ -14,6 +14,7 @@ from aio_pika.abc import AbstractIncomingMessage
 
 from tableinator.extraction_latch import LatchRelation
 from tableinator.tableinator import (
+    StartupFailure,
     channel_prefetch,
     check_all_consumers_idle,
     close_rabbitmq_connection,
@@ -26,7 +27,6 @@ from tableinator.tableinator import (
     schedule_consumer_cancellation,
     signal_handler,
 )
-from tableinator.tableinator import StartupFailure
 
 
 # SimpleConnectionPool tests removed as we now use AsyncPostgreSQLPool
