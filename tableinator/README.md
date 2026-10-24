@@ -32,7 +32,7 @@ guard refuses suspicious cleanup after a resumed extraction.
 - Console command: `uv run discogs-sql-loader`
 - Python: 3.14
 - Python entry point: `tableinator.tableinator:cli`
-- Health endpoint: `http://localhost:8002/health`
+- Health endpoint: `http://localhost:8002/health` (role port `8002`; override with `HEALTH_PORT`)
 - Local image: `discogs-sql-loader:local`
 - Published image: `ghcr.io/groovemap-music/discogs-sql-loader`
 

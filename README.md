@@ -9,7 +9,7 @@ flowchart LR
     ingestion[discogs-ingestion] -->|Discogs catalog events| rabbit[(RabbitMQ)]
     rabbit --> loader[discogs-sql-loader]
     loader -->|batched idempotent upserts| postgres[(PostgreSQL)]
-    loader -->|status on port 8002| health[Health endpoint]
+    loader -->|status on role port 8002, HEALTH_PORT overrides| health[Health endpoint]
 ```
 
 The loader accepts the versioned `groovemap.catalog-events` contract on four durable

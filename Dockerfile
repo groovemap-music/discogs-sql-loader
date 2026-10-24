@@ -49,9 +49,10 @@ ENV HOME=/home/groovemap \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH"
 
+# 8002 is the SQL-loader role port; HEALTH_PORT overrides it (the probe below follows it).
 EXPOSE 8002
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD ["/app/.venv/bin/python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8002/health', timeout=5).read()"]
+    CMD ["/app/.venv/bin/python", "-c", "import os; from urllib.request import urlopen; urlopen('http://127.0.0.1:' + os.environ.get('HEALTH_PORT', '8002') + '/health', timeout=5).read()"]
 
 USER 1000:1000
 ENTRYPOINT ["/app/.venv/bin/discogs-sql-loader"]

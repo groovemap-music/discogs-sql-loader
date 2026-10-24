@@ -35,7 +35,7 @@ handlers cannot exhaust the pool while holding hundreds of unacknowledged messag
 
 ## Recovery checks
 
-The health endpoint at `http://localhost:8002/health` reports `starting` while the pool
+The health endpoint at `http://localhost:8002/health` (port `HEALTH_PORT`, default `8002`) reports `starting` while the pool
 is not initialized, `healthy` when the pool and consumers are usable, and `unhealthy`
 when the pool is lost or the service detects an unexpected no-consumer state. The
 periodic checker reconnects RabbitMQ and recreates consumers when work returns.
