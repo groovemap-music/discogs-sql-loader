@@ -5,22 +5,23 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent.parent
-AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
+AUTOMATION_CI_REVISION = "dbf22ed83d486e9484fc8c6385c7c3e5995700e4"
+AUTOMATION_RELEASE_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 PYTHON_LIBRARIES_REVISION = "9bac0220df80fdb550fde78d4db8228ca4273625"
 
 
 def test_reusable_workflows_are_immutably_pinned() -> None:
     expected = {
-        "ci.yml": "reusable-ci.yml",
-        "release.yml": "reusable-release.yml",
+        "ci.yml": ("reusable-ci.yml", AUTOMATION_CI_REVISION),
+        "release.yml": ("reusable-release.yml", AUTOMATION_RELEASE_REVISION),
     }
-    for name, reusable_name in expected.items():
+    for name, (reusable_name, revision) in expected.items():
         workflow = (ROOT / ".github" / "workflows" / name).read_text()
         refs = re.findall(
             rf"uses: groovemap-music/automation/\.github/workflows/{reusable_name}@([^\s]+)",
             workflow,
         )
-        assert refs == [AUTOMATION_REVISION]
+        assert refs == [revision]
         assert "groovemap-music/.github/" not in workflow
         assert "secrets: inherit" not in workflow
 
