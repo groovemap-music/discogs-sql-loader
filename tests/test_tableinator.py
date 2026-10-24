@@ -14,6 +14,7 @@ from aio_pika.abc import AbstractIncomingMessage
 
 from tableinator.extraction_latch import LatchRelation
 from tableinator.tableinator import (
+    StartupFailure,
     channel_prefetch,
     check_all_consumers_idle,
     close_rabbitmq_connection,
@@ -728,8 +729,9 @@ class TestMain:
         # Make pool initialization fail
         mock_pool_class.side_effect = Exception("Cannot create pool")
 
-        # Should complete without raising
-        await main()
+        # A start that cannot reach PostgreSQL gives up; cli() maps this to exit 1
+        with pytest.raises(StartupFailure):
+            await main()
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.setup_logging")
@@ -2868,6 +2870,7 @@ class TestMainEnvironmentVariables:
             patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
             patch("asyncio.sleep") as mock_sleep,
             patch("tableinator.tableinator.TableinatorConfig.from_env", side_effect=ValueError("Test error")),
+            pytest.raises(StartupFailure),
         ):
             await main()
 
@@ -2890,10 +2893,11 @@ class TestMainEnvironmentVariables:
         with (
             patch("tableinator.tableinator.TableinatorConfig.from_env", side_effect=ValueError("Invalid config")),
             patch("tableinator.tableinator.logger") as mock_logger,
+            pytest.raises(StartupFailure),
         ):
             await main()
 
-        # Should log error and return
+        # Should log the error, then give up
         mock_logger.error.assert_called()
 
 
@@ -3847,10 +3851,11 @@ class TestMainFullRun:
                 patch("tableinator.tableinator.signal.signal"),
             ):
                 mock_hs.return_value = MagicMock()
-                await main()
+                with pytest.raises(StartupFailure):
+                    await main()
 
-            # All startup retries were attempted, then main returned at the
-            # "No AMQP connection available" guard (never opening the channel).
+            # All startup retries were attempted, then main gave up
+            # (never opening the channel).
             assert mock_rabbitmq_instance.connect.await_count >= 1
             mock_rabbitmq_instance.channel.assert_not_called()
         finally:

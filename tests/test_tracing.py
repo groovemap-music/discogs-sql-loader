@@ -25,7 +25,7 @@ from opentelemetry.trace import NoOpTracerProvider, SpanKind, StatusCode
 from tableinator import telemetry
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
 from tableinator.batch_writer import BatchWriteResult
-from tableinator.tableinator import main, make_data_handler
+from tableinator.tableinator import StartupFailure, main, make_data_handler
 
 
 if TYPE_CHECKING:
@@ -527,10 +527,11 @@ class TestEventLoopMonitor:
 
         monkeypatch.setattr("tableinator.tableinator.setup_telemetry", record("setup_telemetry"))
         monkeypatch.setattr("tableinator.tableinator.start_event_loop_monitor", record("start_event_loop_monitor"))
-        # Fail configuration so main() returns immediately after the telemetry bootstrap.
+        # Fail configuration so main() gives up immediately after the telemetry bootstrap.
         monkeypatch.setattr("tableinator.tableinator.TableinatorConfig.from_env", Mock(side_effect=ValueError("no config")))
 
-        await main()
+        with pytest.raises(StartupFailure):
+            await main()
 
         assert [name for name, _ in calls] == ["setup_telemetry", "start_event_loop_monitor"]
         assert calls[1][1] is asyncio.get_running_loop()
