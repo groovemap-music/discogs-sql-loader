@@ -1,6 +1,5 @@
 """cli() exit status: a failed start exits 1 (Docker restart: on-failure), a clean stop exits 0."""
 
-from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -73,12 +72,13 @@ def _pool_ok() -> Any:
     return patch("tableinator.tableinator.AsyncPostgreSQLPool", return_value=pool)
 
 
-_PROBES: Callable[[], list[Any]] = lambda: [  # noqa: E731
-    _pool_ok(),
-    patch("tableinator.tableinator.probe_latch_relation", AsyncMock(return_value=None)),
-    patch("tableinator.tableinator.probe_durable_schema", AsyncMock(return_value=False)),
-    patch("tableinator.tableinator.asyncio.sleep", AsyncMock()),
-]
+def _probes() -> list[Any]:  # noqa: N802
+    return [
+        _pool_ok(),
+        patch("tableinator.tableinator.probe_latch_relation", AsyncMock(return_value=None)),
+        patch("tableinator.tableinator.probe_durable_schema", AsyncMock(return_value=False)),
+        patch("tableinator.tableinator.asyncio.sleep", AsyncMock()),
+    ]
 
 
 def test_amqp_unreachable_exits_1() -> None:
@@ -86,7 +86,7 @@ def test_amqp_unreachable_exits_1() -> None:
     manager.connect = AsyncMock(side_effect=OSError("broker down"))
     _expect_exit_1(
         REQUIRED_ENV,
-        *_PROBES(),
+        *_probes(),
         patch("tableinator.tableinator.AsyncResilientRabbitMQ", return_value=manager),
     )
 
@@ -96,7 +96,7 @@ def test_no_amqp_connection_exits_1() -> None:
     manager.connect = AsyncMock(return_value=None)
     _expect_exit_1(
         REQUIRED_ENV,
-        *_PROBES(),
+        *_probes(),
         patch("tableinator.tableinator.AsyncResilientRabbitMQ", return_value=manager),
     )
 
