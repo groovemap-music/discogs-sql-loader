@@ -35,7 +35,6 @@ def test_public_documentation_uses_mermaid_and_records_compatibility() -> None:
     assert "```mermaid" in implementation
     assert "ghcr.io/groovemap-music/discogs-sql-loader" in readme
     assert "AMQP consumer key `tableinator`" in compatibility
-    assert "Historical `discogsography-*` issue IDs" in compatibility
 
 
 def test_documented_defaults_and_schema_ownership_match_promoted_contracts() -> None:

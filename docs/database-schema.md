@@ -42,12 +42,28 @@ The media shape is owned by
 [ADR 0007](https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md),
 while the column and index remain owned by `database-schema`.
 
+## Graph relations and refresh coordination
+
+On the same transaction as each entity upsert, the loader writes the vertex and edge rows
+the document asserts into the schema-owned `graph` schema (`tableinator/graph_writer.py`).
+Relations shared with `musicbrainz-sql-loader`, such as `graph.issued_on` and
+`graph.credited_to`, carry a `source` column, and every delete this loader issues against
+them is scoped to `source = 'discogs'`. After a complete extraction it also refreshes the
+derived counter and path relations (`tableinator/graph_counters.py`).
+
+Extraction signals and the derived-refresh obligation are recorded in
+`public.loader_extraction_latch`, `public.loader_derived_refresh_cursor`, and
+`public.loader_derived_refresh_job`. See
+[the derived-refresh acknowledgement budget](derived-refresh-ack-budget.md) for the durable
+handoff, and [Cross-store parity](store-parity.md) for how the graph rows are held to the
+Neo4j projection. All of these relations are created and migrated by `database-schema`.
+
 ## Native identity
 
 `gm_item_id` is the GrooveMap catalog item the row's Discogs identifier maps to. The
 Discogs `data_id` remains the primary key and the conflict target; `gm_item_id` is an
 additive nullable column beside it, so a provider identifier is evidence rather than
-identity ([ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity.md)).
+identity ([ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity-and-provider-aliases.md)).
 
 The minting rule:
 

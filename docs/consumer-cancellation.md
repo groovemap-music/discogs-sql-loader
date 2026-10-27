@@ -16,9 +16,9 @@ sequenceDiagram
     alt flush committed
         P-->>L: success
         L->>L: mark entity complete
-        L->>L: wait CONSUMER_CANCEL_DELAY
-        L->>R: cancel entity consumer
+        L->>L: schedule cancellation after CONSUMER_CANCEL_DELAY
         L-->>R: acknowledge file_complete
+        L->>R: cancel entity consumer when the grace period ends
     else flush failed
         P-->>L: failure
         L-->>R: negative acknowledge and requeue

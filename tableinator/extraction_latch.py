@@ -20,7 +20,7 @@ message carries, so each dump collects its own four.
 
 **Durable.** `graphinator` writes its latch to Neo4j BEFORE acking the trigger, because the
 ack destroys the queued message, which was otherwise the only durable copy of the
-coordination state (discogsography-tk7v). An in-memory set has the same hole: a restart
+coordination state. An in-memory set has the same hole: a restart
 between the second and third signal loses the two already collected, the remaining two can
 never reach four, and the refresh silently never runs for that dump.
 

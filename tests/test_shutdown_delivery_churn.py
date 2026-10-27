@@ -1,4 +1,4 @@
-"""Regression coverage for shutdown delivery churn (historical issue discogsography-lnn4)."""
+"""Regression coverage for shutdown delivery churn: unsettled deliveries are not nacked into a redelivery loop."""
 
 from unittest.mock import AsyncMock, patch
 

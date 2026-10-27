@@ -88,7 +88,7 @@ detached with its own retry, because holding the delivery across unbounded work 
 RabbitMQ's 30-minute consumer ack timeout, which closes the SHARED channel with
 PRECONDITION_FAILED: all four consumers die, the signal is redelivered, the sweep restarts
 from scratch, and after `x-delivery-limit=20` redeliveries the trigger is dead-lettered and
-maintenance never completes at all (discogsography-zjja). The latch and schema-owned
+maintenance never completes at all. The latch and schema-owned
 job in `tableinator.durable_refresh` make the worker restart-safe; the measurement
 and cutover gates are in `docs/derived-refresh-ack-budget.md`.
 """

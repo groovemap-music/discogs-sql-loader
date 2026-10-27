@@ -133,8 +133,8 @@ def _purge_delete(relation: str, column: str, entity_table: str, source_scoped: 
 
     The stale set is named by the same `updated_at` predicate the entity purge itself runs,
     joined server-side, so no deleted id is ever streamed back and buffered — a purge of a
-    shrunk dump stays O(1) in the client, which is the property `discogsography-6u1o` asked
-    for and the reason this is not `DELETE ... RETURNING data_id`.
+    shrunk dump stays O(1) in the client however many rows it removes, which is the reason
+    this is not `DELETE ... RETURNING data_id`.
     """
     predicate = sql.SQL("edge.{column} = stale.data_id").format(column=sql.Identifier(column))
     if source_scoped:

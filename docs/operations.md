@@ -68,6 +68,8 @@ preferred for deployed containers.
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
 | `HEALTH_PORT` | `8002` | Health server port; `8002` is the role port for every SQL loader. An invalid value (non-numeric or outside `1`-`65535`) fails startup with a configuration error instead of falling back |
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
+| `LOG_LEVEL` | `INFO` | Log verbosity; an unrecognized value falls back to `INFO` |
+| `ENVIRONMENT` | `development` | Value of the `environment` field on every log entry; does not change verbosity |
 | `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size that rolls the `/logs/discogs-sql-loader.log` file sink over; a non-numeric or non-positive override falls back to the default |
 | `LOG_FILE_BACKUP_COUNT` | `5` | Rotated backups of that file sink retained; a non-numeric or non-positive override falls back to the default |
 | `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |

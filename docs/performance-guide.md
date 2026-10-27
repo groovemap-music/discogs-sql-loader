@@ -57,8 +57,10 @@ The `extraction_complete` derived-relation pass has a separate, much larger
 acknowledgement budget. See [the promoted-schema measurement and durable-handoff
 design](derived-refresh-ack-budget.md): a million-release local pass took 109–121
 seconds, but the full-dump scale cannot be certified under RabbitMQ's 1,800-second
-timeout from that result. Until a durable job is committed before acknowledgement,
-the refresh remains inline and a full dump is at risk of broker timeout.
+timeout from that result. The default `DERIVED_REFRESH_MODE=durable` therefore commits
+the fourth signal and a pending job before acknowledgement and runs the refresh in a
+worker outside the acknowledgement window. `DERIVED_REFRESH_MODE=inline` restores the
+commit-before-ack refresh, which remains uncertified for a full dump.
 
 ## Other performance owners
 
