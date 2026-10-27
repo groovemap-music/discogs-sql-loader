@@ -76,6 +76,27 @@
     "rollback": "every destructive migration requires a tested rollback or restore procedure"
   },
   "contract": "groovemap.persistence",
+  "extraction_history_source": {
+    "check": {
+      "allowed": [
+        "discogs",
+        "musicbrainz"
+      ],
+      "constraint": "extraction_history_source_check",
+      "null_allowed": true
+    },
+    "column": "source",
+    "consumers": [
+      "catalog-api"
+    ],
+    "data": "no default and no backfill: rows written before the column existed keep source NULL, meaning the extractor was not recorded",
+    "index": "idx_extraction_history_source_created_at ON extraction_history (source, created_at DESC)",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "relation": "public.extraction_history",
+    "type": "VARCHAR(20) NULL",
+    "consumer_rollout": "expand phase: catalog-api pins the revision containing this column before it writes or reads source"
+  },
   "extraction_latch": {
     "columns": {
       "loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
@@ -138,6 +159,180 @@
     "semantics": "The future loader commits the final signal and pending job before acknowledging its delivery. It scans due and expired jobs at startup and periodically, claims transactionally with row locking, and fences on both lease token/epoch and the per-loader cursor at the refresh transaction's commit. Refresh, latch stamp, and completed state commit atomically. A failure rolls back or schedules bounded retry; a superseded generation cannot stamp refreshed_at. No delivery may be acknowledged while its sole refresh obligation is in process memory.",
     "rollout": "Schema first. Existing latch rows have NULL generation and remain readable by the current inline writer; the loader cutover must reconcile any unfinished legacy latch before acknowledging a terminal signal under the new protocol. Neither relation schedules work until a loader adopts it. Reverting the loader to inline behavior is safe while retaining these additive objects.",
     "failure_visibility": "The loader must expose pending age, current and last completed versions, attempt count, lease expiry, retry due, sanitized last failure, and superseded count; the schema stores these facts but does not report health itself."
+  },
+  "identity_link_events": {
+    "checks": {
+      "dated_from": [
+        "musicbrainz_fullexport",
+        "groovemap_load"
+      ],
+      "events": [
+        "link_added",
+        "link_changed",
+        "link_removed"
+      ],
+      "link_matches_event": {
+        "constraint": "identity_link_events_link_matches_event",
+        "link_added": "discogs_id_before IS NULL and discogs_id_after IS NOT NULL",
+        "link_changed": "both set and distinct",
+        "link_removed": "discogs_id_before IS NOT NULL and discogs_id_after IS NULL"
+      },
+      "provider": [
+        "musicbrainz"
+      ]
+    },
+    "columns": [
+      "id",
+      "provider",
+      "entity_kind",
+      "external_id",
+      "event",
+      "discogs_id_before",
+      "discogs_id_after",
+      "event_at",
+      "dated_from",
+      "source_ref",
+      "decision_ref",
+      "recorded_at"
+    ],
+    "consumers": [
+      "catalog-api",
+      "musicbrainz-sql-loader"
+    ],
+    "design_decision": "One store for the Identity Ledger's dated link changes, from both the one-time full-export backfill and live loads. provider_aliases and catalog_item_supersessions stamp now() at write time and a supersession's cause is a closed set, so neither can date a link change. dated_from keeps the two provenances apart: a backfilled event reads 'dated from the MusicBrainz full export' because about 9% of its dates belong to older links MusicBrainz replaced, while a load event is dated by its own transaction. discogs_id_before and discogs_id_after are BIGINT, the type of the musicbrainz.*.discogs_*_id columns. entity_kind takes the values provider_aliases uses for MusicBrainz rows. decision_ref is a bare UUID naming the backfill run's admin_audit_log entry and is NULL for a load row. No user data is stored.",
+    "idempotence_key": {
+      "columns": [
+        "dated_from",
+        "source_ref",
+        "provider",
+        "entity_kind",
+        "external_id",
+        "event",
+        "event_at"
+      ],
+      "constraint": "identity_link_events_idempotence_key",
+      "meaning": "a rerun of the same backfill or load inserts the same keys, so INSERT ... ON CONFLICT DO NOTHING makes it a no-op"
+    },
+    "indexes": [
+      "idx_identity_link_events_entity_event_at ON identity_link_events (provider, entity_kind, external_id, event_at)",
+      "idx_identity_link_events_event_at ON identity_link_events (event_at)"
+    ],
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "relation": "public.identity_link_events",
+    "consumer_rollout": "expand phase: catalog-api and musicbrainz-sql-loader pin the revision containing this table before they write or read it"
+  },
+  "identity_ledger_precompute": {
+    "consumers": [
+      "catalog-api"
+    ],
+    "design_decision": "catalog-api's Identity Ledger works list and density routes computed every release item's event history per request (71.5 s p95 for the default works list at 50% scale, against a 2 s budget), and no index helps because each statement aggregates the whole history before it filters. Four materialized views hold what those statements compute, refreshed off the request path by one function. The definitions are catalog-api's route SQL with the filters lifted out, as its prototype composed them (scripts/ledger_scale.py, _view_statements, catalog-api 6d744e2); the integration suite pins row-for-row parity with that prototype. They are declared after the graph statements because they read graph.derived_from, and each after the views it reads.",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "populate": "every view is created WITH NO DATA, so applying the schema never runs the whole history inline; until the first refresh, reading a view raises 'materialized view ... has not been populated' (SQLSTATE 55000), which catalog-api reads as not refreshed yet; reapplying the schema never repopulates or empties a view",
+    "refresh": {
+      "freshness": "each REFRESH takes its own snapshot, so the views can differ by writes committed between them and refreshed_at is a lower bound on freshness; freshness is bounded by catalog-api's refresh trigger, since this repository never calls the function",
+      "function": "public.identity_ledger_refresh(source_watermark jsonb DEFAULT NULL) RETURNS timestamptz",
+      "locking": "an unpopulated view (pg_class.relispopulated false) is refreshed plainly under ACCESS EXCLUSIVE, since CONCURRENTLY refuses one; a populated view is refreshed CONCURRENTLY under EXCLUSIVE, which conflicts with no reader's ACCESS SHARE, so readers never block and keep the previous rows until the refresh commits",
+      "order": [
+        "identity_ledger_edition_events",
+        "identity_ledger_edition_parents",
+        "identity_ledger_work_summary",
+        "identity_ledger_density"
+      ],
+      "privilege": "SECURITY INVOKER: REFRESH needs the views' owner, or MAINTAIN on PostgreSQL 17+. catalog-api connects as the login that owns public, like every service (deployment .env.example), and EXECUTE defaults to PUBLIC, so no grant is declared; a separate catalog-api login would need GRANT MAINTAIN on the four views and GRANT SELECT, INSERT, UPDATE on identity_ledger_refresh_state",
+      "returns": "refreshed_at, the instant the refresh started; the whole refresh and the state upsert run in the caller's one transaction"
+    },
+    "refresh_state": {
+      "columns": [
+        "singleton",
+        "refreshed_at",
+        "duration",
+        "source_watermark"
+      ],
+      "meaning": "one row (singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton)), upserted by each refresh with its start instant, duration, and the caller's watermark (JSONB, NULL when the caller names none); empty until the first refresh",
+      "relation": "public.identity_ledger_refresh_state"
+    },
+    "views": {
+      "identity_ledger_edition_events": {
+        "columns": [
+          "edition_id",
+          "at",
+          "type",
+          "events"
+        ],
+        "indexes": [
+          "idx_identity_ledger_edition_events_at ON public.identity_ledger_edition_events (at)",
+          "idx_identity_ledger_edition_events_type_at ON public.identity_ledger_edition_events (type, at)"
+        ],
+        "meaning": "every non-mint event of a release item, per edition (the item resolved one hop), instant and type, with its count; both sides of a supersession count",
+        "unique": {
+          "columns": [
+            "edition_id",
+            "at",
+            "type"
+          ],
+          "index": "idx_identity_ledger_edition_events_key"
+        }
+      },
+      "identity_ledger_edition_parents": {
+        "columns": [
+          "edition_id",
+          "work_id"
+        ],
+        "indexes": [],
+        "meaning": "every work parent of every evented edition: the Discogs master through graph.derived_from and the release group through musicbrainz.releases, each through its current alias, resolved one hop",
+        "unique": {
+          "columns": [
+            "edition_id",
+            "work_id"
+          ],
+          "index": "idx_identity_ledger_edition_parents_key"
+        }
+      },
+      "identity_ledger_work_summary": {
+        "columns": [
+          "work_id",
+          "event",
+          "evented_editions",
+          "repaired_editions",
+          "first_event",
+          "last_event"
+        ],
+        "indexes": [
+          "idx_identity_ledger_work_summary_page ON public.identity_ledger_work_summary (event, last_event DESC, work_id)"
+        ],
+        "meaning": "one row per work with event = 'any' (every event type), plus one per work and event type; repaired means reattached, promoted, or reverted. The 'any' sentinel, not NULL, keeps the unique index usable by REFRESH ... CONCURRENTLY",
+        "unique": {
+          "columns": [
+            "event",
+            "work_id"
+          ],
+          "index": "idx_identity_ledger_work_summary_key"
+        }
+      },
+      "identity_ledger_density": {
+        "columns": [
+          "kind",
+          "month",
+          "type",
+          "dated_from",
+          "events"
+        ],
+        "indexes": [],
+        "meaning": "events per UTC month, type and provenance for each of release, master, artist and label, as catalog-api's density statement counts them",
+        "unique": {
+          "columns": [
+            "kind",
+            "month",
+            "type",
+            "dated_from"
+          ],
+          "index": "idx_identity_ledger_density_key"
+        }
+      }
+    },
+    "consumer_rollout": "expand phase: catalog-api pins the revision containing these objects before it reads the views or calls the refresh"
   },
   "graph_schema": {
     "availability": "unconditional",
@@ -281,8 +476,39 @@
     "key_columns": {
       "availability": "unconditional",
       "kind": "additive",
-      "note": "Every key column of every graph relation is text. The four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start. This keeps ordinary SQL joins consistent and retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements.",
-      "type": "text"
+      "note": "Key columns are not all text. Discogs vertex and edge keys (artist_id, label_id, master_id, release_id, medium_id, company_id, sublabel_id, and the genre, style, person, and media-family names) are text: the four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start, which retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements. The exceptions are recorded under types and are the types the relations actually declare: uuid for the identifiers of the application-owned relations and for every MusicBrainz mbid, bigint for track ordinals and MusicBrainz relationship ids, and \"char\" for graph.vertex_degree.kind. graph.collected.release_id and graph.wants.release_id also publish data_id::text, so every Discogs graph key is text and a join against graph.release.release_id needs no cast; schema init converges an existing database by dropping and recreating those two views when the column still reads as another type.",
+      "types": {
+        "bigint": [
+          "graph.mb_rel_*.relationship_id",
+          "graph.track_by_artist.sub_track_ordinal",
+          "graph.track_by_artist.track_ordinal",
+          "graph.track_credited_on.sub_track_ordinal",
+          "graph.track_credited_on.track_ordinal"
+        ],
+        "char": [
+          "graph.vertex_degree.kind"
+        ],
+        "text": "every other key column of every loader-written table, and the key column of the Discogs vertex views (graph.artist.artist_id, graph.label.label_id, graph.master.master_id, graph.release.release_id) and of graph.collected.release_id, graph.wants.release_id, graph.sublabel_of, graph.part_of, graph.in_family, and graph.release_degree",
+        "uuid": [
+          "graph.app_user.user_id",
+          "graph.catalog_item.item_id",
+          "graph.collected.collection_id",
+          "graph.collected.user_id",
+          "graph.mb_artist.mbid",
+          "graph.mb_label.mbid",
+          "graph.mb_rel_*.source_mbid",
+          "graph.mb_rel_*.target_mbid",
+          "graph.mb_release.mbid",
+          "graph.mb_release_group.mbid",
+          "graph.owns.artifact_id",
+          "graph.owns.collection_row_id",
+          "graph.owns.item_id",
+          "graph.owns.owned_copy_id",
+          "graph.owns.user_id",
+          "graph.wants.user_id",
+          "graph.wants.wantlist_id"
+        ]
+      }
     },
     "kind": "additive",
     "member_of_union": {
@@ -304,7 +530,7 @@
         "graph.mb_rel_artist_artist"
       ]
     },
-    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, one more is the cross-provenance MEMBER_OF union recorded under graph_schema.member_of_union, one more is the per-vertex degree recorded under graph_schema.vertex_degree, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
+    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, one more is the cross-provenance MEMBER_OF union recorded under graph_schema.member_of_union, one more is the per-vertex degree recorded under graph_schema.vertex_degree, two more (graph.track_credited_on and graph.track_by_artist) are the track-level credits and performers that never had a view, which makes thirty-one tables, and the remaining thirty-seven relations are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
     "path_function": {
       "availability": "unconditional",
       "clamped_to": [
@@ -688,6 +914,24 @@
   "owners": [
     "database-schema"
   ],
+  "retired_relations": {
+    "consumer_rollout": "contract phase of expand, migrate consumers, then contract: catalog-api stopped writing and reading both tables (gm-catalog-api-gz4r) and operations-console reads queue and service-health history from VictoriaMetrics, so the drop lands only after a catalog-api release containing that removal is deployed",
+    "data": "historical rows are not migrated; VictoriaMetrics holds the same series at finer resolution for its retention window (ADR 0018)",
+    "decision": "design ADR 0018",
+    "drop_statements": {
+      "public.queue_metrics": "DROP TABLE IF EXISTS queue_metrics",
+      "public.service_health_metrics": "DROP TABLE IF EXISTS service_health_metrics"
+    },
+    "indexes_dropped_with_table": [
+      "idx_queue_metrics_recorded_queue",
+      "idx_service_health_recorded_service"
+    ],
+    "kind": "retirement",
+    "relations": [
+      "public.queue_metrics",
+      "public.service_health_metrics"
+    ]
+  },
   "sources": [
     "src/groovemap_schema/neo4j.py",
     "src/groovemap_schema/postgres.py"
