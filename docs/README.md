@@ -5,7 +5,7 @@ Start with these repository-specific guides:
 - [Operations](operations.md) — inputs, PostgreSQL output, configuration, health,
   restart and completion behavior, validation, and troubleshooting.
 - [Compatibility identifiers](compatibility.md) — names retained to preserve Python
-  imports, durable AMQP queues, and regression provenance.
+  imports and durable AMQP queues.
 - [Consumer cancellation and draining](consumer-cancellation.md) — how terminal
   messages stop deliveries without losing accepted work.
 - [File completion tracking](file-completion-tracking.md) — file and extraction
@@ -19,6 +19,9 @@ Start with these repository-specific guides:
   non-batch modes bound connection demand.
 - [PostgreSQL persistence boundary](database-schema.md) — tables and write invariants
   this consumer relies on, with links to the owning schema repository.
+- [Derived-refresh acknowledgement budget](derived-refresh-ack-budget.md) — the
+  measured refresh cost against RabbitMQ's acknowledgement timeout and the durable
+  handoff that runs the refresh outside it.
 - [Cross-store parity](store-parity.md) — the opt-in lane that holds this loader's graph
   to the graph enricher's, and the differences on record between them.
 - [Query performance ownership](query-performance-optimizations.md) — pointers to the

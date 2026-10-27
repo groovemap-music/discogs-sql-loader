@@ -72,7 +72,7 @@ class TestGetConnection:
 
 
 class TestChannelPrefetch:
-    """discogsography-4fio: QoS must be coupled to the PostgreSQL pool in non-batch mode.
+    """QoS must be coupled to the PostgreSQL pool in non-batch mode.
 
     In non-batch mode every in-flight handler holds a pooled connection for its upsert.
     Per-consumer QoS of 200 across 4 consumers put 800 handlers in flight against a
@@ -229,7 +229,7 @@ class TestOnDataMessage:
     async def test_reject_on_shutdown(self) -> None:
         """During shutdown a message is left UNSETTLED, not nacked.
 
-        discogsography-lnn4: a still-subscribed consumer would be redelivered a
+        A still-subscribed consumer would be redelivered a
         nacked message within milliseconds, burning one quorum x-delivery-count
         per cycle until x-delivery-limit=20 dead-letters a perfectly valid record.
         Leaving it unsettled defers redelivery to connection close.
@@ -274,7 +274,7 @@ class TestOnDataMessage:
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_batch_mode_nack_callback_uses_requeue_false(self) -> None:
-        """Regression (cu2.52): the batch-mode add_message nack callback must use
+        """The batch-mode add_message nack callback must use
         requeue=False.
 
         add_message invokes nack_callback only for permanently-invalid input
@@ -345,7 +345,7 @@ def _make_purge_connection(total_count: int, stale_count: int) -> tuple[MagicMoc
     fetchone yields the total-row count then the would-be-deleted count;
     rowcount (only meaningful once the DELETE itself runs) reports the actual
     affected-row count purge_stale_rows now reads directly — no RETURNING/
-    fetchall (discogsography-6u1o).
+    fetchall.
     """
     mock_cursor = AsyncMock()
     mock_cursor.execute = AsyncMock()
@@ -368,7 +368,7 @@ def _make_purge_connection(total_count: int, stale_count: int) -> tuple[MagicMoc
 
 
 class TestPurgeStaleRowsGuards:
-    """Regression tests for discogsography-cu2.2 — resumed-extraction mass data loss.
+    """Regression tests for resumed-extraction mass data loss.
 
     On a resumed extraction the extractor skips files completed in an earlier session,
     so a data type can receive an extraction_complete signal while zero records were
@@ -489,7 +489,7 @@ class TestPurgeStaleRowsGuards:
 
 
 class TestPurgeStaleRowsDeleteIsO1Memory:
-    """discogsography-6u1o: the DELETE must never stream every deleted data_id
+    """The DELETE must never stream every deleted data_id
     back over the wire and buffer it into a Python list purely to len() a
     count already known — that is an O(n) allocation (potentially multi-GB
     on a large purge) where O(1) suffices via cursor.rowcount."""
@@ -1008,7 +1008,7 @@ class TestOnDataMessageExtended:
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_extraction_complete_marks_the_type_complete(self) -> None:
-        """discogsography-ewvh: extraction_complete is the type's terminal signal.
+        """extraction_complete is the type's terminal signal.
 
         completed_files was written only by file_complete and erased by
         _recover_consumers for any type whose queue still holds messages — and when the
@@ -1135,7 +1135,7 @@ class TestOnDataMessageExtended:
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_extraction_complete_skips_purge_after_dlq_nacks(self) -> None:
-        """discogsography-x763: if a message for this data_type was nacked to the
+        """If a message for this data_type was nacked to the
         DLQ this run (poison batch, missing id, normalize failure), purge_stale_rows
         must NOT run — those rows' updated_at was never refreshed, so purging would
         delete dump-present records beyond the DLQ. The extraction_complete message
@@ -1186,7 +1186,7 @@ class TestOnDataMessageExtended:
     @pytest.mark.parametrize("bad_id", [None, ""])
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_handles_falsy_id_field(self, bad_id: str | None) -> None:
-        """discogsography-ria1: a present-but-falsy id is just as invalid as a missing one.
+        """A present-but-falsy id is just as invalid as a missing one.
 
         Key-presence-only validation let `"id": null` reach an INSERT into a NOT NULL
         PRIMARY KEY; the resulting deterministic IntegrityError fell to the generic
@@ -1354,7 +1354,7 @@ class TestOnDataMessageExtended:
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", True)
     async def test_rejects_message_when_shutdown_requested(self) -> None:
-        """Messages received during shutdown are left unsettled (discogsography-lnn4)."""
+        """Messages received during shutdown are left unsettled, not nacked."""
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps({"id": "1", "name": "Test"}).encode()
         mock_message.routing_key = "artists"
@@ -2183,7 +2183,7 @@ class TestOnDataMessageDatabaseOperations:
     @patch("tableinator.tableinator.shutdown_requested", False)
     @patch("tableinator.tableinator.BATCH_MODE", False)
     async def test_handles_integrity_error_without_requeue(self, sample_artist_data: dict[str, Any]) -> None:
-        """discogsography-yuyg (mirror): a constraint violation is deterministic.
+        """A constraint violation is deterministic (mirrors the brainz consumers).
 
         IntegrityError (e.g. NotNullViolation) is not a subclass of DataError, so it
         used to reach the generic handler and be nacked with requeue=True, spending all
@@ -3059,7 +3059,7 @@ class TestRecoverConsumersTableinator:
 
     @pytest.mark.asyncio
     async def test_recovers_all_types_not_just_backlogged(self) -> None:
-        """Regression (cu2.53): recovery must start consumers for ALL data types,
+        """Recovery must start consumers for ALL data types,
         not only those with a backlog at the passive-declare instant.
 
         With a partial backlog (only 'artists' has messages), the old loop over
@@ -3110,7 +3110,7 @@ class TestRecoverConsumersTableinator:
 
     @pytest.mark.asyncio
     async def test_error_after_partial_registration_clears_consumer_tags(self) -> None:
-        """Regression (cu2.54): if recovery errors after ≥1 consumer registered,
+        """If recovery errors after ≥1 consumer registered,
         the except block must clear consumer_tags.
 
         The consumers registered before the error died with the now-closed
@@ -3938,7 +3938,7 @@ class TestMainFullRun:
 
 
 class TestOutageRequeueBackoff:
-    """Regression tests for discogsography-rb05 (mirror of the brainz consumers)."""
+    """Regression tests for requeue throttling during a PostgreSQL outage (mirror of the brainz consumers)."""
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)

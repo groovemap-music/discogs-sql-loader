@@ -96,7 +96,7 @@ class PostgreSQLRecordPersistence:
                     # The edges of the documents this DELETE is about to remove, swept
                     # first so the join that names them still has rows to join against.
                     # Set-based and server-side: no deleted id is streamed back, which is
-                    # what keeps a large purge O(1) in the client (discogsography-6u1o).
+                    # what keeps a large purge O(1) in the client.
                     await purge_document_graph(cursor, data_type, started_at_dt)
 
                     await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
@@ -130,9 +130,8 @@ class PostgreSQLRecordPersistence:
         # the row's prior hash in a `prior` CTE — evaluated on the pre-statement snapshot,
         # so it sees the hash the upsert is about to overwrite — and return whether this
         # event's payload differs from it. A separate SELECT would be a second round trip
-        # for an answer the one statement already has (discogsography-hh7r's single-upsert
-        # shape), and an absent `prior` row is a first sight of the document, which changes
-        # everything there is to change.
+        # for an answer the one statement already has, and an absent `prior` row is a first
+        # sight of the document, which changes everything there is to change.
         content_changed = True
         # One transaction for the document, its aliases, and its graph rows, exactly as
         # `purge_stale_rows` above and `PostgreSQLBatchWriter.process_batch` open one. The

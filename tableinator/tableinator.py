@@ -98,7 +98,7 @@ completed_files: set[str] = set()  # Track which files have completed processing
 # Non-batch mode only: throttles requeues while PostgreSQL is unavailable, so an
 # outage cannot burn the quorum queue's x-delivery-limit budget and dead-letter
 # valid records. Batch mode gets the same protection from _flush_queue's
-# re-enqueue+backoff, which never nacks (discogsography-rb05).
+# re-enqueue+backoff, which never nacks.
 outage_backoff = OutageBackoff(SERVICE_NAME)
 current_task = None
 current_progress = 0.0
@@ -303,8 +303,7 @@ def channel_prefetch() -> tuple[int, bool]:
       pool's ~15.5s exhausted-wait retry loop, applies backpressure. Without this,
       4 x 200 = 800 concurrent handlers raced for 12 connections; the losers raised,
       were nacked with ``requeue=True``, and burned the quorum queue's
-      ``x-delivery-limit: 20`` until the message was silently dead-lettered
-      (discogsography-4fio).
+      ``x-delivery-limit: 20`` until the message was silently dead-lettered.
     """
     if BATCH_MODE:
         # prefetch_count must be >= batch_size to allow batches to fill before flushing
@@ -948,7 +947,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
         # within milliseconds and nacked again, burning a quorum x-delivery-count
         # per cycle; at x-delivery-limit=20 valid records are dead-lettered within
         # a second of a routine restart. Returning without settling lets the
-        # connection close requeue them exactly once. See discogsography-lnn4.
+        # connection close requeue them exactly once.
         logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
         return
 
@@ -976,7 +975,6 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 # pending messages were about to refresh, while the service
                 # reports success. Requeue the marker instead — the pending
                 # records stay queued and periodic_flush retries them.
-                # See discogsography-hh7r.
                 logger.error(
                     "❌ Flush incomplete — requeueing file_complete instead of marking the file done",
                     data_type=data_type,
@@ -1008,7 +1006,6 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             # on top of an incomplete drain is actively destructive: the pending
             # messages' rows still carry an old updated_at, so purge_stale_rows
             # would DELETE exactly the records that were about to be refreshed.
-            # See discogsography-hh7r.
             if batch_processor is not None and not await batch_processor.flush_queue(data_type):
                 logger.error(
                     "❌ Flush incomplete — requeueing extraction_complete instead of purging stale rows",
@@ -1038,7 +1035,6 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             # record that is still present in the current dump was never upserted,
             # so its row's updated_at was never refreshed and would otherwise look
             # stale and get purged — deleting a still-current record beyond the DLQ.
-            # See discogsography-x763.
             purge_ok = True
             if batch_processor is not None and batch_processor.had_dlq_nacks(data_type):
                 logger.warning(
@@ -1165,7 +1161,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 # check_all_consumers_idle() could never return True, and the
                 # connection plus four idle consumers were held open until restart.
                 # A plain restart between the file_complete ack and this delivery
-                # reaches the same terminal state (discogsography-ewvh).
+                # reaches the same terminal state.
                 completed_files.add(data_type)
 
                 # Re-arm cancellation: the file_complete that originally scheduled it
@@ -1193,7 +1189,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
         # into a NOT NULL PRIMARY KEY, whose deterministic IntegrityError landed in the
         # generic handler and was nacked with requeue=True — burning all 20 redeliveries
         # before dead-lettering — while `"id": ""` silently wrote a junk row keyed on the
-        # empty string and acked it as success (discogsography-ria1).
+        # empty string and acked it as success.
         if not data.get("id"):
             logger.error("❌ Message missing 'id' field", data=data)
             await message.nack(requeue=False)
@@ -1708,7 +1704,7 @@ async def main() -> None:
         finally:
             # Stop new deliveries FIRST, before the multi-second flush/teardown
             # below: a still-subscribed consumer keeps being handed messages it
-            # can only leave unacked (discogsography-lnn4).
+            # can only leave unacked.
             await cancel_all_consumers()
             if consumer_cancellation_failed:
                 await _reset_durable_broker()

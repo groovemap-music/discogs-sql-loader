@@ -212,7 +212,7 @@ async def test_the_signal_is_recorded_before_the_delivery_is_acked() -> None:
 
     graphinator writes its latch to Neo4j before acking for the same reason: the ack
     destroys the queued message, which was otherwise the only durable copy of this
-    coordination state (discogsography-tk7v).
+    coordination state.
     """
     cursor = RecordingCursor((["artists", "labels"], False, False, False))
     pool = FakePool(cursor)

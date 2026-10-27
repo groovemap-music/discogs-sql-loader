@@ -34,14 +34,16 @@ external dependencies; use the separately versioned
 stack. Build and inspect the repository-owned image with `just image`. The published
 image name is `ghcr.io/groovemap-music/discogs-sql-loader`.
 
-`just check` formats and lints the source, verifies promoted contracts, scans for
+`just check` checks formatting, lints the source, verifies promoted contracts, scans for
 secrets, type-checks, runs the mocked unit and regression suite with coverage, builds
 and installs the wheel, checks licenses, and previews the next version. Tests do not
 connect to live PostgreSQL or RabbitMQ services.
 
-Run `just test-integration` to exercise representative single-record and batch upserts
-against a pinned, disposable PostgreSQL 18 container. The test creates a unique
-synthetic schema, verifies JSONB round trips and `ON CONFLICT` updates, and removes the
+Run `just test-integration` to run the PostgreSQL-backed suites against a pinned,
+disposable PostgreSQL 18 container. The lane applies the pinned `database-schema`
+initializer once, then exercises single-record and batch upserts in a unique synthetic
+schema (JSONB round trips and `ON CONFLICT` updates), the `graph` vertex and edge
+writes, the derived counters, and the durable derived-refresh worker. It removes the
 container when complete. To use an already-running disposable database instead, set
 `TEST_DATABASE_URL`; the command never prints that value. CI invokes this separate
 service-backed lane after the credential-free required checks.
