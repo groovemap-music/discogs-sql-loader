@@ -44,7 +44,7 @@ def test_invalid_health_port_is_rejected(value: str) -> None:
 
 @pytest.mark.asyncio
 async def test_main_starts_health_server_on_configured_port() -> None:
-    config = MagicMock(health_port=9102)
+    config = MagicMock(health_port=9102, postgres_pool_max_size=12)
     with (
         patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
         patch("tableinator.tableinator.setup_logging"),

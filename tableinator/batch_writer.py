@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from common import DatabaseUnavailableError
 from common.identity import resolve_aliases
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -13,6 +14,8 @@ from tableinator.identity import alias_ref, alias_targets, attach_alias_targets
 if TYPE_CHECKING:
     import uuid
     from collections.abc import Callable, Sequence
+
+    from common import WriteAdmission
 
 
 class BatchRecord(Protocol):
@@ -37,10 +40,12 @@ class PostgreSQLBatchWriter:
         connection_pool: Any,
         logger: Any,
         media_resolver: Callable[[dict[str, Any]], dict[str, Any]],
+        admission: WriteAdmission | None = None,
     ) -> None:
         self.connection_pool = connection_pool
         self.logger = logger
         self.media_resolver = media_resolver
+        self.admission = admission
 
     async def process_batch(
         self,
@@ -48,6 +53,17 @@ class PostgreSQLBatchWriter:
         messages: Sequence[BatchRecord],
     ) -> BatchWriteResult:
         """Write a batch in one transaction and report unchanged records."""
+        if self.admission is None:
+            raise DatabaseUnavailableError("Write admission not initialized")
+        async with self.admission.slot():
+            return await self._process_batch(data_type, messages)
+
+    async def _process_batch(
+        self,
+        data_type: str,
+        messages: Sequence[BatchRecord],
+    ) -> BatchWriteResult:
+        """Run SQL while the caller holds the shared pool admission slot."""
         async with self.connection_pool.connection() as conn:
             await conn.set_autocommit(False)
             async with conn.transaction(), conn.cursor() as cursor:

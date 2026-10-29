@@ -42,6 +42,11 @@ coverage: test
 test-integration:
     bash scripts/test-integration.sh
 
+# Starts exclusively owned disposable PostgreSQL and RabbitMQ services; deprecated global QoS
+# is disabled in RabbitMQ. Kept outside `check` and `test-integration` by design.
+test-admission-integration:
+    bash scripts/test-admission-integration.sh
+
 # Cross-store parity against discogs-graph-enricher: the same fixture events into this
 # loader's PostgreSQL and the enricher's Neo4j, then a per-label comparison of the two
 # graphs. Starts both pinned containers and removes them, and their anonymous volumes,

@@ -52,7 +52,7 @@ preferred for deployed containers.
 | `POSTGRES_PASSWORD` / `_FILE` | required | PostgreSQL password |
 | `POSTGRES_DATABASE` | required | PostgreSQL database |
 | `POSTGRES_POOL_MIN_SIZE` | `2` | Minimum open PostgreSQL connections |
-| `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum open PostgreSQL connections; durable refresh requires at least `4` for the pass, heartbeat, health sampler, and delivery |
+| `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum open PostgreSQL connections; durable refresh reserves `3` for the refresh transaction, lease heartbeat, and health sampler, and requires at least `4` total |
 | `RABBITMQ_HOST` | `rabbitmq` | RabbitMQ host |
 | `RABBITMQ_PORT` | `5672` | RabbitMQ AMQP port |
 | `RABBITMQ_USERNAME` / `_FILE` | deployment supplied | RabbitMQ user |

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from common import normalize_record
+from common import WriteAdmission, normalize_record
 from common.batch import AsyncBatchEngine, BatchItemResult, BatchPolicy
 from common.db_resilience import DatabaseUnavailableError
 from common.delivery import DeliveryResult, FailureKind, Settlement
@@ -269,8 +269,9 @@ class PostgreSQLBatchSink:
 class PostgreSQLBatchProcessor:
     """Owner adapter around :class:`common.batch.AsyncBatchEngine`."""
 
-    def __init__(self, connection_pool: Any, config: BatchConfig | None = None) -> None:
+    def __init__(self, connection_pool: Any, config: BatchConfig | None = None, admission: WriteAdmission | None = None) -> None:
         self.connection_pool = connection_pool
+        self.admission = admission
         self.config = config or BatchConfig()
         env_batch_size = os.environ.get("POSTGRES_BATCH_SIZE")
         if env_batch_size:
@@ -366,7 +367,7 @@ class PostgreSQLBatchProcessor:
         return True
 
     async def _process_batch(self, data_type: str, messages: list[PendingMessage]) -> BatchWriteResult:
-        writer = PostgreSQLBatchWriter(self.connection_pool, logger, media_for_release)
+        writer = PostgreSQLBatchWriter(self.connection_pool, logger, media_for_release, self.admission)
         return await writer.process_batch(data_type, messages)
 
     async def flush_queue(self, data_type: str) -> bool:
