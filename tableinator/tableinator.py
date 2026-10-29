@@ -18,6 +18,7 @@ from common import (
     HealthServer,
     OutageBackoff,
     Settlement,
+    WriteAdmission,
     normalize_record,
     parse_postgres_host_port,
     run_delivery,
@@ -281,10 +282,11 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12
+write_admission: WriteAdmission | None = None
 
 
-def channel_prefetch() -> tuple[int, bool]:
-    """Resolve ``(prefetch_count, global_)`` for this channel's QoS.
+def channel_prefetch() -> int:
+    """Resolve the per-consumer broker delivery limit.
 
     Two different shapes, because the two modes hold PostgreSQL connections very
     differently:
@@ -293,23 +295,18 @@ def channel_prefetch() -> tuple[int, bool]:
       and return immediately; only the flush task holds a pooled connection, and its
       concurrency is bounded by the batch processor's own semaphore. Each queue needs
       at least ``BATCH_SIZE`` unacked deliveries of its OWN data type for a batch to
-      fill, so QoS stays per-consumer (``global_=False``). The channel-wide ceiling is
-      therefore ``prefetch_count * len(DATA_TYPES)`` — logged explicitly so the 4x
-      multiplier is not a surprise.
+      fill, so QoS stays per-consumer (``global_=False``). A shared database admission
+      budget separately bounds active writes across all entity consumers.
     * **Non-batch mode** (``POSTGRES_BATCH_MODE=false``) — every in-flight handler
-      holds a pooled connection for the duration of its upsert, exactly the shape
-      brainztableinator couples in ``_channel_prefetch``. Bound the channel's TOTAL
-      unacked deliveries (``global_=True``) to the pool max so the broker, not the
-      pool's ~15.5s exhausted-wait retry loop, applies backpressure. Without this,
-      4 x 200 = 800 concurrent handlers raced for 12 connections; the losers raised,
-      were nacked with ``requeue=True``, and burned the quorum queue's
-      ``x-delivery-limit: 20`` until the message was silently dead-lettered.
+      holds a pooled connection for the duration of its upsert. Keep each consumer's
+      delivery limit coupled to the pool size; the shared database admission budget
+      provides the aggregate pool bound across all entity consumers.
     """
     if BATCH_MODE:
         # prefetch_count must be >= batch_size to allow batches to fill before flushing
-        return max(200, BATCH_SIZE * 2), False
+        return max(200, BATCH_SIZE * 2)
     pool_max = config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
-    return pool_max, True
+    return pool_max
 
 
 # Global shutdown flag
@@ -598,13 +595,35 @@ async def durable_recovery_loop() -> None:
         await asyncio.sleep(15)
 
 
-async def close_rabbitmq_connection() -> None:
+async def close_rabbitmq_connection() -> bool:
     """Close idle transports without discarding unconfirmed cleanup state."""
-    if await _close_recovery_broker():
+    closed = await _close_recovery_broker()
+    if closed:
         logger.info(
             f"✅ RabbitMQ connection closed. Will check for new messages every {QUEUE_CHECK_INTERVAL}s",
             QUEUE_CHECK_INTERVAL=QUEUE_CHECK_INTERVAL,
         )
+    return closed
+
+
+async def close_database_after_broker_drain() -> bool:
+    """Close the pool and release its admission budget only after broker drain."""
+    global write_admission
+
+    if not await close_rabbitmq_connection():
+        logger.error("❌ Keeping PostgreSQL pool and write admission open because RabbitMQ callback drain is unconfirmed")
+        return False
+
+    try:
+        if connection_pool:
+            await connection_pool.close()
+            logger.info("✅ Async connection pool closed")
+    except Exception as exc:
+        logger.warning("⚠️ Error closing connection pool; retaining write admission", error=type(exc).__name__)
+        return False
+
+    write_admission = None
+    return True
 
 
 async def check_all_consumers_idle() -> bool:
@@ -787,8 +806,8 @@ async def _recover_consumers() -> None:
 
             # Set QoS - scale with batch_size in batch mode, couple to the PostgreSQL
             # pool capacity in non-batch mode (see channel_prefetch).
-            prefetch_count, prefetch_global = channel_prefetch()
-            await active_channel.set_qos(prefetch_count=prefetch_count, global_=prefetch_global)
+            prefetch_count = channel_prefetch()
+            await active_channel.set_qos(prefetch_count=prefetch_count, global_=False)
 
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
@@ -886,13 +905,17 @@ async def purge_stale_rows(data_type: str, started_at: str, record_count: int | 
     """Delete rows not refreshed by the current extraction when safe."""
     if connection_pool is None:
         return
+    admission = write_admission
+    if admission is None:
+        raise DatabaseUnavailableError("Write admission not initialized")
     persistence = PostgreSQLRecordPersistence(
         connection_pool,
         logger,
         PURGE_MAX_DELETE_FRACTION,
         media_for_release,
     )
-    await persistence.purge_stale_rows(data_type, started_at, record_count)
+    async with admission.slot():
+        await persistence.purge_stale_rows(data_type, started_at, record_count)
 
 
 def make_data_handler(
@@ -1267,7 +1290,11 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             PURGE_MAX_DELETE_FRACTION,
             media_for_release,
         )
-        terminal_outcome = await persistence.persist_record(data_type, data_id, data)
+        admission = write_admission
+        if admission is None:
+            raise DatabaseUnavailableError("Write admission not initialized")
+        async with admission.slot():
+            terminal_outcome = await persistence.persist_record(data_type, data_id, data)
         return DeliveryResult(Settlement.ACK, terminal_outcome)
 
     class DeliveryTelemetryObserver:
@@ -1424,6 +1451,7 @@ class StartupFailure(Exception):
 async def main() -> None:
     global \
         connection_pool, \
+        write_admission, \
         config, \
         connection_params, \
         queues, \
@@ -1468,6 +1496,11 @@ async def main() -> None:
         logger.error("❌ Configuration error", error=str(e))
         raise StartupFailure("configuration error") from e
 
+    # A previous lifespan with an unconfirmed broker close may still have
+    # callbacks using its pool budget. Never create a competing budget/pool.
+    if connection_pool is not None and write_admission is not None:
+        raise StartupFailure("previous PostgreSQL writer lifespan did not drain")
+
     # Start health server
     health_server = HealthServer(config.health_port, get_health_data)
     health_server.start_background()
@@ -1505,6 +1538,9 @@ async def main() -> None:
             health_check_interval=30,
         )
         await connection_pool.initialize()
+        # One loop-owned budget bounds every database writer sharing this pool,
+        # including direct entity handlers, batch flushes, and the extraction purge.
+        write_admission = WriteAdmission(config.postgres_pool_max_size)
         logger.info("🐘 Connected to PostgreSQL with async resilient connection pool")
         # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
         # read-only. A miss is a logged degraded mode, never a reason to create the table.
@@ -1542,7 +1578,7 @@ async def main() -> None:
             batch_size=BATCH_SIZE,
             flush_interval=BATCH_FLUSH_INTERVAL,
         )
-        batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config)
+        batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config, write_admission)
         logger.info(
             "🚀 Async batch processing enabled",
             batch_size=BATCH_SIZE,
@@ -1611,16 +1647,14 @@ async def main() -> None:
         channel = await amqp_connection.channel()
         active_channel = channel
 
-        # Set QoS to allow concurrent batch processing for better throughput, or to
-        # couple in-flight deliveries to the PostgreSQL pool in non-batch mode.
-        prefetch_count, prefetch_global = channel_prefetch()
-        await channel.set_qos(prefetch_count=prefetch_count, global_=prefetch_global)
+        # Keep enough per-consumer deliveries for batch fill; direct writes are separately
+        # bounded by the shared admission budget sized to this PostgreSQL pool.
+        prefetch_count = channel_prefetch()
+        await channel.set_qos(prefetch_count=prefetch_count, global_=False)
         logger.info(
-            "🔧 QoS prefetch configured",
-            prefetch_count=prefetch_count,
-            channel_global=prefetch_global,
-            # Per-consumer QoS means the real channel-wide ceiling is prefetch x consumers.
-            channel_wide_max=prefetch_count if prefetch_global else prefetch_count * len(DATA_TYPES),
+            "🔧 Per-consumer QoS and shared database admission configured",
+            per_consumer_delivery_limit=prefetch_count,
+            shared_database_writer_bound=config.postgres_pool_max_size,
             batch_size=BATCH_SIZE if BATCH_MODE else "N/A",
         )
 
@@ -1750,16 +1784,9 @@ async def main() -> None:
             for task in list(consumer_cancel_tasks.values()):
                 task.cancel()
 
-            # Close RabbitMQ connection if still active
-            await close_rabbitmq_connection()
-
-            # Close async connection pool
-            try:
-                if connection_pool:
-                    await connection_pool.close()
-                    logger.info("✅ Async connection pool closed")
-            except Exception as e:
-                logger.warning("⚠️ Error closing connection pool", error=str(e))
+            # Only release the pool budget after transport closure confirms that
+            # RabbitMQ has cancelled and joined every callback using this pool.
+            await close_database_after_broker_drain()
 
         # Stop health server
         health_server.stop()
