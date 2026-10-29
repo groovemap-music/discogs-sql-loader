@@ -11,13 +11,16 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_entity_queues_share_admission_and_cancel_safely(monkeypatch) -> None:
+    from common import WriteAdmission
+
     from tableinator import tableinator as service
 
     cfg = MagicMock()
     cfg.postgres_pool_max_size = 2
     monkeypatch.setattr(service, "config", cfg)
     monkeypatch.setattr(service, "shutdown_requested", False)
-    monkeypatch.setattr(service, "_write_slots", None)
+    admission = WriteAdmission(2)
+    monkeypatch.setattr(service, "write_admission", admission)
     active = peak = 0
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -60,8 +63,8 @@ async def test_entity_queues_share_admission_and_cancel_safely(monkeypatch) -> N
         await asyncio.sleep(0)
         assert active == peak == 2
         # A broker reconnect must retain this same budget while old writes drain.
-        gate = service._write_admission()
-        assert service._write_admission() is gate
+        gate = service.write_admission
+        assert gate is admission
         tasks[-1].cancel()
         tasks[0].cancel()
         results = await asyncio.gather(tasks[-1], tasks[0], return_exceptions=True)
@@ -83,16 +86,19 @@ async def test_entity_queues_share_admission_and_cancel_safely(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_purge_uses_the_same_writer_budget(monkeypatch) -> None:
+    from common import WriteAdmission
+
     from tableinator import tableinator as service
 
     cfg = MagicMock()
     cfg.postgres_pool_max_size = 1
     monkeypatch.setattr(service, "config", cfg)
-    monkeypatch.setattr(service, "_write_slots", None)
+    admission = WriteAdmission(1)
+    monkeypatch.setattr(service, "write_admission", admission)
     monkeypatch.setattr(service, "connection_pool", MagicMock())
     purge = AsyncMock()
     monkeypatch.setattr(service.PostgreSQLRecordPersistence, "purge_stale_rows", purge)
-    async with service._write_admission().slot():
+    async with admission.slot():
         task = asyncio.create_task(service.purge_stale_rows("artists", "2026-10-29T00:00:00Z", 100))
         await asyncio.sleep(0)
         purge.assert_not_awaited()

@@ -56,16 +56,16 @@ dev = [
 packages = ["tableinator"]
 
 [tool.uv]
-# The schema dev dependency retains its historical runtime pin; rehearsal must use
-# the same active runtime as the loader. Do not rewrite the producer contract.
-override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+https://github.com/groovemap-music/python-libraries.git@264e1d84c7165525844d3b1210179cfbf72a61f2"]
 exclude-newer = "7 days"
 # Security exception: certifi 2026.10.19 fixes PYSEC-2026-4320 and is inside the
 # 7-day window. Remove after 2026-10-27T02:24:17Z, when the window covers it.
 exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
+# The schema producer's historical runtime URL is immutable; resolve its dev dependency
+# against this loader's active tested runtime rather than locking two revisions.
+override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+https://github.com/groovemap-music/python-libraries.git@40d799c6ae0cd9b11b524f7477642a5c14f5f8f2"]
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "264e1d84c7165525844d3b1210179cfbf72a61f2" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "40d799c6ae0cd9b11b524f7477642a5c14f5f8f2" }
 groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "244cb2ba40d8dd80717bcbd5315049896662c99f" }
 
 [tool.ruff]

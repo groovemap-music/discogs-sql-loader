@@ -65,7 +65,7 @@ class TestPolicyAdapters:
     def test_runtime_is_pinned_to_the_reviewed_revision(self) -> None:
         pyproject = Path("pyproject.toml").read_text()
         lock = Path("uv.lock").read_text()
-        revision = "264e1d84c7165525844d3b1210179cfbf72a61f2"
+        revision = "40d799c6ae0cd9b11b524f7477642a5c14f5f8f2"
         assert revision in pyproject
         assert f"#{revision}" in lock
 
@@ -299,6 +299,41 @@ class TestSharedEngineSafety:
         processor._process_batch = write  # type: ignore[method-assign]
         await asyncio.gather(*(processor.add_message(entity, {"id": entity}, AsyncMock(), AsyncMock()) for entity in DATA_TYPES))
         assert maximum == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_sql_admission_is_shared_across_entity_flushes(self) -> None:
+        """Batch fill remains independent while actual flushes use the pool budget."""
+        from common import WriteAdmission
+
+        from tableinator.batch_writer import PostgreSQLBatchWriter
+
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(), WriteAdmission(1))
+        active = 0
+        maximum = 0
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def write(_writer: PostgreSQLBatchWriter, _data_type: str, _messages: list[PendingMessage]) -> BatchWriteResult:
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            first_entered.set()
+            try:
+                await release.wait()
+                return result()
+            finally:
+                active -= 1
+
+        with patch.object(PostgreSQLBatchWriter, "_process_batch", new=write):
+            first = asyncio.create_task(processor._process_batch("artists", [message("a")]))
+            await asyncio.wait_for(first_entered.wait(), timeout=2)
+            second = asyncio.create_task(processor._process_batch("labels", [message("b")]))
+            await asyncio.sleep(0)
+            assert maximum == 1
+            release.set()
+            await asyncio.gather(first, second)
+
+        assert maximum == 1
 
     @pytest.mark.asyncio
     async def test_capacity_blocks_and_recovers_after_settlement(self) -> None:
