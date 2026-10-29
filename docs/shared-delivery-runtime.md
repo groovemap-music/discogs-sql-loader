@@ -20,12 +20,15 @@ cross-entity concurrency, adaptive sizing, retry state, periodic flush, bounded 
 cancellation restoration, and exactly-once terminal settlement.
 
 Each RabbitMQ consumer uses per-consumer QoS. One `common.WriteAdmission` instance is created
-after pool initialization and shared by direct entity writes, batch SQL writes, and stale-row
-purges. It is sized to the configured pool maximum. `handler()` tracks each callback without
-using a SQL permit; `slot()` bounds actual SQL and tracks waiters. After stopping consumers and
-background producers and confirming broker closure, shutdown calls `drain()` with a finite
-timeout before pool shutdown. A timed-out drain retains the pool and budget. Batch collection
-and pending-queue backpressure do not acquire a database permit.
+after pool initialization and shared by direct entity writes, batch SQL writes, stale-row
+purges, and extraction completion writes. Inline refresh mode budgets the configured pool
+maximum. Durable refresh mode reserves three connections for its refresh transaction, lease
+heartbeat, and health sampler, then budgets the remaining pool connections for writers. Startup
+fails closed unless at least one writer connection remains. `handler()` tracks each callback
+without using a SQL permit; `slot()` bounds actual SQL and tracks waiters. After stopping
+consumers and background producers and confirming broker closure, shutdown calls `drain()` with
+a finite timeout before pool shutdown. A timed-out drain retains the pool and budget. Batch
+collection and pending-queue backpressure do not acquire a database permit.
 
 The owner boundary remains in `tableinator`: normalization, PostgreSQL statements and result
 sets, transient/deterministic classification, metrics and traces, completion control, stale-row

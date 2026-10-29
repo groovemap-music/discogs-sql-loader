@@ -26,6 +26,7 @@ from tableinator.tableinator import (
     purge_stale_rows,
     schedule_consumer_cancellation,
     signal_handler,
+    writer_admission_capacity,
 )
 
 
@@ -124,6 +125,42 @@ class TestChannelPrefetch:
             prefetch = channel_prefetch()
 
         assert prefetch == 200
+
+
+class TestWriterAdmissionCapacity:
+    def test_durable_mode_reserves_refresh_heartbeat_and_health_connections(self) -> None:
+        assert writer_admission_capacity(4, durable_refresh=True) == 1
+        assert writer_admission_capacity(12, durable_refresh=True) == 9
+
+    def test_inline_mode_uses_the_full_pool_for_writers(self) -> None:
+        assert writer_admission_capacity(1, durable_refresh=False) == 1
+        assert writer_admission_capacity(12, durable_refresh=False) == 12
+
+    @pytest.mark.parametrize("pool_capacity", [0, -1, True, 2.5])
+    def test_invalid_pool_capacity_fails_closed(self, pool_capacity: Any) -> None:
+        with pytest.raises(ValueError, match="positive integer"):
+            writer_admission_capacity(pool_capacity, durable_refresh=False)  # type: ignore[arg-type]
+
+    def test_durable_mode_rejects_a_pool_without_reserved_and_writer_capacity(self) -> None:
+        with pytest.raises(ValueError, match="requires at least one writer connection"):
+            writer_admission_capacity(3, durable_refresh=True)
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_durable_pool_below_four_before_pool_creation(self) -> None:
+        config = MagicMock()
+        config.postgres_pool_max_size = 3
+        with (
+            patch("tableinator.tableinator.setup_logging"),
+            patch("tableinator.tableinator.setup_telemetry"),
+            patch("tableinator.tableinator.start_event_loop_monitor"),
+            patch("tableinator.tableinator.TableinatorConfig.from_env", return_value=config),
+            patch("tableinator.tableinator.AsyncPostgreSQLPool") as pool_class,
+            patch.dict("os.environ", {"STARTUP_DELAY": "0", "DERIVED_REFRESH_MODE": "durable"}),
+            pytest.raises(StartupFailure, match="invalid PostgreSQL writer admission capacity"),
+        ):
+            await main()
+
+        pool_class.assert_not_called()
 
 
 class TestMakeDataHandler:
