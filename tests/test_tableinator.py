@@ -81,7 +81,7 @@ class TestChannelPrefetch:
     x-delivery-limit until the message was silently dead-lettered.
     """
 
-    def test_non_batch_prefetch_is_channel_global_and_matches_pool_max(self) -> None:
+    def test_non_batch_prefetch_is_per_consumer_and_matches_pool_max(self) -> None:
         mock_config = MagicMock()
         mock_config.postgres_pool_max_size = 12
 
@@ -89,11 +89,9 @@ class TestChannelPrefetch:
             patch("tableinator.tableinator.BATCH_MODE", False),
             patch("tableinator.tableinator.config", mock_config),
         ):
-            prefetch, global_ = channel_prefetch()
+            prefetch = channel_prefetch()
 
         assert prefetch == 12
-        # global_=True bounds the CHANNEL's total unacked deliveries, not each consumer's.
-        assert global_ is True
 
     def test_non_batch_prefetch_falls_back_when_config_unset(self) -> None:
         from tableinator.tableinator import _DEFAULT_POOL_MAX
@@ -102,10 +100,9 @@ class TestChannelPrefetch:
             patch("tableinator.tableinator.BATCH_MODE", False),
             patch("tableinator.tableinator.config", None),
         ):
-            prefetch, global_ = channel_prefetch()
+            prefetch = channel_prefetch()
 
         assert prefetch == _DEFAULT_POOL_MAX
-        assert global_ is True
 
     def test_batch_prefetch_stays_per_consumer_and_scales_with_batch_size(self) -> None:
         """Batch mode hands off to the batch processor rather than holding a connection
@@ -115,17 +112,16 @@ class TestChannelPrefetch:
             patch("tableinator.tableinator.BATCH_MODE", True),
             patch("tableinator.tableinator.BATCH_SIZE", 500),
         ):
-            prefetch, global_ = channel_prefetch()
+            prefetch = channel_prefetch()
 
         assert prefetch == 1000
-        assert global_ is False
 
     def test_batch_prefetch_has_a_floor_of_200(self) -> None:
         with (
             patch("tableinator.tableinator.BATCH_MODE", True),
             patch("tableinator.tableinator.BATCH_SIZE", 10),
         ):
-            prefetch, _ = channel_prefetch()
+            prefetch = channel_prefetch()
 
         assert prefetch == 200
 
@@ -190,6 +186,144 @@ class TestOnDataMessage:
 
         # Verify single upsert was executed (no separate SELECT)
         assert len(_entity_upsert_calls(mock_cursor)) == 1
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_mixed_entity_handlers_share_pool_admission(self) -> None:
+        """Concurrent direct writes across all four queues obey one pool-sized budget."""
+        from common import WriteAdmission
+
+        active = 0
+        peak = 0
+        two_started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingPersistence:
+            async def persist_record(self, _data_type: str, _data_id: str, _data: dict[str, Any]) -> str:
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    two_started.set()
+                try:
+                    await release.wait()
+                    return "processed"
+                finally:
+                    active -= 1
+
+        messages = []
+        for index in range(8):
+            message = AsyncMock(spec=AbstractIncomingMessage)
+            message.body = json.dumps({"id": str(index + 1), "name": "Artist", "sha256": f"hash-{index}"}).encode()
+            messages.append((message, ("artists", "labels", "masters", "releases")[index % 4]))
+
+        with (
+            patch("tableinator.tableinator.write_admission", WriteAdmission(2)),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.PostgreSQLRecordPersistence", return_value=BlockingPersistence()),
+        ):
+            tasks = [asyncio.create_task(on_data_message(message, data_type)) for message, data_type in messages]
+            await asyncio.wait_for(two_started.wait(), timeout=2)
+            await asyncio.sleep(0)
+            assert peak == 2
+            assert sum(task.done() for task in tasks) == 0
+            release.set()
+            await asyncio.gather(*tasks)
+
+        assert peak == 2
+        for message, _data_type in messages:
+            message.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_direct_write_admission_releases_after_cancel_and_failure(self) -> None:
+        """A cancelled waiter, cancelled writer, and failed write do not leak slots."""
+        from common import WriteAdmission
+
+        active = 0
+        first_started = asyncio.Event()
+        block_first = asyncio.Event()
+
+        class Persistence:
+            async def persist_record(self, _data_type: str, data_id: str, _data: dict[str, Any]) -> str:
+                nonlocal active
+                active += 1
+                try:
+                    if data_id == "1":
+                        first_started.set()
+                        await block_first.wait()
+                        raise asyncio.CancelledError
+                    if data_id == "3":
+                        raise RuntimeError("write failed")
+                    return "processed"
+                finally:
+                    active -= 1
+
+        def message(data_id: str) -> AsyncMock:
+            result = AsyncMock(spec=AbstractIncomingMessage)
+            result.body = json.dumps({"id": data_id, "name": "Artist", "sha256": f"hash-{data_id}"}).encode()
+            return result
+
+        first, cancelled_waiter, failed, recovered = (message(str(index)) for index in range(1, 5))
+        admission = WriteAdmission(1)
+        with (
+            patch("tableinator.tableinator.write_admission", admission),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.PostgreSQLRecordPersistence", return_value=Persistence()),
+        ):
+            writer = asyncio.create_task(on_data_message(first, "artists"))
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            waiter = asyncio.create_task(on_data_message(cancelled_waiter, "labels"))
+            await asyncio.sleep(0)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            writer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await writer
+
+            await on_data_message(failed, "masters")
+            await on_data_message(recovered, "releases")
+
+        assert active == 0
+        failed.nack.assert_awaited_once_with(requeue=False)
+        recovered.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_same_budget_bounds_concurrent_stale_purges(self) -> None:
+        """Extraction cleanup shares the direct-write pool budget across entities."""
+        from common import WriteAdmission
+
+        active = 0
+        peak = 0
+        release = asyncio.Event()
+        two_started = asyncio.Event()
+
+        class BlockingPurge:
+            async def purge_stale_rows(self, _data_type: str, _started_at: str, _record_count: int | None) -> None:
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    two_started.set()
+                try:
+                    await release.wait()
+                finally:
+                    active -= 1
+
+        with (
+            patch("tableinator.tableinator.write_admission", WriteAdmission(2)),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.PostgreSQLRecordPersistence", return_value=BlockingPurge()),
+        ):
+            tasks = [asyncio.create_task(purge_stale_rows(kind, "2026-01-01T00:00:00Z")) for kind in ("artists", "labels", "masters", "releases")]
+            await asyncio.wait_for(two_started.wait(), timeout=2)
+            await asyncio.sleep(0)
+            assert peak == 2
+            release.set()
+            await asyncio.gather(*tasks)
+
+        assert peak == 2
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
@@ -3100,6 +3234,7 @@ class TestRecoverConsumersTableinator:
             await t._recover_consumers()
 
         assert set(t.consumer_tags.keys()) == {"artists", "labels", "masters", "releases"}
+        assert mock_channel.set_qos.await_args.kwargs["global_"] is False
         assert t.completed_files == set(t.DATA_TYPES) - {"artists"}
 
         # Reset shared module state
@@ -3809,6 +3944,7 @@ class TestMainFullRun:
             # Connect + channel + QoS were configured.
             mock_rabbitmq_instance.connect.assert_awaited()
             mock_channel.set_qos.assert_awaited_once()
+            assert mock_channel.set_qos.await_args.kwargs["global_"] is False
             # Exchanges/queues declared and consumers started for every data type.
             assert mock_channel.declare_exchange.await_count >= len(mod.DATA_TYPES)
             assert mock_queue.consume.await_count == len(mod.DATA_TYPES)

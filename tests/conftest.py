@@ -149,6 +149,7 @@ def reset_service_state() -> Iterator[None]:
         service.shutdown_requested = False
         service.config = None
         service.connection_pool = None
+        service.write_admission = None
         service.rabbitmq_manager = None
         service.active_connection = None
         service.active_channel = None
