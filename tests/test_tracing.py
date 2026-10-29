@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from common import WriteAdmission
 from common import telemetry as common_telemetry
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult
 from opentelemetry.trace import NoOpTracerProvider, SpanKind, StatusCode
@@ -263,7 +264,7 @@ class TestFlushSpan:
 
     @pytest.mark.asyncio
     async def test_a_successful_flush_links_its_deliveries_and_records_the_outcome(self, span_collector: SpanCollector) -> None:
-        processor = PostgreSQLBatchProcessor(batch_pool([]), BatchConfig(batch_size=10))
+        processor = PostgreSQLBatchProcessor(batch_pool([]), BatchConfig(batch_size=10), WriteAdmission(1))
 
         contexts = []
         for data_id in ("1", "2"):
@@ -296,7 +297,7 @@ class TestFlushSpan:
         """A batch of ten thousand rows must not carry ten thousand links to the collector."""
         from common.tracing import MAX_FLUSH_LINKS
 
-        processor = PostgreSQLBatchProcessor(batch_pool([]), BatchConfig(batch_size=100))
+        processor = PostgreSQLBatchProcessor(batch_pool([]), BatchConfig(batch_size=100), WriteAdmission(1))
 
         for index in range(100):
             with telemetry.consume_span("releases", SAMPLED_PARENT) as span:
@@ -401,7 +402,7 @@ class TestConsumerAndFlushSpansTogether:
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_a_batched_delivery_is_linked_from_the_flush_that_writes_it(self, span_collector: SpanCollector) -> None:
-        processor = PostgreSQLBatchProcessor(batch_pool([]), BatchConfig(batch_size=1))
+        processor = PostgreSQLBatchProcessor(batch_pool([]), BatchConfig(batch_size=1), WriteAdmission(1))
         queue = FakeQueue("groovemap-discogs-tableinator-artists")
         await queue.consume(make_data_handler("artists"))
 

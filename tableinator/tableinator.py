@@ -282,7 +282,24 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12
+_DURABLE_REFRESH_RESERVED_CONNECTIONS = 3
 write_admission: WriteAdmission | None = None
+
+
+def writer_admission_capacity(pool_capacity: int, *, durable_refresh: bool) -> int:
+    """Leave durable refresh's transaction, heartbeat, and health connections available."""
+    if isinstance(pool_capacity, bool) or not isinstance(pool_capacity, int) or pool_capacity <= 0:
+        raise ValueError("PostgreSQL pool capacity must be a positive integer")
+    if not isinstance(durable_refresh, bool):
+        raise ValueError("durable_refresh must be a boolean")
+
+    reserved = _DURABLE_REFRESH_RESERVED_CONNECTIONS if durable_refresh else 0
+    available = pool_capacity - reserved
+    if available <= 0:
+        if durable_refresh:
+            raise ValueError("durable refresh reserves three PostgreSQL connections and requires at least one writer connection")
+        raise ValueError("PostgreSQL pool must leave at least one writer connection")
+    return available
 
 
 def channel_prefetch() -> int:
@@ -524,7 +541,11 @@ async def attempt_durable_recovery() -> bool:
         try:
             await reconcile_legacy_latches(connection_pool, DATA_TYPES)
             for data_type, version in sorted(durable_refresh_recovery_signals):
-                await record_durable_signal(connection_pool, version, data_type, DATA_TYPES)
+                admission = write_admission
+                if admission is None:
+                    raise DatabaseUnavailableError("Write admission not initialized")
+                async with admission.slot():
+                    await record_durable_signal(connection_pool, version, data_type, DATA_TYPES)
             snapshot = await read_refresh_health(connection_pool)
         except Exception as exc:
             durable_refresh_ready = False
@@ -608,10 +629,17 @@ async def close_rabbitmq_connection() -> bool:
 
 async def close_database_after_broker_drain() -> bool:
     """Close the pool and release its admission budget only after broker drain."""
-    global write_admission
+    global connection_pool, write_admission
 
     if not await close_rabbitmq_connection():
         logger.error("❌ Keeping PostgreSQL pool and write admission open because RabbitMQ callback drain is unconfirmed")
+        return False
+
+    # The shared runtime tracks complete callback lifetimes as well as SQL holders
+    # and waiters; a timeout preserves the work and keeps its pool/budget alive.
+    admission = write_admission
+    if admission is not None and not await admission.drain(timeout=CONSUMER_CANCEL_TIMEOUT):
+        logger.error("❌ Keeping PostgreSQL pool and write admission open because delivery callbacks did not drain")
         return False
 
     try:
@@ -622,6 +650,7 @@ async def close_database_after_broker_drain() -> bool:
         logger.warning("⚠️ Error closing connection pool; retaining write admission", error=type(exc).__name__)
         return False
 
+    connection_pool = None
     write_admission = None
     return True
 
@@ -924,7 +953,11 @@ def make_data_handler(
     """Create a per-data-type message handler that injects data_type context."""
 
     async def handler(message: AbstractIncomingMessage) -> None:
-        await on_data_message(message, data_type)
+        admission = write_admission
+        if admission is None:
+            raise DatabaseUnavailableError("Write admission not initialized")
+        async with admission.handler():
+            await on_data_message(message, data_type)
 
     return handler
 
@@ -1095,7 +1128,11 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     durable_handoff_failed = True
                 else:
                     try:
-                        durable = await record_durable_signal(connection_pool, data.get("version"), data_type, DATA_TYPES)
+                        admission = write_admission
+                        if admission is None:
+                            raise DatabaseUnavailableError("Write admission not initialized")
+                        async with admission.slot():
+                            durable = await record_durable_signal(connection_pool, data.get("version"), data_type, DATA_TYPES)
                         logger.info(
                             "✅ Derived-refresh signal durably committed before acknowledgement",
                             version=durable.version,
@@ -1137,10 +1174,14 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                                 data_type=data_type,
                             )
                             raise _UnnamedExtraction
-                        latch = await record_extraction_signal(connection_pool, extraction_latch, version, data_type)
-                        if latch.should_refresh(DATA_TYPES):
-                            await refresh_derived_relations(connection_pool, logger, version, extraction_latch)
-                        elif latch.already_refreshed:
+                        admission = write_admission
+                        if admission is None:
+                            raise DatabaseUnavailableError("Write admission not initialized")
+                        async with admission.slot():
+                            latch = await record_extraction_signal(connection_pool, extraction_latch, version, data_type)
+                            if latch.should_refresh(DATA_TYPES):
+                                await refresh_derived_relations(connection_pool, logger, version, extraction_latch)
+                        if latch.already_refreshed:
                             logger.info(
                                 "✅ Derived relations were already refreshed for this extraction",
                                 data_type=data_type,
@@ -1498,20 +1539,20 @@ async def main() -> None:
 
     # A previous lifespan with an unconfirmed broker close may still have
     # callbacks using its pool budget. Never create a competing budget/pool.
-    if connection_pool is not None and write_admission is not None:
+    if connection_pool is not None or isinstance(write_admission, WriteAdmission):
         raise StartupFailure("previous PostgreSQL writer lifespan did not drain")
+
+    durable_refresh_active = os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline"
+    try:
+        writer_capacity = writer_admission_capacity(config.postgres_pool_max_size, durable_refresh=durable_refresh_active)
+    except ValueError as e:
+        logger.error("❌ Invalid PostgreSQL writer admission capacity", error=str(e), configured_pool_max=config.postgres_pool_max_size)
+        raise StartupFailure("invalid PostgreSQL writer admission capacity") from e
 
     # Start health server
     health_server = HealthServer(config.health_port, get_health_data)
     health_server.start_background()
     logger.info(f"🏥 Health server started on port {config.health_port}", health_port=config.health_port)
-
-    if os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline" and config.postgres_pool_max_size < 4:
-        logger.error(
-            "❌ Durable refresh needs at least four PostgreSQL pool connections (refresh transaction, lease heartbeat, health sampler, and delivery)",
-            configured_max=config.postgres_pool_max_size,
-        )
-        raise StartupFailure("postgres pool max size below durable refresh minimum")
 
     # Parse host and port from address (POSTGRES_HOST may embed a port, e.g. a pooler)
     host, port = parse_postgres_host_port(config.postgres_host)
@@ -1538,14 +1579,14 @@ async def main() -> None:
             health_check_interval=30,
         )
         await connection_pool.initialize()
-        # One loop-owned budget bounds every database writer sharing this pool,
-        # including direct entity handlers, batch flushes, and the extraction purge.
-        write_admission = WriteAdmission(config.postgres_pool_max_size)
+        # One loop-owned budget bounds entity handlers, batch flushes, and purges.
+        # Durable mode subtracts the refresh transaction, lease heartbeat, and
+        # health sampler reservations so those controls can still acquire connections.
+        write_admission = WriteAdmission(writer_capacity)
         logger.info("🐘 Connected to PostgreSQL with async resilient connection pool")
         # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
         # read-only. A miss is a logged degraded mode, never a reason to create the table.
         extraction_latch = await probe_latch_relation(connection_pool, logger)
-        durable_refresh_active = os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline"
         if durable_refresh_active:
             durable_refresh_ready = await probe_durable_schema(connection_pool, logger)
             if durable_refresh_ready:
@@ -1781,8 +1822,11 @@ async def main() -> None:
                     logger.warning("⚠️ Error flushing batch processor", error=str(e))
 
             # Cancel any pending consumer cancellation tasks
-            for task in list(consumer_cancel_tasks.values()):
+            pending_cancellations = list(consumer_cancel_tasks.values())
+            for task in pending_cancellations:
                 task.cancel()
+            if pending_cancellations:
+                await asyncio.gather(*pending_cancellations, return_exceptions=True)
 
             # Only release the pool budget after transport closure confirms that
             # RabbitMQ has cancelled and joined every callback using this pool.

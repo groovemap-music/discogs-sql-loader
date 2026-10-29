@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import psycopg
 import pytest
 import pytest_asyncio
+from common import WriteAdmission
 from orjson import dumps
 from psycopg import sql
 from psycopg.errors import OperationalError
@@ -165,7 +166,7 @@ async def test_batch_writer_updates_conflicts_and_round_trips_jsonb(
 ) -> None:
     """The batch executemany path performs its advertised atomic conflict update."""
     pool = SingleConnectionPool(postgres_connection)
-    writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]})
+    writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]}, WriteAdmission(1))
     first = BatchRecord("99", {"id": "99", "name": "First"}, "batch-hash-1")
     changed = BatchRecord("99", {"id": "99", "name": "Changed", "tags": ["a", "b"]}, "batch-hash-2")
 
@@ -194,7 +195,7 @@ async def test_batch_writer_backfills_a_row_written_before_minting_existed(
 ) -> None:
     """A hash-unchanged row with a NULL `gm_item_id` is minted in place, payload untouched."""
     pool = SingleConnectionPool(postgres_connection)
-    writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]})
+    writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]}, WriteAdmission(1))
     legacy = {"id": "77", "name": "Written before ADR 0009"}
     await postgres_connection.execute(
         "INSERT INTO artists (hash, data_id, data, gm_item_id) VALUES (%s, %s, %s, NULL)",
@@ -250,7 +251,7 @@ async def test_shared_batch_engine_writes_real_postgres_and_settles_each_deliver
     postgres_connection: psycopg.AsyncConnection[Any],
 ) -> None:
     pool = SingleConnectionPool(postgres_connection)
-    processor = PostgreSQLBatchProcessor(pool, engine_config(batch_size=2))
+    processor = PostgreSQLBatchProcessor(pool, engine_config(batch_size=2), WriteAdmission(1))
     acks = [AsyncMock(), AsyncMock()]
     nacks = [AsyncMock(), AsyncMock()]
 
@@ -269,8 +270,9 @@ async def test_shared_batch_engine_preserves_real_unchanged_media_and_identity_r
     postgres_connection: psycopg.AsyncConnection[Any],
 ) -> None:
     pool = SingleConnectionPool(postgres_connection)
-    processor = PostgreSQLBatchProcessor(pool, engine_config(batch_size=3))
-    writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]})
+    admission = WriteAdmission(1)
+    processor = PostgreSQLBatchProcessor(pool, engine_config(batch_size=3), admission)
+    writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]}, admission)
 
     await writer.process_batch("artists", [BatchRecord("301", {"id": "301", "name": "Stable"}, "same")])
     await postgres_connection.execute(
@@ -314,7 +316,7 @@ async def test_shared_batch_engine_preserves_real_unchanged_media_and_identity_r
 async def test_shared_engine_retries_a_transient_before_real_postgres_commit(
     postgres_connection: psycopg.AsyncConnection[Any],
 ) -> None:
-    processor = PostgreSQLBatchProcessor(SingleConnectionPool(postgres_connection), engine_config(batch_size=1))
+    processor = PostgreSQLBatchProcessor(SingleConnectionPool(postgres_connection), engine_config(batch_size=1), WriteAdmission(1))
     real_write = processor._process_batch
     attempts = 0
 
@@ -345,6 +347,7 @@ async def test_shared_engine_isolates_poison_vetoes_purge_and_commits_healthy_ta
     processor = PostgreSQLBatchProcessor(
         SingleConnectionPool(postgres_connection),
         engine_config(batch_size=2, max_poison_retries=2),
+        WriteAdmission(1),
     )
     real_write = processor._process_batch
 
@@ -374,7 +377,7 @@ async def test_shared_engine_isolates_poison_vetoes_purge_and_commits_healthy_ta
 async def test_shutdown_drain_commits_pending_shared_engine_work(
     postgres_connection: psycopg.AsyncConnection[Any],
 ) -> None:
-    processor = PostgreSQLBatchProcessor(SingleConnectionPool(postgres_connection), engine_config(batch_size=10))
+    processor = PostgreSQLBatchProcessor(SingleConnectionPool(postgres_connection), engine_config(batch_size=10), WriteAdmission(1))
     acks = [AsyncMock(), AsyncMock()]
     await processor.add_message("labels", {"id": "501", "name": "One", "sha256": "one"}, acks[0], AsyncMock())
     await processor.add_message("labels", {"id": "502", "name": "Two", "sha256": "two"}, acks[1], AsyncMock())

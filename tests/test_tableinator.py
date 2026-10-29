@@ -26,6 +26,7 @@ from tableinator.tableinator import (
     purge_stale_rows,
     schedule_consumer_cancellation,
     signal_handler,
+    writer_admission_capacity,
 )
 
 
@@ -124,6 +125,42 @@ class TestChannelPrefetch:
             prefetch = channel_prefetch()
 
         assert prefetch == 200
+
+
+class TestWriterAdmissionCapacity:
+    def test_durable_mode_reserves_refresh_heartbeat_and_health_connections(self) -> None:
+        assert writer_admission_capacity(4, durable_refresh=True) == 1
+        assert writer_admission_capacity(12, durable_refresh=True) == 9
+
+    def test_inline_mode_uses_the_full_pool_for_writers(self) -> None:
+        assert writer_admission_capacity(1, durable_refresh=False) == 1
+        assert writer_admission_capacity(12, durable_refresh=False) == 12
+
+    @pytest.mark.parametrize("pool_capacity", [0, -1, True, 2.5])
+    def test_invalid_pool_capacity_fails_closed(self, pool_capacity: Any) -> None:
+        with pytest.raises(ValueError, match="positive integer"):
+            writer_admission_capacity(pool_capacity, durable_refresh=False)  # type: ignore[arg-type]
+
+    def test_durable_mode_rejects_a_pool_without_reserved_and_writer_capacity(self) -> None:
+        with pytest.raises(ValueError, match="requires at least one writer connection"):
+            writer_admission_capacity(3, durable_refresh=True)
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_durable_pool_below_four_before_pool_creation(self) -> None:
+        config = MagicMock()
+        config.postgres_pool_max_size = 3
+        with (
+            patch("tableinator.tableinator.setup_logging"),
+            patch("tableinator.tableinator.setup_telemetry"),
+            patch("tableinator.tableinator.start_event_loop_monitor"),
+            patch("tableinator.tableinator.TableinatorConfig.from_env", return_value=config),
+            patch("tableinator.tableinator.AsyncPostgreSQLPool") as pool_class,
+            patch.dict("os.environ", {"STARTUP_DELAY": "0", "DERIVED_REFRESH_MODE": "durable"}),
+            pytest.raises(StartupFailure, match="invalid PostgreSQL writer admission capacity"),
+        ):
+            await main()
+
+        pool_class.assert_not_called()
 
 
 class TestMakeDataHandler:
@@ -348,6 +385,14 @@ class TestOnDataMessage:
                     finally:
                         admission_active -= 1
 
+            @contextlib.asynccontextmanager
+            async def handler(self) -> Any:
+                async with shared_budget.handler():
+                    yield
+
+            async def drain(self, *, timeout: float) -> bool:
+                return await shared_budget.drain(timeout=timeout)
+
         admission = TrackingAdmission()
         purge_calls = 0
 
@@ -379,7 +424,7 @@ class TestOnDataMessage:
             patch.object(service, "PostgreSQLRecordPersistence", return_value=Persistence()),
             patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=False)),
         ):
-            callback = asyncio.create_task(on_data_message(message, "artists"))
+            callback = asyncio.create_task(service.make_data_handler("artists")(message))
             await asyncio.wait_for(flush_entered.wait(), timeout=2)
 
             # The handler passed its entry check before shutdown; broker close cannot
@@ -394,6 +439,74 @@ class TestOnDataMessage:
 
         assert purge_calls == 1
         message.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_broker_close_joins_active_delivery_before_pool_close(self) -> None:
+        from common import WriteAdmission
+
+        import tableinator.tableinator as service
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        pool = AsyncMock()
+        admission = WriteAdmission(1)
+
+        async def blocked_delivery(_message: Any, _data_type: str) -> None:
+            entered.set()
+            await release.wait()
+
+        with (
+            patch.object(service, "connection_pool", pool),
+            patch.object(service, "write_admission", admission),
+            patch.object(service, "on_data_message", new=blocked_delivery),
+            patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=True)),
+        ):
+            callback = asyncio.create_task(service.make_data_handler("artists")(MagicMock()))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            shutdown = asyncio.create_task(service.close_database_after_broker_drain())
+            await asyncio.sleep(0)
+            assert not shutdown.done()
+            pool.close.assert_not_awaited()
+            assert service.write_admission is admission
+
+            release.set()
+            await asyncio.wait_for(callback, timeout=2)
+            assert await asyncio.wait_for(shutdown, timeout=2)
+            pool.close.assert_awaited_once()
+            assert service.connection_pool is None
+            assert service.write_admission is None
+
+    @pytest.mark.asyncio
+    async def test_callback_drain_timeout_retains_pool_and_budget(self) -> None:
+        from common import WriteAdmission
+
+        import tableinator.tableinator as service
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        pool = AsyncMock()
+        admission = WriteAdmission(1)
+
+        async def blocked_delivery(_message: Any, _data_type: str) -> None:
+            entered.set()
+            await release.wait()
+
+        with (
+            patch.object(service, "connection_pool", pool),
+            patch.object(service, "write_admission", admission),
+            patch.object(service, "on_data_message", new=blocked_delivery),
+            patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=True)),
+            patch.object(service, "CONSUMER_CANCEL_TIMEOUT", 0.01),
+        ):
+            callback = asyncio.create_task(service.make_data_handler("artists")(MagicMock()))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            assert not await service.close_database_after_broker_drain()
+            pool.close.assert_not_awaited()
+            assert service.connection_pool is pool
+            assert service.write_admission is admission
+
+            release.set()
+            await asyncio.wait_for(callback, timeout=2)
 
     @pytest.mark.asyncio
     async def test_purge_fails_closed_without_admission(self) -> None:
@@ -412,6 +525,44 @@ class TestOnDataMessage:
 
         persistence.assert_not_called()
         pool.connection.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_broker_drain_releases_pool_and_budget(self) -> None:
+        from common import WriteAdmission
+
+        import tableinator.tableinator as service
+
+        pool = AsyncMock()
+        admission = WriteAdmission(1)
+        with (
+            patch.object(service, "connection_pool", pool),
+            patch.object(service, "write_admission", admission),
+            patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=True)),
+        ):
+            assert await service.close_database_after_broker_drain()
+            assert service.connection_pool is None
+            assert service.write_admission is None
+
+        pool.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_startup_refuses_replacement_when_only_old_budget_remains(self) -> None:
+        from common import WriteAdmission
+
+        import tableinator.tableinator as service
+
+        with (
+            patch.object(service, "setup_logging"),
+            patch.object(service, "setup_telemetry"),
+            patch.object(service, "start_event_loop_monitor"),
+            patch.object(service, "TableinatorConfig") as config_type,
+            patch.object(service, "connection_pool", None),
+            patch.object(service, "write_admission", WriteAdmission(1)),
+            patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
+            pytest.raises(service.StartupFailure, match="previous PostgreSQL writer lifespan"),
+        ):
+            config_type.from_env.return_value = MagicMock()
+            await service.main()
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)

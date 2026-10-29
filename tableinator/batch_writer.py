@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from common import DatabaseUnavailableError
 from common.identity import resolve_aliases
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -53,7 +54,7 @@ class PostgreSQLBatchWriter:
     ) -> BatchWriteResult:
         """Write a batch in one transaction and report unchanged records."""
         if self.admission is None:
-            return await self._process_batch(data_type, messages)
+            raise DatabaseUnavailableError("Write admission not initialized")
         async with self.admission.slot():
             return await self._process_batch(data_type, messages)
 

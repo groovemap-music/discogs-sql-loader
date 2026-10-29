@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aio_pika
 import psycopg
@@ -18,6 +18,7 @@ from common import AsyncPostgreSQLPool, WriteAdmission
 from orjson import dumps
 from psycopg import sql
 
+import tableinator.durable_refresh as durable
 import tableinator.tableinator as service
 
 
@@ -221,3 +222,167 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
         await cleanup.set_autocommit(True)
         await cleanup.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
         await cleanup.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_refresh_reservations_progress_with_writer_budget_saturated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refresh, lease heartbeat, and health query get the three reserved pool slots."""
+    dsn = os.environ.get("TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("owned integration script must set TEST_DATABASE_URL")
+
+    loader = f"discogs-admission-{uuid.uuid4().hex}"
+    monkeypatch.setattr(durable, "LOADER_DISCRIMINATOR", loader)
+    monkeypatch.setattr(durable, "_HEARTBEAT_SECONDS", 0.005)
+    raw_pool = AsyncPostgreSQLPool(
+        connection_params={"conninfo": dsn},
+        min_connections=1,
+        max_connections=4,
+        max_retries=1,
+        health_check_interval=3600,
+    )
+    await raw_pool.initialize()
+
+    refresh_entered = asyncio.Event()
+    release_refresh = asyncio.Event()
+    heartbeat_connection_acquired = asyncio.Event()
+    release_heartbeat_connection = asyncio.Event()
+    health_connection_acquired = asyncio.Event()
+    release_health_connection = asyncio.Event()
+    writer_connection_acquired = asyncio.Event()
+    release_writer = asyncio.Event()
+    blocked_writer_attempted = asyncio.Event()
+    blocked_writer_acquired = asyncio.Event()
+
+    class ReservedConnectionPool:
+        def __init__(self) -> None:
+            self.active = 0
+            self.peak = 0
+
+        @asynccontextmanager
+        async def connection(self) -> Any:
+            async with raw_pool.connection() as connection:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                task = asyncio.current_task()
+                task_name = task.get_name() if task is not None else ""
+                try:
+                    if task_name == "saturated-writer":
+                        writer_connection_acquired.set()
+                        await release_writer.wait()
+                    elif task_name == "durable-lease-heartbeat":
+                        heartbeat_connection_acquired.set()
+                        await release_heartbeat_connection.wait()
+                    elif task_name == "durable-health-sampler":
+                        health_connection_acquired.set()
+                        await release_health_connection.wait()
+                    yield connection
+                finally:
+                    self.active -= 1
+
+    pool = ReservedConnectionPool()
+    admission = WriteAdmission(service.writer_admission_capacity(4, durable_refresh=True))
+    logger = MagicMock()
+    worker: asyncio.Task[None] | None = None
+    heartbeat: asyncio.Task[None] | None = None
+    health: asyncio.Task[dict[str, Any]] | None = None
+    writer: asyncio.Task[None] | None = None
+    blocked_writer: asyncio.Task[None] | None = None
+    initial_lease_expiry = None
+    try:
+        for entity in service.DATA_TYPES:
+            await durable.record_durable_signal(pool, "20991230", entity, service.DATA_TYPES)
+        job = await durable.claim_due_job(pool, "admission-reservation-test", logger)
+        assert job is not None
+
+        async with raw_pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT lease_expires_at FROM public.loader_derived_refresh_job WHERE loader = %s AND version = %s",
+                (loader, job.version),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            initial_lease_expiry = row[0]
+
+        original_before_refresh = durable._before_refresh
+
+        async def hold_refresh_transaction(cursor: Any, claimed_job: durable.ClaimedJob) -> None:
+            await original_before_refresh(cursor, claimed_job)
+            refresh_entered.set()
+            await release_refresh.wait()
+
+        monkeypatch.setattr(durable, "_before_refresh", hold_refresh_transaction)
+
+        async def saturate_writer() -> None:
+            async with admission.slot(), pool.connection() as connection:
+                await connection.execute("SELECT 1")
+
+        writer = asyncio.create_task(saturate_writer(), name="saturated-writer")
+        await asyncio.wait_for(writer_connection_acquired.wait(), timeout=5)
+
+        async def refresh_transaction() -> None:
+            await durable.refresh_derived_relations(
+                pool,
+                logger,
+                job.version,
+                before_refresh=lambda cursor: durable._before_refresh(cursor, job),
+                before_commit=lambda cursor: durable._before_commit(cursor, job),
+            )
+
+        worker = asyncio.create_task(refresh_transaction(), name="durable-refresh-transaction")
+        await asyncio.wait_for(refresh_entered.wait(), timeout=5)
+        heartbeat = asyncio.create_task(durable._heartbeat(pool, job, asyncio.Event()), name="durable-lease-heartbeat")
+        health = asyncio.create_task(durable.read_refresh_health(pool), name="durable-health-sampler")
+        await asyncio.wait_for(asyncio.gather(heartbeat_connection_acquired.wait(), health_connection_acquired.wait()), timeout=5)
+
+        async def compete_for_writer_slot() -> None:
+            blocked_writer_attempted.set()
+            async with admission.slot():
+                blocked_writer_acquired.set()
+                async with pool.connection():
+                    pass
+
+        blocked_writer = asyncio.create_task(compete_for_writer_slot(), name="waiting-writer")
+        await asyncio.wait_for(blocked_writer_attempted.wait(), timeout=2)
+        await asyncio.sleep(0)
+        assert not blocked_writer_acquired.is_set()
+        assert pool.peak == 4
+
+        release_heartbeat_connection.set()
+        release_health_connection.set()
+        health_snapshot = await asyncio.wait_for(health, timeout=5)
+        assert health_snapshot["phase"] == "leased"
+        await asyncio.sleep(0.02)
+        async with raw_pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT lease_expires_at FROM public.loader_derived_refresh_job WHERE loader = %s AND version = %s",
+                (loader, job.version),
+            )
+            row = await cursor.fetchone()
+            assert row is not None and initial_lease_expiry is not None
+            assert row[0] > initial_lease_expiry
+
+        release_refresh.set()
+        await asyncio.wait_for(worker, timeout=10)
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        release_writer.set()
+        await asyncio.wait_for(writer, timeout=5)
+        await asyncio.wait_for(blocked_writer, timeout=5)
+        assert blocked_writer_acquired.is_set()
+    finally:
+        release_refresh.set()
+        release_heartbeat_connection.set()
+        release_health_connection.set()
+        release_writer.set()
+        for task in (worker, heartbeat, health, writer, blocked_writer):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (worker, heartbeat, health, writer, blocked_writer) if task is not None), return_exceptions=True)
+        async with raw_pool.connection() as connection:
+            await connection.set_autocommit(False)
+            async with connection.transaction(), connection.cursor() as cursor:
+                await cursor.execute("DELETE FROM public.loader_derived_refresh_job WHERE loader = %s", (loader,))
+                await cursor.execute("DELETE FROM public.loader_extraction_latch WHERE loader = %s", (loader,))
+                await cursor.execute("DELETE FROM public.loader_derived_refresh_cursor WHERE loader = %s", (loader,))
+        await raw_pool.close()

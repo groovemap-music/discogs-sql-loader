@@ -80,6 +80,7 @@ from unittest.mock import AsyncMock, MagicMock
 import psycopg
 import pytest
 import pytest_asyncio
+from common import WriteAdmission
 from neo4j import AsyncGraphDatabase
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
@@ -561,7 +562,7 @@ async def _empty_neo4j(driver: AsyncDriver) -> None:
 
 async def _load(connection: psycopg.AsyncConnection[Any], driver: AsyncDriver) -> None:
     """Send every fixture event to both services, in one order, through both batch paths."""
-    writer = PostgreSQLBatchWriter(SingleConnectionPool(connection), MagicMock(), media_for_release)
+    writer = PostgreSQLBatchWriter(SingleConnectionPool(connection), MagicMock(), media_for_release, WriteAdmission(1))
     processor = Neo4jBatchProcessor(driver)
 
     for data_type, documents in EVENTS:

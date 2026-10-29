@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aio_pika.abc import AbstractIncomingMessage
+from common import WriteAdmission
 
 from tableinator import telemetry
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
@@ -192,7 +193,7 @@ class TestBatchProcessorTelemetry:
         # data_id "1" already has the same hash on record (unchanged -> skipped);
         # "2" has a different hash on record (changed -> processed).
         pool = self._connection_pool([("1", "abc", False), ("2", "old-hash", False)])
-        processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
+        processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10), WriteAdmission(1))
 
         await processor.add_message("artists", {"id": "1", "sha256": "abc"}, AsyncMock(), AsyncMock())
         await processor.add_message("artists", {"id": "2", "sha256": "new-hash"}, AsyncMock(), AsyncMock())
@@ -218,7 +219,7 @@ class TestBatchProcessorTelemetry:
         recorded as `media_backfilled`, not folded into `skipped` (ADR 0007). Both rows
         match on hash; only "1" still has a NULL media column."""
         pool = self._connection_pool([("1", "abc", True, False), ("2", "def", False, False)])
-        processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10))
+        processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=10), WriteAdmission(1))
 
         release = {"id": "1", "formats": [{"name": "Vinyl", "qty": "1"}]}
         await processor.add_message("releases", dict(release, sha256="abc"), AsyncMock(), AsyncMock())

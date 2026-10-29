@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 import psycopg
 import pytest
 import pytest_asyncio
+from common import WriteAdmission
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
 from tableinator.extraction_latch import (
@@ -244,7 +245,7 @@ async def _truncate(connection: psycopg.AsyncConnection[Any]) -> None:
 
 
 async def _write_batch(connection: psycopg.AsyncConnection[Any], data_type: str, documents: Any, suffix: str = "v1") -> None:
-    writer = PostgreSQLBatchWriter(SingleConnectionPool(connection), MagicMock(), media_for_release)
+    writer = PostgreSQLBatchWriter(SingleConnectionPool(connection), MagicMock(), media_for_release, WriteAdmission(1))
     await writer.process_batch(data_type, [BatchRecord(data_id, data, f"{data_id}-{suffix}") for data_id, data in documents])
 
 
