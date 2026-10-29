@@ -326,6 +326,115 @@ class TestOnDataMessage:
         assert peak == 2
 
     @pytest.mark.asyncio
+    async def test_late_extraction_purge_keeps_budget_after_unconfirmed_broker_close(self) -> None:
+        """An in-flight completion callback uses its pool budget after uncertain teardown."""
+        from common import WriteAdmission
+
+        import tableinator.tableinator as service
+
+        flush_entered = asyncio.Event()
+        release_flush = asyncio.Event()
+        shared_budget = WriteAdmission(1)
+        admission_active = 0
+
+        class TrackingAdmission:
+            @contextlib.asynccontextmanager
+            async def slot(self) -> Any:
+                nonlocal admission_active
+                async with shared_budget.slot():
+                    admission_active += 1
+                    try:
+                        yield
+                    finally:
+                        admission_active -= 1
+
+        admission = TrackingAdmission()
+        purge_calls = 0
+
+        class Batch:
+            async def flush_queue(self, _data_type: str) -> bool:
+                flush_entered.set()
+                await release_flush.wait()
+                return True
+
+            def had_dlq_nacks(self, _data_type: str) -> bool:
+                return False
+
+        class Persistence:
+            async def purge_stale_rows(self, *_args: Any) -> None:
+                nonlocal purge_calls
+                purge_calls += 1
+                assert service.write_admission is admission
+                assert admission_active == 1
+
+        message = AsyncMock(spec=AbstractIncomingMessage)
+        message.body = json.dumps({"type": "extraction_complete", "started_at": "2026-01-01T00:00:00Z"}).encode()
+        with (
+            patch.object(service, "shutdown_requested", False),
+            patch.object(service, "write_admission", admission),
+            patch.object(service, "connection_pool", MagicMock()),
+            patch.object(service, "batch_processor", Batch()),
+            patch.object(service, "durable_refresh_active", False),
+            patch.object(service, "extraction_latch", None),
+            patch.object(service, "PostgreSQLRecordPersistence", return_value=Persistence()),
+            patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=False)),
+        ):
+            callback = asyncio.create_task(on_data_message(message, "artists"))
+            await asyncio.wait_for(flush_entered.wait(), timeout=2)
+
+            # The handler passed its entry check before shutdown; broker close cannot
+            # confirm that this suspended callback has drained.
+            service.shutdown_requested = True
+            assert not await service.close_database_after_broker_drain()
+            assert service.connection_pool is not None
+            assert service.write_admission is admission
+
+            release_flush.set()
+            await asyncio.wait_for(callback, timeout=2)
+
+        assert purge_calls == 1
+        message.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_purge_fails_closed_without_admission(self) -> None:
+        from common import DatabaseUnavailableError
+
+        import tableinator.tableinator as service
+
+        pool = MagicMock()
+        with (
+            patch.object(service, "connection_pool", pool),
+            patch.object(service, "write_admission", None),
+            patch.object(service, "PostgreSQLRecordPersistence") as persistence,
+            pytest.raises(DatabaseUnavailableError, match="Write admission not initialized"),
+        ):
+            await purge_stale_rows("artists", "2026-01-01T00:00:00Z")
+
+        persistence.assert_not_called()
+        pool.connection.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_direct_write_fails_closed_without_admission(self) -> None:
+
+        import tableinator.tableinator as service
+
+        message = AsyncMock(spec=AbstractIncomingMessage)
+        message.body = json.dumps({"id": "late", "name": "Artist", "sha256": "hash"}).encode()
+        pool = MagicMock()
+        with (
+            patch.object(service, "connection_pool", pool),
+            patch.object(service, "write_admission", None),
+            patch.object(service, "PostgreSQLRecordPersistence") as persistence,
+        ):
+            await on_data_message(message, "artists")
+
+        persistence.return_value.persist_record.assert_not_called()
+        pool.connection.assert_not_called()
+        message.nack.assert_awaited_once_with(requeue=True)
+        message.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_skip_unchanged_record(self, sample_artist_data: dict[str, Any], mock_postgres_connection: MagicMock, mock_async_pool: Any) -> None:
         """Test that unchanged records are handled via a single conditional upsert.
@@ -3821,6 +3930,8 @@ class TestCoverageGaps:
     @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_purge_stale_rows_reraises_exception(self) -> None:
         """Test purge_stale_rows re-raises exceptions (line 514)."""
+        from common import WriteAdmission
+
         from tableinator.tableinator import purge_stale_rows
 
         mock_pool = MagicMock()
@@ -3832,6 +3943,7 @@ class TestCoverageGaps:
 
         with (
             patch("tableinator.tableinator.connection_pool", mock_pool),
+            patch("tableinator.tableinator.write_admission", WriteAdmission(1)),
             patch("tableinator.tableinator.logger"),
             pytest.raises(Exception, match="DB connection lost"),
         ):

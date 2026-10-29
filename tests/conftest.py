@@ -1,6 +1,7 @@
 """Pytest configuration for tableinator tests."""
 
 import asyncio
+import contextlib
 import uuid
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,6 +17,14 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from psycopg import AsyncConnection, AsyncCursor, AsyncTransaction
 
 from tableinator import telemetry as tableinator_telemetry
+
+
+class _TestWriteAdmission:
+    """No-op default for legacy unit tests; admission behavior has focused tests."""
+
+    @contextlib.asynccontextmanager
+    async def slot(self) -> Any:
+        yield
 
 
 if TYPE_CHECKING:
@@ -149,7 +158,7 @@ def reset_service_state() -> Iterator[None]:
         service.shutdown_requested = False
         service.config = None
         service.connection_pool = None
-        service.write_admission = None
+        service.write_admission = _TestWriteAdmission()
         service.rabbitmq_manager = None
         service.active_connection = None
         service.active_channel = None

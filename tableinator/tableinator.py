@@ -595,13 +595,35 @@ async def durable_recovery_loop() -> None:
         await asyncio.sleep(15)
 
 
-async def close_rabbitmq_connection() -> None:
+async def close_rabbitmq_connection() -> bool:
     """Close idle transports without discarding unconfirmed cleanup state."""
-    if await _close_recovery_broker():
+    closed = await _close_recovery_broker()
+    if closed:
         logger.info(
             f"✅ RabbitMQ connection closed. Will check for new messages every {QUEUE_CHECK_INTERVAL}s",
             QUEUE_CHECK_INTERVAL=QUEUE_CHECK_INTERVAL,
         )
+    return closed
+
+
+async def close_database_after_broker_drain() -> bool:
+    """Close the pool and release its admission budget only after broker drain."""
+    global write_admission
+
+    if not await close_rabbitmq_connection():
+        logger.error("❌ Keeping PostgreSQL pool and write admission open because RabbitMQ callback drain is unconfirmed")
+        return False
+
+    try:
+        if connection_pool:
+            await connection_pool.close()
+            logger.info("✅ Async connection pool closed")
+    except Exception as exc:
+        logger.warning("⚠️ Error closing connection pool; retaining write admission", error=type(exc).__name__)
+        return False
+
+    write_admission = None
+    return True
 
 
 async def check_all_consumers_idle() -> bool:
@@ -883,16 +905,15 @@ async def purge_stale_rows(data_type: str, started_at: str, record_count: int | 
     """Delete rows not refreshed by the current extraction when safe."""
     if connection_pool is None:
         return
+    admission = write_admission
+    if admission is None:
+        raise DatabaseUnavailableError("Write admission not initialized")
     persistence = PostgreSQLRecordPersistence(
         connection_pool,
         logger,
         PURGE_MAX_DELETE_FRACTION,
         media_for_release,
     )
-    admission = write_admission
-    if admission is None:
-        await persistence.purge_stale_rows(data_type, started_at, record_count)
-        return
     async with admission.slot():
         await persistence.purge_stale_rows(data_type, started_at, record_count)
 
@@ -1271,10 +1292,9 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
         )
         admission = write_admission
         if admission is None:
+            raise DatabaseUnavailableError("Write admission not initialized")
+        async with admission.slot():
             terminal_outcome = await persistence.persist_record(data_type, data_id, data)
-        else:
-            async with admission.slot():
-                terminal_outcome = await persistence.persist_record(data_type, data_id, data)
         return DeliveryResult(Settlement.ACK, terminal_outcome)
 
     class DeliveryTelemetryObserver:
@@ -1475,6 +1495,11 @@ async def main() -> None:
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         raise StartupFailure("configuration error") from e
+
+    # A previous lifespan with an unconfirmed broker close may still have
+    # callbacks using its pool budget. Never create a competing budget/pool.
+    if connection_pool is not None and write_admission is not None:
+        raise StartupFailure("previous PostgreSQL writer lifespan did not drain")
 
     # Start health server
     health_server = HealthServer(config.health_port, get_health_data)
@@ -1759,18 +1784,9 @@ async def main() -> None:
             for task in list(consumer_cancel_tasks.values()):
                 task.cancel()
 
-            # Close RabbitMQ connection if still active
-            await close_rabbitmq_connection()
-
-            # Close async connection pool
-            try:
-                if connection_pool:
-                    await connection_pool.close()
-                    logger.info("✅ Async connection pool closed")
-            except Exception as e:
-                logger.warning("⚠️ Error closing connection pool", error=str(e))
-            # Drop the loop-owned budget only after every writer is joined and the pool is closed.
-            write_admission = None
+            # Only release the pool budget after transport closure confirms that
+            # RabbitMQ has cancelled and joined every callback using this pool.
+            await close_database_after_broker_drain()
 
         # Stop health server
         health_server.stop()
