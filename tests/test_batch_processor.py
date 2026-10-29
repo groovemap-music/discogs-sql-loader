@@ -65,7 +65,7 @@ class TestPolicyAdapters:
     def test_runtime_is_pinned_to_the_reviewed_revision(self) -> None:
         pyproject = Path("pyproject.toml").read_text()
         lock = Path("uv.lock").read_text()
-        revision = "40d799c6ae0cd9b11b524f7477642a5c14f5f8f2"
+        revision = "a86f3e48783a8618be62667c74258eaa30388494"
         assert revision in pyproject
         assert f"#{revision}" in lock
 
@@ -299,6 +299,16 @@ class TestSharedEngineSafety:
         processor._process_batch = write  # type: ignore[method-assign]
         await asyncio.gather(*(processor.add_message(entity, {"id": entity}, AsyncMock(), AsyncMock()) for entity in DATA_TYPES))
         assert maximum == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_sql_fails_closed_without_shared_admission(self) -> None:
+        pool = MagicMock()
+        processor = PostgreSQLBatchProcessor(pool, processor_config())
+
+        with pytest.raises(DatabaseUnavailableError, match="Write admission not initialized"):
+            await processor._process_batch("artists", [message("missing-budget")])
+
+        pool.connection.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_batch_sql_admission_is_shared_across_entity_flushes(self) -> None:

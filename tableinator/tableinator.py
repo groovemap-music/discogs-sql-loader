@@ -614,6 +614,13 @@ async def close_database_after_broker_drain() -> bool:
         logger.error("❌ Keeping PostgreSQL pool and write admission open because RabbitMQ callback drain is unconfirmed")
         return False
 
+    # The shared runtime tracks complete callback lifetimes as well as SQL holders
+    # and waiters; a timeout preserves the work and keeps its pool/budget alive.
+    admission = write_admission
+    if admission is not None and not await admission.drain(timeout=CONSUMER_CANCEL_TIMEOUT):
+        logger.error("❌ Keeping PostgreSQL pool and write admission open because delivery callbacks did not drain")
+        return False
+
     try:
         if connection_pool:
             await connection_pool.close()
@@ -925,7 +932,11 @@ def make_data_handler(
     """Create a per-data-type message handler that injects data_type context."""
 
     async def handler(message: AbstractIncomingMessage) -> None:
-        await on_data_message(message, data_type)
+        admission = write_admission
+        if admission is None:
+            raise DatabaseUnavailableError("Write admission not initialized")
+        async with admission.handler():
+            await on_data_message(message, data_type)
 
     return handler
 
@@ -1782,8 +1793,11 @@ async def main() -> None:
                     logger.warning("⚠️ Error flushing batch processor", error=str(e))
 
             # Cancel any pending consumer cancellation tasks
-            for task in list(consumer_cancel_tasks.values()):
+            pending_cancellations = list(consumer_cancel_tasks.values())
+            for task in pending_cancellations:
                 task.cancel()
+            if pending_cancellations:
+                await asyncio.gather(*pending_cancellations, return_exceptions=True)
 
             # Only release the pool budget after transport closure confirms that
             # RabbitMQ has cancelled and joined every callback using this pool.

@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import pytest_asyncio
+from common import WriteAdmission
 from common.identifiers import IdentifierValidationError
 from common.identity import AliasRef
 
@@ -112,8 +114,8 @@ def attach() -> Iterator[AttachRecorder]:
         yield recorder
 
 
-@pytest.fixture
-def batch_writer(
+@pytest_asyncio.fixture
+async def batch_writer(
     mock_postgres_connection: Any,
     mock_async_pool: Any,
     attach: AttachRecorder,
@@ -122,7 +124,7 @@ def batch_writer(
     logger = MagicMock()
     cursor = mock_postgres_connection.cursor.return_value
     attach.probe = lambda: cursor.executemany.await_count
-    writer = PostgreSQLBatchWriter(mock_async_pool(mock_postgres_connection), logger, lambda data: {"source": data["id"]})
+    writer = PostgreSQLBatchWriter(mock_async_pool(mock_postgres_connection), logger, lambda data: {"source": data["id"]}, WriteAdmission(1))
     return writer, mock_postgres_connection, logger
 
 

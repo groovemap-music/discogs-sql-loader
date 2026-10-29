@@ -5,6 +5,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from common import WriteAdmission
 
 from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
 
@@ -40,7 +41,7 @@ async def _add(processor: PostgreSQLBatchProcessor, data_type: str, count: int) 
 
 @pytest.mark.asyncio
 async def test_batch_size_500_processes_1000_records_with_two_writes() -> None:
-    processor = PostgreSQLBatchProcessor(_pool(), BatchConfig(batch_size=500, flush_interval=2, max_pending=5000))
+    processor = PostgreSQLBatchProcessor(_pool(), BatchConfig(batch_size=500, flush_interval=2, max_pending=5000), WriteAdmission(2))
     started = time.perf_counter()
     await _add(processor, "artists", 1000)
     await processor.flush_all()
@@ -52,7 +53,7 @@ async def test_batch_size_500_processes_1000_records_with_two_writes() -> None:
 @pytest.mark.asyncio
 async def test_four_entity_streams_use_the_pool_and_preserve_counts() -> None:
     pool = _pool()
-    processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=500, flush_interval=2, max_pending=5000))
+    processor = PostgreSQLBatchProcessor(pool, BatchConfig(batch_size=500, flush_interval=2, max_pending=5000), WriteAdmission(2))
     await asyncio.gather(*(_add(processor, data_type, 500) for data_type in ("artists", "labels", "masters", "releases")))
     await processor.flush_all()
     assert pool.connection.call_count >= 4
@@ -61,7 +62,7 @@ async def test_four_entity_streams_use_the_pool_and_preserve_counts() -> None:
 
 @pytest.mark.asyncio
 async def test_mocked_throughput_remains_above_500_records_per_second() -> None:
-    processor = PostgreSQLBatchProcessor(_pool(), BatchConfig(batch_size=500, flush_interval=2, max_pending=5000))
+    processor = PostgreSQLBatchProcessor(_pool(), BatchConfig(batch_size=500, flush_interval=2, max_pending=5000), WriteAdmission(2))
     started = time.perf_counter()
     await _add(processor, "artists", 5000)
     await processor.flush_all()

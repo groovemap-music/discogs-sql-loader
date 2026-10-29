@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 import psycopg
 import pytest
 import pytest_asyncio
+from common import WriteAdmission
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
 from tableinator.graph_counters import PATH_REFRESH_RELATIONS, REFRESH_ORDER
@@ -190,7 +191,7 @@ async def _truncate(connection: psycopg.AsyncConnection[Any]) -> None:
 
 async def _write_via_loader(connection: psycopg.AsyncConnection[Any]) -> None:
     """Write the fixture catalog through the loader's own batch derive-and-write path."""
-    writer = PostgreSQLBatchWriter(SingleConnectionPool(connection), MagicMock(), media_for_release)
+    writer = PostgreSQLBatchWriter(SingleConnectionPool(connection), MagicMock(), media_for_release, WriteAdmission(1))
     records = [BatchRecord(data_id, data, f"{data_id}-v1") for data_id, data in RELEASES]
     await writer.process_batch("releases", records)
 

@@ -26,6 +26,13 @@ class _TestWriteAdmission:
     async def slot(self) -> Any:
         yield
 
+    @contextlib.asynccontextmanager
+    async def handler(self) -> Any:
+        yield
+
+    async def drain(self, *, timeout: float) -> bool:  # noqa: ARG002
+        return True
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

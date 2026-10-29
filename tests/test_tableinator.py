@@ -348,6 +348,14 @@ class TestOnDataMessage:
                     finally:
                         admission_active -= 1
 
+            @contextlib.asynccontextmanager
+            async def handler(self) -> Any:
+                async with shared_budget.handler():
+                    yield
+
+            async def drain(self, *, timeout: float) -> bool:
+                return await shared_budget.drain(timeout=timeout)
+
         admission = TrackingAdmission()
         purge_calls = 0
 
@@ -379,7 +387,7 @@ class TestOnDataMessage:
             patch.object(service, "PostgreSQLRecordPersistence", return_value=Persistence()),
             patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=False)),
         ):
-            callback = asyncio.create_task(on_data_message(message, "artists"))
+            callback = asyncio.create_task(service.make_data_handler("artists")(message))
             await asyncio.wait_for(flush_entered.wait(), timeout=2)
 
             # The handler passed its entry check before shutdown; broker close cannot
@@ -394,6 +402,74 @@ class TestOnDataMessage:
 
         assert purge_calls == 1
         message.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_broker_close_joins_active_delivery_before_pool_close(self) -> None:
+        from common import WriteAdmission
+
+        import tableinator.tableinator as service
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        pool = AsyncMock()
+        admission = WriteAdmission(1)
+
+        async def blocked_delivery(_message: Any, _data_type: str) -> None:
+            entered.set()
+            await release.wait()
+
+        with (
+            patch.object(service, "connection_pool", pool),
+            patch.object(service, "write_admission", admission),
+            patch.object(service, "on_data_message", new=blocked_delivery),
+            patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=True)),
+        ):
+            callback = asyncio.create_task(service.make_data_handler("artists")(MagicMock()))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            shutdown = asyncio.create_task(service.close_database_after_broker_drain())
+            await asyncio.sleep(0)
+            assert not shutdown.done()
+            pool.close.assert_not_awaited()
+            assert service.write_admission is admission
+
+            release.set()
+            await asyncio.wait_for(callback, timeout=2)
+            assert await asyncio.wait_for(shutdown, timeout=2)
+            pool.close.assert_awaited_once()
+            assert service.connection_pool is None
+            assert service.write_admission is None
+
+    @pytest.mark.asyncio
+    async def test_callback_drain_timeout_retains_pool_and_budget(self) -> None:
+        from common import WriteAdmission
+
+        import tableinator.tableinator as service
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        pool = AsyncMock()
+        admission = WriteAdmission(1)
+
+        async def blocked_delivery(_message: Any, _data_type: str) -> None:
+            entered.set()
+            await release.wait()
+
+        with (
+            patch.object(service, "connection_pool", pool),
+            patch.object(service, "write_admission", admission),
+            patch.object(service, "on_data_message", new=blocked_delivery),
+            patch.object(service, "close_rabbitmq_connection", new=AsyncMock(return_value=True)),
+            patch.object(service, "CONSUMER_CANCEL_TIMEOUT", 0.01),
+        ):
+            callback = asyncio.create_task(service.make_data_handler("artists")(MagicMock()))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            assert not await service.close_database_after_broker_drain()
+            pool.close.assert_not_awaited()
+            assert service.connection_pool is pool
+            assert service.write_admission is admission
+
+            release.set()
+            await asyncio.wait_for(callback, timeout=2)
 
     @pytest.mark.asyncio
     async def test_purge_fails_closed_without_admission(self) -> None:
