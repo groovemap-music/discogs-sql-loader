@@ -4,11 +4,12 @@
     "delivery",
     "otel",
     "postgres",
-    "rabbitmq"
+    "rabbitmq",
+    "delivery-admission"
   ],
   "package": "groovemap-runtime",
-  "source_commit": "9bac0220df80fdb550fde78d4db8228ca4273625",
+  "source_commit": "264e1d84c7165525844d3b1210179cfbf72a61f2",
   "source_repository": "https://github.com/groovemap-music/python-libraries",
-  "source_tree": "e37921b1e8c4365a6f2adab0292832ed27097608",
+  "source_tree": "8fdb428da1857dd064d947d38ed61aa185a68ebd",
   "version": "0.1.0"
 }

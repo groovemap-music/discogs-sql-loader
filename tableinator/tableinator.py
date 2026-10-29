@@ -14,6 +14,7 @@ from common import (
     AsyncPostgreSQLPool,
     AsyncResilientRabbitMQ,
     DatabaseUnavailableError,
+    DeliveryAdmission,
     DeliveryResult,
     HealthServer,
     OutageBackoff,
@@ -282,6 +283,19 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12
 
+_write_slots: tuple[asyncio.AbstractEventLoop, int, DeliveryAdmission] | None = None
+
+
+def _write_admission() -> DeliveryAdmission:
+    """Share the PostgreSQL writer budget across entity queues and broker reconnects."""
+    global _write_slots
+    loop = asyncio.get_running_loop()
+    capacity = config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
+    # Settings are fixed while running. Test loops must not reuse a contended gate.
+    if _write_slots is None or _write_slots[:2] != (loop, capacity):
+        _write_slots = (loop, capacity, DeliveryAdmission(capacity))
+    return _write_slots[2]
+
 
 def channel_prefetch() -> tuple[int, bool]:
     """Resolve ``(prefetch_count, global_)`` for this channel's QoS.
@@ -296,20 +310,15 @@ def channel_prefetch() -> tuple[int, bool]:
       fill, so QoS stays per-consumer (``global_=False``). The channel-wide ceiling is
       therefore ``prefetch_count * len(DATA_TYPES)`` — logged explicitly so the 4x
       multiplier is not a surprise.
-    * **Non-batch mode** (``POSTGRES_BATCH_MODE=false``) — every in-flight handler
-      holds a pooled connection for the duration of its upsert, exactly the shape
-      brainztableinator couples in ``_channel_prefetch``. Bound the channel's TOTAL
-      unacked deliveries (``global_=True``) to the pool max so the broker, not the
-      pool's ~15.5s exhausted-wait retry loop, applies backpressure. Without this,
-      4 x 200 = 800 concurrent handlers raced for 12 connections; the losers raised,
-      were nacked with ``requeue=True``, and burned the quorum queue's
-      ``x-delivery-limit: 20`` until the message was silently dead-lettered.
+    * **Non-batch mode** — per-consumer prefetch matches the pool max. A shared
+      admission budget bounds database writers across all queues before pool
+      acquisition, without deprecated channel-global QoS or pool-wait requeues.
     """
     if BATCH_MODE:
         # prefetch_count must be >= batch_size to allow batches to fill before flushing
         return max(200, BATCH_SIZE * 2), False
     pool_max = config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
-    return pool_max, True
+    return pool_max, False
 
 
 # Global shutdown flag
@@ -785,8 +794,7 @@ async def _recover_consumers() -> None:
 
             # Re-establish full connection and start consuming
 
-            # Set QoS - scale with batch_size in batch mode, couple to the PostgreSQL
-            # pool capacity in non-batch mode (see channel_prefetch).
+            # Supported per-consumer QoS; admission retains its budget across recovery.
             prefetch_count, prefetch_global = channel_prefetch()
             await active_channel.set_qos(prefetch_count=prefetch_count, global_=prefetch_global)
 
@@ -892,7 +900,8 @@ async def purge_stale_rows(data_type: str, started_at: str, record_count: int | 
         PURGE_MAX_DELETE_FRACTION,
         media_for_release,
     )
-    await persistence.purge_stale_rows(data_type, started_at, record_count)
+    async with _write_admission().slot():
+        await persistence.purge_stale_rows(data_type, started_at, record_count)
 
 
 def make_data_handler(
@@ -1267,7 +1276,8 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             PURGE_MAX_DELETE_FRACTION,
             media_for_release,
         )
-        terminal_outcome = await persistence.persist_record(data_type, data_id, data)
+        async with _write_admission().slot():
+            terminal_outcome = await persistence.persist_record(data_type, data_id, data)
         return DeliveryResult(Settlement.ACK, terminal_outcome)
 
     class DeliveryTelemetryObserver:
@@ -1612,7 +1622,7 @@ async def main() -> None:
         active_channel = channel
 
         # Set QoS to allow concurrent batch processing for better throughput, or to
-        # couple in-flight deliveries to the PostgreSQL pool in non-batch mode.
+        # bound deliveries while shared admission caps non-batch database writers.
         prefetch_count, prefetch_global = channel_prefetch()
         await channel.set_qos(prefetch_count=prefetch_count, global_=prefetch_global)
         logger.info(

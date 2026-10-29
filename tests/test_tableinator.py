@@ -81,7 +81,7 @@ class TestChannelPrefetch:
     x-delivery-limit until the message was silently dead-lettered.
     """
 
-    def test_non_batch_prefetch_is_channel_global_and_matches_pool_max(self) -> None:
+    def test_non_batch_prefetch_is_per_consumer_and_matches_pool_max(self) -> None:
         mock_config = MagicMock()
         mock_config.postgres_pool_max_size = 12
 
@@ -92,8 +92,8 @@ class TestChannelPrefetch:
             prefetch, global_ = channel_prefetch()
 
         assert prefetch == 12
-        # global_=True bounds the CHANNEL's total unacked deliveries, not each consumer's.
-        assert global_ is True
+        # Shared admission caps writers independently of the delivery prefetch.
+        assert global_ is False
 
     def test_non_batch_prefetch_falls_back_when_config_unset(self) -> None:
         from tableinator.tableinator import _DEFAULT_POOL_MAX
@@ -105,7 +105,7 @@ class TestChannelPrefetch:
             prefetch, global_ = channel_prefetch()
 
         assert prefetch == _DEFAULT_POOL_MAX
-        assert global_ is True
+        assert global_ is False
 
     def test_batch_prefetch_stays_per_consumer_and_scales_with_batch_size(self) -> None:
         """Batch mode hands off to the batch processor rather than holding a connection
@@ -3096,9 +3096,12 @@ class TestRecoverConsumersTableinator:
         mock_rmq = AsyncMock()
         mock_rmq.connect = AsyncMock(return_value=mock_connection)
 
+        gate = t._write_admission()
         with patch.object(t, "rabbitmq_manager", mock_rmq), patch.object(t, "logger"):
             await t._recover_consumers()
 
+        assert t._write_admission() is gate
+        assert mock_channel.set_qos.call_args.kwargs["global_"] is False
         assert set(t.consumer_tags.keys()) == {"artists", "labels", "masters", "releases"}
         assert t.completed_files == set(t.DATA_TYPES) - {"artists"}
 
@@ -3809,6 +3812,7 @@ class TestMainFullRun:
             # Connect + channel + QoS were configured.
             mock_rabbitmq_instance.connect.assert_awaited()
             mock_channel.set_qos.assert_awaited_once()
+            assert mock_channel.set_qos.call_args.kwargs["global_"] is False
             # Exchanges/queues declared and consumers started for every data type.
             assert mock_channel.declare_exchange.await_count >= len(mod.DATA_TYPES)
             assert mock_queue.consume.await_count == len(mod.DATA_TYPES)
