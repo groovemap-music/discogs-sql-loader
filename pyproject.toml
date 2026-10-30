@@ -62,10 +62,10 @@ exclude-newer = "7 days"
 exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
 # The schema producer's historical runtime URL is immutable; resolve its dev dependency
 # against this loader's active tested runtime rather than locking two revisions.
-override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+https://github.com/groovemap-music/python-libraries.git@a86f3e48783a8618be62667c74258eaa30388494"]
+override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+https://github.com/groovemap-music/python-libraries.git@6d0425f908e01a446b040e2993045e2afe30460e"]
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "a86f3e48783a8618be62667c74258eaa30388494" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6d0425f908e01a446b040e2993045e2afe30460e" }
 groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "244cb2ba40d8dd80717bcbd5315049896662c99f" }
 
 [tool.ruff]
