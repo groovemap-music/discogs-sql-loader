@@ -14,9 +14,9 @@ simultaneous connection demand than this service's pool can satisfy.
   `POSTGRES_POOL_MIN_SIZE` and `POSTGRES_POOL_MAX_SIZE`.
 - Batch mode queues deliveries in memory and limits concurrent flushes to two. Its
   RabbitMQ prefetch is per consumer and large enough to fill each entity batch.
-- Non-batch mode performs one database operation per in-flight handler. Its prefetch is
-  channel-global and equals `POSTGRES_POOL_MAX_SIZE`, so RabbitMQ supplies the
-  backpressure.
+- Non-batch mode performs one database operation per in-flight handler. Each consumer's
+  prefetch equals `POSTGRES_POOL_MAX_SIZE`, and a shared write-admission budget bounds
+  the total across all entity consumers, so RabbitMQ supplies the backpressure.
 - Pool acquisition, transaction, and retry behavior comes from the pinned
   `groovemap-runtime`; this repository does not maintain a second pool implementation.
 
@@ -26,7 +26,7 @@ flowchart TD
     mode -->|true| buffered[Per-entity buffers]
     buffered --> bounded[At most two concurrent flushes]
     mode -->|false| direct[One handler per delivery]
-    direct --> qos[Channel-global prefetch equals pool max]
+    direct --> qos[Per-consumer prefetch equals pool max]
     bounded --> pool[(PostgreSQL pool)]
     qos --> pool
 ```

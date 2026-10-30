@@ -1,5 +1,10 @@
 # Operations
 
+`discogs-sql-loader` reads Discogs catalog records from RabbitMQ and keeps the matching
+PostgreSQL tables up to date. This page is for operators and developers who run or debug the
+service. It covers the data flow, configuration, completion and restart behavior, health,
+validation, troubleshooting, and telemetry.
+
 ## Data flow
 
 ```mermaid
@@ -19,10 +24,10 @@ sequenceDiagram
     R->>L: terminal delivery
     L->>P: flush and guarded cleanup
     P-->>L: commit
-    L->>P: signal and pending job transaction
+    L->>P: one transaction: terminal signal and pending refresh job
     P-->>L: commit
     L-->>R: acknowledge terminal delivery
-    L->>P: scan, claim, refresh, fence, complete
+    L->>P: worker scans, claims, refreshes, then completes (a newer extraction fences it off)
 ```
 
 The input contract is `groovemap.catalog-events` version 1. The default Discogs
@@ -41,8 +46,10 @@ upserted into the matching PostgreSQL table:
 
 ## Configuration
 
-Credentials support either the named variable or its `_FILE` form. Secret files are
+Set these as environment variables. Credentials support either the named variable or its `_FILE` form. Secret files are
 preferred for deployed containers.
+
+### Postgres
 
 | Variable | Required/default | Purpose |
 | --- | --- | --- |
@@ -53,27 +60,57 @@ preferred for deployed containers.
 | `POSTGRES_DATABASE` | required | PostgreSQL database |
 | `POSTGRES_POOL_MIN_SIZE` | `2` | Minimum open PostgreSQL connections |
 | `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum open PostgreSQL connections; durable refresh reserves `3` for the refresh transaction, lease heartbeat, and health sampler, and requires at least `4` total |
+
+### RabbitMQ
+
+| Variable | Required/default | Purpose |
+| --- | --- | --- |
 | `RABBITMQ_HOST` | `rabbitmq` | RabbitMQ host |
 | `RABBITMQ_PORT` | `5672` | RabbitMQ AMQP port |
 | `RABBITMQ_USERNAME` / `_FILE` | deployment supplied | RabbitMQ user |
 | `RABBITMQ_PASSWORD` / `_FILE` | deployment supplied | RabbitMQ password |
 | `DISCOGS_EXCHANGE_PREFIX` | `groovemap-discogs` | Producer-owned exchange prefix |
+
+### Batching
+
+| Variable | Required/default | Purpose |
+| --- | --- | --- |
 | `POSTGRES_BATCH_MODE` | `true` | Enable transactional batch writes |
 | `POSTGRES_BATCH_SIZE` | `100` | Records that trigger a batch flush |
 | `POSTGRES_BATCH_FLUSH_INTERVAL` | `5.0` seconds | Time that triggers a batch flush |
+
+### Lifecycle and health
+
+| Variable | Required/default | Purpose |
+| --- | --- | --- |
 | `CONSUMER_CANCEL_DELAY` | `300` seconds | Grace period after `file_complete`; `0` disables cancellation |
 | `QUEUE_CHECK_INTERVAL` | `3600` seconds | Poll interval after all queues become idle |
 | `STUCK_CHECK_INTERVAL` | `30` seconds | Consumer recovery check interval |
 | `STARTUP_IDLE_TIMEOUT` | `30` seconds | Delay before entering quiet idle mode |
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
-| `HEALTH_PORT` | `8002` | Health server port; `8002` is the role port for every SQL loader. An invalid value (non-numeric or outside `1`-`65535`) fails startup with a configuration error instead of falling back |
+| `HEALTH_PORT` | `8002` | Health server port; `8002` is the role port, the one fixed health port shared by every SQL loader. An invalid value (non-numeric or outside `1`-`65535`) fails startup with a configuration error instead of falling back |
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
+| `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |
+
+### Logging
+
+| Variable | Required/default | Purpose |
+| --- | --- | --- |
 | `LOG_LEVEL` | `INFO` | Log verbosity; an unrecognized value falls back to `INFO` |
 | `ENVIRONMENT` | `development` | Value of the `environment` field on every log entry; does not change verbosity |
 | `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size that rolls the `/logs/discogs-sql-loader.log` file sink over; a non-numeric or non-positive override falls back to the default |
 | `LOG_FILE_BACKUP_COUNT` | `5` | Rotated backups of that file sink retained; a non-numeric or non-positive override falls back to the default |
-| `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |
-| `DERIVED_REFRESH_MODE` | `durable` | `inline` explicitly rolls back to commit-before-ack refresh; do not use for a full dump without an ack-budget certification |
+
+### Derived refresh
+
+| Variable | Required/default | Purpose |
+| --- | --- | --- |
+| `DERIVED_REFRESH_MODE` | `durable` | `inline` explicitly rolls back to commit-before-ack refresh; do not use for a full dump unless the [ack-budget report](derived-refresh-ack-budget.md) certifies it |
+
+### Telemetry export
+
+| Variable | Required/default | Purpose |
+| --- | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry disabled) | Collector base URL, e.g. `http://otel-collector:4318`; shared by metrics and traces |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | falls back to the endpoint above | Metrics-only collector override |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | falls back to the endpoint above | Traces-only collector override |
@@ -84,6 +121,103 @@ preferred for deployed containers.
 | `OTEL_METRIC_EXPORT_INTERVAL` | SDK default | Push interval, in milliseconds |
 | `OTEL_SERVICE_NAME` | `tableinator` | Overrides the `service.name` resource attribute |
 | `OTEL_RESOURCE_ATTRIBUTES` | empty | Extra resource attributes, e.g. `service.namespace=groovemap,deployment.environment.name=dev` |
+
+## Completion and restart behavior
+
+A `file_complete` delivery is not acknowledged until the batch for that entity has
+flushed successfully. The service then marks the entity complete and, after
+`CONSUMER_CANCEL_DELAY`, cancels that consumer. When all consumers are complete, the
+RabbitMQ connection can close; `QUEUE_CHECK_INTERVAL` controls when the service checks
+for new work and reconnects.
+
+An `extraction_complete` delivery flushes all pending data before guarded stale-row
+cleanup. Cleanup is skipped when a message for that entity was dead-lettered or when
+the deletion would meet or exceed `PURGE_MAX_DELETE_FRACTION` of a non-empty table.
+
+Completion state is in memory. On process restart, the producer may resume and skip
+files completed earlier. The delete guard is therefore part of the restart-safety
+contract. During shutdown, consumers are canceled before the potentially slow batch
+flush so RabbitMQ does not keep delivering messages that the process cannot settle.
+
+## Health and logs
+
+The health server listens on port `8002`, the role port (the fixed health port shared by every
+SQL loader), unless `HEALTH_PORT` overrides it. The image `HEALTHCHECK` follows the override.
+
+The JSON at `/health`:
+
+- identifies the service as `discogs-sql-loader`;
+- reports `starting`, `healthy`, or `unhealthy`;
+- lists the current task, per-entity counts, active consumers, and completed files.
+
+Container logs go through the shared structured-logging runtime under the same service name,
+to `/logs/discogs-sql-loader.log`. That file is a size-capped `RotatingFileHandler` bounded by
+`LOG_FILE_MAX_BYTES` / `LOG_FILE_BACKUP_COUNT` (see [Logging](#logging)).
+
+### Durable derived refresh
+
+With durable refresh enabled, the payload also has a `durable_derived_refresh` object with:
+
+- current and latest completed versions;
+- phase and duration;
+- pending age and attempts;
+- retry due time and lease expiry;
+- the sanitized last failure and the superseded count.
+
+The health status becomes `unhealthy` when any of these holds:
+
+- the schema for the refresh jobs is missing;
+- pending or `waiting_for_signals` work is stale (older than 24 hours, which allows the four
+  queues to drain);
+- a retry is scheduled;
+- a worker lease has expired.
+
+How the worker behaves:
+
+- It scans on its own, independently of RabbitMQ deliveries.
+- A run can be *fenced*: just before committing, it checks that its extraction is still the
+  newest and that it still holds its lease. If either is false, the run rolls back instead of
+  committing, so a stale refresh never overwrites newer data.
+- Acknowledging a terminal signal means the refresh job is durable in the database. It does
+  not mean the refresh has finished.
+
+## Validation
+
+Install the dependencies first, then run the checks:
+
+```bash
+just setup
+just check
+```
+
+The check is local and credential-free after dependencies are installed. It covers the
+restored shutdown-delivery, terminal file-completion, batch-performance, drain, and
+transient-failure regressions without contacting PostgreSQL or RabbitMQ.
+
+For container validation, run `just image`; this builds `discogs-sql-loader:local`,
+checks the installed module, and verifies the non-root runtime identity. The full stack
+belongs to the separate `deployment` repository.
+
+## Troubleshooting
+
+- `starting` persists: verify all required PostgreSQL variables and reachability.
+- `unhealthy` with no consumers: inspect RabbitMQ connectivity and stuck-state logs.
+- Terminal delivery is requeued: the pending batch did not commit; inspect PostgreSQL
+  availability before retrying.
+- Durable terminal delivery is requeued: consumers are paused first, so the queued
+  message cannot hot-loop through its 20-delivery limit (the most times RabbitMQ redelivers a
+  message before dead-lettering it). Inspect the schema probe,
+  legacy-latch reconciliation (at startup, extraction latch rows written before durable refresh
+  get a generation, and rows with all four signals that are not yet refreshed become refresh
+  jobs; rows older than the current version are skipped), and signal-commit logs. Recovery probes the failed
+  signal without another broker delivery and resubscribes after its commit succeeds.
+  Never force an ack while the job relation is unavailable.
+- `durable_derived_refresh.status=degraded`: inspect `phase`, `retry_due`,
+  `lease_expiry`, and `last_sanitized_failure`; the scanner retries without a new
+  broker message. A versionless/invalid terminal delivery is refused to the DLQ and
+  recorded in `derived_relation_refresh_last_refused`.
+- Cleanup was refused: confirm whether the producer resumed an existing extraction or
+  whether the source dump unexpectedly shrank before changing the safety threshold.
 
 ## Telemetry
 
@@ -155,70 +289,3 @@ re-enqueued for an in-process retry, and its span records the error only.
 
 A failure sets span status `ERROR` and an `error.type` attribute. No statement, record id, file
 name, stack trace, or span event carrying a payload is ever attached to a span.
-
-## Completion and restart behavior
-
-A `file_complete` delivery is not acknowledged until the batch for that entity has
-flushed successfully. The service then marks the entity complete and, after
-`CONSUMER_CANCEL_DELAY`, cancels that consumer. When all consumers are complete, the
-RabbitMQ connection can close; `QUEUE_CHECK_INTERVAL` controls when the service checks
-for new work and reconnects.
-
-An `extraction_complete` delivery flushes all pending data before guarded stale-row
-cleanup. Cleanup is skipped when a message for that entity was dead-lettered or when
-the deletion would meet or exceed `PURGE_MAX_DELETE_FRACTION` of a non-empty table.
-
-Completion state is in memory. On process restart, the producer may resume and skip
-files completed earlier. The delete guard is therefore part of the restart-safety
-contract. During shutdown, consumers are canceled before the potentially slow batch
-flush so RabbitMQ does not keep delivering messages that the process cannot settle.
-
-## Health and logs
-
-The health server listens on port `8002`, the role port for every SQL loader, unless
-`HEALTH_PORT` overrides it (the image `HEALTHCHECK` follows the override). Its JSON identifies the service as
-`discogs-sql-loader` and reports `starting`, `healthy`, or `unhealthy`, plus the current
-task, per-entity counts, active consumers, and completed files. Container logs are
-written through the shared structured-logging runtime under the same service name, to
-`/logs/discogs-sql-loader.log`; that file sink is a size-capped `RotatingFileHandler`
-bounded by `LOG_FILE_MAX_BYTES` / `LOG_FILE_BACKUP_COUNT` (see Configuration above).
-With durable refresh enabled, `durable_derived_refresh` reports the current and latest
-completed versions, phase/duration, pending age, attempts, retry due, lease expiry,
-sanitized failure, and superseded count. Missing schema, stale pending or
-`waiting_for_signals` work (after 24 hours, allowing the four queues to drain), a retry,
-or an expired lease makes the health status
-`unhealthy`. The worker scans independently
-of RabbitMQ deliveries; acknowledging a terminal signal means its database job is
-durable, not that the refresh has already finished.
-
-## Validation
-
-```bash
-just check
-```
-
-The check is local and credential-free after dependencies are installed. It covers the
-restored shutdown-delivery, terminal file-completion, batch-performance, drain, and
-transient-failure regressions without contacting PostgreSQL or RabbitMQ.
-
-For container validation, run `just image`; this builds `discogs-sql-loader:local`,
-checks the installed module, and verifies the non-root runtime identity. The full stack
-belongs to the separate `deployment` repository.
-
-## Troubleshooting
-
-- `starting` persists: verify all required PostgreSQL variables and reachability.
-- `unhealthy` with no consumers: inspect RabbitMQ connectivity and stuck-state logs.
-- Terminal delivery is requeued: the pending batch did not commit; inspect PostgreSQL
-  availability before retrying.
-- Durable terminal delivery is requeued: consumers are paused first, so the queued
-  message cannot hot-loop through its 20-delivery limit. Inspect the schema probe,
-  legacy-latch reconciliation, and signal-commit logs. Recovery probes the failed
-  signal without another broker delivery and resubscribes after its commit succeeds.
-  Never force an ack while the job relation is unavailable.
-- `durable_derived_refresh.status=degraded`: inspect `phase`, `retry_due`,
-  `lease_expiry`, and `last_sanitized_failure`; the scanner retries without a new
-  broker message. A versionless/invalid terminal delivery is refused to the DLQ and
-  recorded in `derived_relation_refresh_last_refused`.
-- Cleanup was refused: confirm whether the producer resumed an existing extraction or
-  whether the source dump unexpectedly shrank before changing the safety threshold.

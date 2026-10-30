@@ -20,8 +20,9 @@ bounded retry behavior. The default pool range is 2–12 connections and can be 
 with `POSTGRES_POOL_MIN_SIZE` and `POSTGRES_POOL_MAX_SIZE`.
 
 Batch mode limits concurrent flushes independently of the pool. Non-batch mode uses
-channel-global RabbitMQ prefetch no larger than the configured pool maximum so delivery
-handlers cannot exhaust the pool while holding hundreds of unacknowledged messages.
+a per-consumer RabbitMQ prefetch equal to the configured pool maximum, plus a shared
+write-admission budget across consumers, so delivery handlers cannot exhaust the pool
+while holding hundreds of unacknowledged messages.
 
 ## Delivery settlement
 

@@ -1,9 +1,13 @@
 # Derived-relation refresh and RabbitMQ acknowledgement budget
 
-Bead `gm-discogs-sql-loader-vd0`, measured 2026-09-20/21. Verdict: **do not certify the
-current inline refresh for a full Discogs dump**. Preserve the existing
-commit-before-ack behavior until a durable scheduled handoff is implemented; never
-replace it with an untracked in-process task.
+Bead `gm-discogs-sql-loader-vd0`, measured 2026-09-20/21.
+
+**Current status:** the durable handoff this report called for is implemented and is the
+default (`DERIVED_REFRESH_MODE=durable`); see
+[Durable handoff](#durable-handoff-required-before-removing-inline-work). The measurements
+and the verdict below are kept as the evidence for that decision. Verdict at the time: **do
+not certify the inline refresh for a full Discogs dump**, and never replace it with an
+untracked in-process task. That still holds for `DERIVED_REFRESH_MODE=inline`.
 
 ## Question and method
 
@@ -17,7 +21,7 @@ broker delivery handling, and contention spend additional time from that same bu
 
 The deterministic generator at `database-schema`'s
 `docs/spikes/gm-database-schema-9c8.1/generate.py` (seed **20260917**, source revision
-`274a84758c53c61e4905c242bdd038f1e3cc9f06`, this loader's immutable dev pin)
+`274a84758c53c61e4905c242bdd038f1e3cc9f06`, the loader's dev pin when measured)
 streamed a synthetic catalog into the exact promoted schema. It has 1,000,000 releases,
 120,000 artists, 20,000 labels, 250,000 masters, 60,000 MusicBrainz artists, and
 254,925 MusicBrainz relationships (300,000 generated, with Discogs-origin relationships
@@ -117,8 +121,8 @@ deployment profile, repeatedly, before anyone chooses inline semantics.
 
 ## Durable handoff required before removing inline work
 
-This design is implemented by `tableinator/durable_refresh.py` against immutable
-`database-schema` pin `96da0291ccb30a86af94d0ee8dcf959bd47ada6b`. Production now
+This design is implemented by `tableinator/durable_refresh.py` against the job relations
+in the promoted persistence contract (`contracts/persistence/v1/source.json`). Production now
 defaults to `DERIVED_REFRESH_MODE=durable`; `DERIVED_REFRESH_MODE=inline` is an explicit
 rollback to the old commit-before-ack path while retaining the additive job relations.
 If the durable contract probe or legacy-latch reconciliation fails, the service reports

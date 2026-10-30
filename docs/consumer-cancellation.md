@@ -54,10 +54,25 @@ controlled by `QUEUE_CHECK_INTERVAL` and defaults to one hour.
 
 Process shutdown has a separate but related ordering guarantee:
 
-1. cancel every active consumer so no new deliveries arrive;
-2. stop periodic tasks;
-3. flush all messages already accepted by the batch processor;
-4. close RabbitMQ and PostgreSQL resources.
+1. cancel every active consumer, with broker confirmation, so no new deliveries arrive;
+2. stop the durable-refresh recovery and worker tasks, the progress reporter, and the
+   periodic queue checker;
+3. stop the batch flush task and flush all messages already accepted by the batch
+   processor;
+4. cancel any pending completion grace timers;
+5. close the RabbitMQ connection and confirm that every delivery callback has stopped;
+6. drain the shared write admission (waits up to five seconds for in-flight callbacks and
+   SQL writers);
+7. close the PostgreSQL pool and release the admission budget;
+8. stop the health server, then shut down telemetry so the final export includes the
+   teardown metrics.
+
+If step 5 or 6 cannot be confirmed, or closing the pool fails, the service keeps the pool
+and write admission open and logs an error, rather than closing a pool that a running
+callback may still use. The health server still stops. A later startup in the same process
+refuses to create a second pool and budget, and fails with "previous PostgreSQL writer
+lifespan did not drain". See [Shared delivery runtime](shared-delivery-runtime.md) for the
+admission lifecycle.
 
 Leaving shutdown deliveries unsettled allows the broker connection close to requeue
 them once. A historical regression test exercises repeated delivery churn and verifies
