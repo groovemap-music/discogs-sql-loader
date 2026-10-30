@@ -98,6 +98,7 @@ preferred for deployed containers.
 | --- | --- | --- |
 | `LOG_LEVEL` | `INFO` | Log verbosity; an unrecognized value falls back to `INFO` |
 | `ENVIRONMENT` | `development` | Value of the `environment` field on every log entry; does not change verbosity |
+| `LOG_FILE` | `/logs/discogs-sql-loader.log` | Overrides the log file path; an empty value disables the file sink. If the file cannot be opened (for example `/logs` is absent outside a container), the service logs one warning and continues on the console only |
 | `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size that rolls the `/logs/discogs-sql-loader.log` file sink over; a non-numeric or non-positive override falls back to the default |
 | `LOG_FILE_BACKUP_COUNT` | `5` | Rotated backups of that file sink retained; a non-numeric or non-positive override falls back to the default |
 
@@ -151,7 +152,8 @@ The JSON at `/health`:
 - lists the current task, per-entity counts, active consumers, and completed files.
 
 Container logs go through the shared structured-logging runtime under the same service name,
-to `/logs/discogs-sql-loader.log`. That file is a size-capped `RotatingFileHandler` bounded by
+to the console and to `/logs/discogs-sql-loader.log` (override with `LOG_FILE`; running locally without `/logs`
+falls back to console-only logging). That file is a size-capped `RotatingFileHandler` bounded by
 `LOG_FILE_MAX_BYTES` / `LOG_FILE_BACKUP_COUNT` (see [Logging](#logging)).
 
 ### Durable derived refresh
