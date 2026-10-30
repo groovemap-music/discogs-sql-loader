@@ -1,13 +1,13 @@
 # Shared delivery runtime attestation
 
 Discogs SQL delivery lifecycle behavior is pinned to `groovemap-runtime` source revision
-`a86f3e48783a8618be62667c74258eaa30388494`, whose Git tree is
-`f9a8cdcbee4a85e7cf0a6f1badd6152c779df8b4`. Both `pyproject.toml` and `uv.lock` resolve that
+`6d0425f908e01a446b040e2993045e2afe30460e`, whose Git tree is
+`abec17ef8df697bdb3b0495ac6186315d69f6b56`. Both `pyproject.toml` and `uv.lock` resolve that
 immutable revision; the container wheel preparation guard requires the same revision.
 
 | Consumer-owned reference | Previous published pin | Reconciled canonical pin | Evidence |
 | --- | --- | --- | --- |
-| Runtime API in `pyproject.toml`, `uv.lock`, wheel guard, and this attestation | `264e1d84c7165525844d3b1210179cfbf72a61f2` exported `common.delivery.DeliveryAdmission`; producer PR #21 and reviewed loader lineage `gm-discogs-sql-loader-h1t3` renamed the public type to `common.WriteAdmission` at `40d799c6ae0cd9b11b524f7477642a5c14f5f8f2`, tree `d65554a74551c653b1a8e0943fedbfa903b19015` | `a86f3e48783a8618be62667c74258eaa30388494`, tree `f9a8cdcbee4a85e7cf0a6f1badd6152c779df8b4` | Reviewed runtime handler-lifetime and bounded-drain extension; same `WriteAdmission` class, no alias or second admission implementation |
+| Runtime API in `pyproject.toml`, `uv.lock`, wheel guard, and this attestation | `264e1d84c7165525844d3b1210179cfbf72a61f2` exported `common.delivery.DeliveryAdmission`; producer PR #21 and reviewed loader lineage `gm-discogs-sql-loader-h1t3` renamed the public type to `common.WriteAdmission` at `40d799c6ae0cd9b11b524f7477642a5c14f5f8f2`, tree `d65554a74551c653b1a8e0943fedbfa903b19015` | `6d0425f908e01a446b040e2993045e2afe30460e`, tree `abec17ef8df697bdb3b0495ac6186315d69f6b56` | Reviewed runtime handler-lifetime and bounded-drain extension; same `WriteAdmission` class, no alias or second admission implementation |
 
 The schema producer's immutable source remains `244cb2ba40d8dd80717bcbd5315049896662c99f`;
 its generated bindings and producer-owned persistence contracts are unchanged. The schema
