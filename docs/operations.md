@@ -175,8 +175,9 @@ The health status becomes `unhealthy` when any of these holds:
 How the worker behaves:
 
 - It scans on its own, independently of RabbitMQ deliveries.
-- A newer extraction can *fence* it: the older run rolls back instead of committing, so a stale
-  refresh never overwrites newer data.
+- A run can be *fenced*: just before committing, it checks that its extraction is still the
+  newest and that it still holds its lease. If either is false, the run rolls back instead of
+  committing, so a stale refresh never overwrites newer data.
 - Acknowledging a terminal signal means the refresh job is durable in the database. It does
   not mean the refresh has finished.
 
@@ -206,8 +207,9 @@ belongs to the separate `deployment` repository.
 - Durable terminal delivery is requeued: consumers are paused first, so the queued
   message cannot hot-loop through its 20-delivery limit (the most times RabbitMQ redelivers a
   message before dead-lettering it). Inspect the schema probe,
-  legacy-latch reconciliation (startup turns extraction latches written before durable
-  refresh into refresh jobs), and signal-commit logs. Recovery probes the failed
+  legacy-latch reconciliation (at startup, extraction latch rows written before durable refresh
+  get a generation, and rows with all four signals that are not yet refreshed become refresh
+  jobs; rows older than the current version are skipped), and signal-commit logs. Recovery probes the failed
   signal without another broker delivery and resubscribes after its commit succeeds.
   Never force an ack while the job relation is unavailable.
 - `durable_derived_refresh.status=degraded`: inspect `phase`, `retry_due`,
