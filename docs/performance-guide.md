@@ -28,8 +28,9 @@ flowchart LR
 | `POSTGRES_POOL_MIN_SIZE` | `2` | Keeps a small ready connection floor. |
 | `POSTGRES_POOL_MAX_SIZE` | `12` | Bounds this service's PostgreSQL connections. |
 
-In non-batch mode, channel-global RabbitMQ prefetch equals the configured pool maximum.
-This applies backpressure at the broker rather than allowing delivery handlers to wait
+In non-batch mode, each consumer's RabbitMQ prefetch equals the configured pool maximum,
+and a shared write-admission budget bounds the total across all four consumers. This
+applies backpressure at the broker rather than allowing delivery handlers to wait
 unboundedly for a database connection. In batch mode, prefetch is per consumer because
 handlers enqueue records without holding connections; the flush semaphore provides the
 database bound.
