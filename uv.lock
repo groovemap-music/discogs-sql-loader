@@ -6,9 +6,6 @@ requires-python = "==3.14.*"
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
-[options.exclude-newer-package]
-certifi = "2026-10-20T02:24:17Z"
-
 [manifest]
 overrides = [{ name = "groovemap-runtime", extras = ["neo4j", "otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=6d0425f908e01a446b040e2993045e2afe30460e" }]
 
