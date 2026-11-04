@@ -22,6 +22,7 @@ from tableinator.batch_processor import (
     PostgreSQLBatchProcessor,
     PostgreSQLBatchSink,
     PostgreSQLFailureClassifier,
+    _CallbackDelivery,
 )
 
 
@@ -65,7 +66,7 @@ class TestPolicyAdapters:
     def test_runtime_is_pinned_to_the_reviewed_revision(self) -> None:
         pyproject = Path("pyproject.toml").read_text()
         lock = Path("uv.lock").read_text()
-        revision = "6d0425f908e01a446b040e2993045e2afe30460e"
+        revision = "5459343ccaf46da5f71db11cda40d9338ce61d8d"
         assert revision in pyproject
         assert f"#{revision}" in lock
 
@@ -78,6 +79,13 @@ class TestPolicyAdapters:
         assert policy.max_concurrent_flushes == config.max_concurrent_flushes
         assert policy.max_drain_retries == config.max_flush_retries
         assert policy.max_poison_retries == config.max_poison_retries
+        assert policy.max_hold_s == config.max_hold_s
+
+    def test_default_hold_bound_stays_below_the_lux_consumer_timeout(self) -> None:
+        consumer_timeout_s = 1_800  # RabbitMQ consumer_timeout on lux: 1,800,000 ms
+        policy = BatchConfig().runtime_policy()
+        assert policy.max_hold_s == 900.0
+        assert policy.max_hold_s < consumer_timeout_s
 
     def test_owner_uses_shared_engine_instead_of_a_local_queue_lifecycle(self) -> None:
         processor = PostgreSQLBatchProcessor(MagicMock(), processor_config())
@@ -99,6 +107,15 @@ class TestPolicyAdapters:
         assert isinstance(error, OperationalError)
         assert error.sqlstate == "54000"
         assert PostgreSQLFailureClassifier()(error) is FailureKind.DETERMINISTIC
+
+    @pytest.mark.parametrize(
+        ("sqlstate", "label"), [("28000", "invalid authorization"), ("HV000", "foreign data wrapper"), ("XX999", "unrecognised class")]
+    )
+    def test_unrecognised_operational_sqlstates_are_retried_not_dead_lettered(self, sqlstate: str, label: str) -> None:
+        error_type = type(label.replace(" ", "_"), (OperationalError,), {"sqlstate": sqlstate})
+        error = error_type(f"{label} ({sqlstate})")
+        assert isinstance(error, OperationalError)
+        assert PostgreSQLFailureClassifier()(error) is FailureKind.TRANSIENT
 
     @pytest.mark.parametrize("error", [AdminShutdown("terminating"), ConnectionFailure("server closed"), SerializationFailure("retry")])
     def test_connection_class_sqlstates_stay_transient(self, error: BaseException) -> None:
@@ -401,6 +418,46 @@ class TestSharedEngineSafety:
         assert await processor.flush_all()
         ack.assert_awaited_once()
         assert processor.get_stats()["shutdown"] is True
+
+
+class TestHeldDeliveryRequeue:
+    @pytest.mark.asyncio
+    async def test_transient_auth_failure_is_retried_in_a_multi_record_batch(self) -> None:
+        # Class 28 must not trigger bisection or a DLQ nack: the whole batch is retried in-process.
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=2))
+        invalid_auth = type("InvalidAuth", (OperationalError,), {"sqlstate": "28000"})("password authentication failed")
+        processor._process_batch = AsyncMock(side_effect=[invalid_auth, result(), result()])  # type: ignore[method-assign]
+        acks = {i: AsyncMock() for i in ("a", "b")}
+        nacks = {i: AsyncMock() for i in acks}
+        for i in acks:
+            await processor.add_message("artists", {"id": i}, acks[i], nacks[i])
+        assert await processor.flush_queue("artists")
+        assert all(acks[i].await_count == 1 for i in acks)
+        assert all(nacks[i].await_count == 0 for i in nacks)
+        assert not processor.had_dlq_nacks("artists")
+
+    @pytest.mark.asyncio
+    async def test_delivery_held_past_max_hold_is_requeued_not_acked_or_dropped(self) -> None:
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=10, max_hold_s=0.05))
+        processor._process_batch = AsyncMock(side_effect=OperationalError("server closed the connection"))  # type: ignore[method-assign]
+        ack, nack, requeue = AsyncMock(), AsyncMock(), AsyncMock()
+        assert await processor.add_message("artists", {"id": "held"}, ack, nack, requeue_callback=requeue)
+
+        assert not await processor.flush_queue("artists")  # transient backoff: the delivery is held
+        assert processor.get_stats()["pending"]["artists"] == 1
+        await asyncio.sleep(0.06)  # now past max_hold_s
+        await processor.flush_queue("artists")
+
+        requeue.assert_awaited_once()
+        ack.assert_not_awaited()
+        nack.assert_not_awaited()
+        assert processor.get_stats()["pending"]["artists"] == 0
+
+    @pytest.mark.asyncio
+    async def test_requeue_without_a_requeue_callback_is_still_refused(self) -> None:
+        delivery = _CallbackDelivery(AsyncMock(), AsyncMock())
+        with pytest.raises(ValueError, match="retried in-process"):
+            await delivery.nack(requeue=True)
 
 
 class TestPoisonIsolation:

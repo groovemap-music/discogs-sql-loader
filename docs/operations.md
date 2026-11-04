@@ -78,6 +78,7 @@ preferred for deployed containers.
 | `POSTGRES_BATCH_MODE` | `true` | Enable transactional batch writes |
 | `POSTGRES_BATCH_SIZE` | `100` | Records that trigger a batch flush |
 | `POSTGRES_BATCH_FLUSH_INTERVAL` | `5.0` seconds | Time that triggers a batch flush |
+| `POSTGRES_BATCH_MAX_HOLD_S` | `900` seconds | Longest a delivery waits out PostgreSQL backoff before it is returned to RabbitMQ with `requeue=True`. Keep it below the broker `consumer_timeout` (30 minutes on lux). |
 
 ### Lifecycle and health
 

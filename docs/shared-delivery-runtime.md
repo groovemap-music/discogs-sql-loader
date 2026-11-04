@@ -1,8 +1,12 @@
 # Shared delivery runtime attestation
 
 Discogs SQL delivery lifecycle behavior is pinned to `groovemap-runtime` source revision
-`6d0425f908e01a446b040e2993045e2afe30460e`, whose Git tree is
-`abec17ef8df697bdb3b0495ac6186315d69f6b56`. Both `pyproject.toml` and `uv.lock` resolve that
+`5459343ccaf46da5f71db11cda40d9338ce61d8d`, whose Git tree is
+`722fabc9ceab39fcfb0497b1c8a54ade84616a21`. It supersedes `6d0425f908e01a446b040e2993045e2afe30460e`
+(tree `abec17ef8df697bdb3b0495ac6186315d69f6b56`), whose loader-local classifier and unbounded batch
+holds it replaces: `PostgreSQLFailureClassifier` now comes from `common.postgres_resilient`, where only
+SQLSTATE class 54 is a permanent `OperationalError`, and `BatchPolicy.max_hold_s` is set from
+`POSTGRES_BATCH_MAX_HOLD_S` (default 900 s). Both `pyproject.toml` and `uv.lock` resolve that
 immutable revision; the container wheel preparation guard requires the same revision.
 
 | Consumer-owned reference | Previous published pin | Reconciled canonical pin | Evidence |

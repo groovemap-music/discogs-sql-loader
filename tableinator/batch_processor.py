@@ -20,9 +20,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from common import WriteAdmission, normalize_record
 from common.batch import AsyncBatchEngine, BatchItemResult, BatchPolicy
-from common.db_resilience import DatabaseUnavailableError
 from common.delivery import DeliveryResult, FailureKind, Settlement
-from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
+from common.postgres_resilient import PostgreSQLFailureClassifier
 
 from tableinator import telemetry
 from tableinator.batch_writer import BatchWriteResult, PostgreSQLBatchWriter
@@ -51,6 +50,9 @@ class BatchConfig:
     backoff_multiplier: float = 2.0
     max_flush_retries: int = 5
     max_poison_retries: int = 5
+    # Longest a delivery may be held in transient backoff before it is returned to RabbitMQ
+    # with requeue=True. Must stay below the broker consumer_timeout (lux: 30 minutes).
+    max_hold_s: float | None = 900.0
 
     def runtime_policy(self) -> BatchPolicy:
         """Return the transport-neutral policy consumed by the shared engine."""
@@ -65,6 +67,7 @@ class BatchConfig:
             backoff_multiplier=self.backoff_multiplier,
             max_drain_retries=self.max_flush_retries,
             max_poison_retries=self.max_poison_retries,
+            max_hold_s=self.max_hold_s,
         )
 
 
@@ -87,6 +90,9 @@ class PendingMessage:
 class _CallbackDelivery:
     ack_callback: Callable[[], Awaitable[None] | None]
     nack_callback: Callable[[], Awaitable[None] | None]
+    # Only set for deliveries the shared engine may return to the broker (max_hold_s). Without
+    # it a requeue request is a programming error, because the batch path otherwise retries in-process.
+    requeue_callback: Callable[[], Awaitable[None] | None] | None = None
 
     async def ack(self) -> None:
         result = self.ack_callback()
@@ -95,46 +101,13 @@ class _CallbackDelivery:
 
     async def nack(self, *, requeue: bool) -> None:
         if requeue:
-            raise ValueError("batch deliveries are retried in-process, not broker-requeued")
-        result = self.nack_callback()
+            if self.requeue_callback is None:
+                raise ValueError("batch deliveries are retried in-process, not broker-requeued")
+            result = self.requeue_callback()
+        else:
+            result = self.nack_callback()
         if inspect.isawaitable(result):
             await result
-
-
-class PostgreSQLFailureClassifier:
-    """Map owner-specific PostgreSQL failures onto the shared retry taxonomy."""
-
-    _TRANSIENT = (InterfaceError, OperationalError, DatabaseUnavailableError)
-    _DETERMINISTIC = (DataError, IntegrityError, ValueError, RuntimeError)
-    # SQLSTATE classes whose cause is the server, connection or its resources, so
-    # the same statement can succeed later: 08 connection exception, 40 rollback
-    # (serialization failure, deadlock), 53 insufficient resources, 55 object not
-    # in prerequisite state, 57 operator intervention (admin shutdown, cannot
-    # connect now, query cancel), 58 system error, F0 config file error.
-    _TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "55", "57", "58", "F0"})
-
-    def __call__(self, error: BaseException) -> FailureKind:
-        if isinstance(error, OperationalError) and self.is_data_dependent(error):
-            # psycopg raises e.g. ProgramLimitExceeded (54000, "index row size
-            # exceeds btree maximum") as an OperationalError subclass. It comes
-            # from the record, not the connection, so retrying can never help.
-            return FailureKind.DETERMINISTIC
-        if isinstance(error, self._TRANSIENT):
-            return FailureKind.TRANSIENT
-        if isinstance(error, self._DETERMINISTIC):
-            return FailureKind.DETERMINISTIC
-        # Preserve the historical safety posture for unknown infrastructure
-        # exceptions: retry rather than silently dead-lettering a valid record.
-        return FailureKind.TRANSIENT
-
-    @classmethod
-    def is_data_dependent(cls, error: BaseException) -> bool:
-        """True for a server-reported OperationalError that is not a connection-class failure."""
-        sqlstate = getattr(error, "sqlstate", None)
-        if not isinstance(sqlstate, str) or len(sqlstate) != 5:
-            # No server verdict (client-side connection loss, pool timeout): keep retrying.
-            return False
-        return sqlstate[:2] not in cls._TRANSIENT_SQLSTATE_CLASSES
 
 
 @dataclass
@@ -379,8 +352,12 @@ class PostgreSQLBatchProcessor:
         ack_callback: Callable[[], Awaitable[None] | None],
         nack_callback: Callable[[], Awaitable[None] | None],
         span_context: Any = None,
+        requeue_callback: Callable[[], Awaitable[None] | None] | None = None,
     ) -> bool:
-        """Normalize and submit one delivery; invalid input is rejected locally."""
+        """Normalize and submit one delivery; invalid input is rejected locally.
+
+        ``requeue_callback`` returns a held delivery to the broker once it exceeds ``max_hold_s``.
+        """
         started = time.perf_counter()
 
         async def reject(error_type: str) -> bool:
@@ -423,7 +400,7 @@ class PostgreSQLBatchProcessor:
         await self._engine.submit(
             data_type,
             pending,
-            _CallbackDelivery(ack_callback, nack_callback),
+            _CallbackDelivery(ack_callback, nack_callback, requeue_callback),
             span_context=span_context,
         )
         self._observer.accepted(data_type, started)
