@@ -123,7 +123,7 @@ async def batch_writer(
     """Return a batch writer over a mocked pool, with its connection and logger."""
     logger = MagicMock()
     cursor = mock_postgres_connection.cursor.return_value
-    attach.probe = lambda: cursor.executemany.await_count
+    attach.probe = lambda: sum("INSERT INTO" in str(call.args[0]) for call in cursor.execute.await_args_list)
     writer = PostgreSQLBatchWriter(mock_async_pool(mock_postgres_connection), logger, lambda data: {"source": data["id"]}, WriteAdmission(1))
     return writer, mock_postgres_connection, logger
 
@@ -201,9 +201,8 @@ class TestBatchPath:
         result = await writer.process_batch("releases", [Record("r1", release("r1", identifiers=contract_identifiers_block()))])
 
         assert result.unchanged_ids == {"r1"}
-        assert connection.cursor.return_value.executemany.await_count == 0
-        assert set(attach.mapping) == {BARCODE, MATRIX, CATALOG_NUMBER}
         assert attach.upserts_before_call == [0]
+        assert set(attach.mapping) == {BARCODE, MATRIX, CATALOG_NUMBER}
 
     @pytest.mark.asyncio
     async def test_an_empty_identifiers_block_attaches_nothing(

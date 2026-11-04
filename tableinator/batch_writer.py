@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from operator import itemgetter
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from common import DatabaseUnavailableError
@@ -16,6 +17,46 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from common import WriteAdmission
+
+
+def _upsert(data_type: str) -> sql.Composed:
+    """Return the set-based entity upsert, whose arrays are `_process_batch`'s record columns."""
+    if data_type == "releases":
+        return sql.SQL(
+            "INSERT INTO {table} (hash, data_id, data, media, gm_item_id, updated_at) "
+            "SELECT incoming.hash, incoming.data_id, incoming.data, incoming.media, incoming.gm_item_id, NOW() "
+            "FROM unnest(%b::text[], %b::text[], %b::jsonb[], %b::jsonb[], %b::uuid[]) "
+            "AS incoming(hash, data_id, data, media, gm_item_id) "
+            "ON CONFLICT (data_id) DO UPDATE "
+            "SET hash = EXCLUDED.hash, data = EXCLUDED.data, media = EXCLUDED.media, "
+            "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
+        ).format(table=sql.Identifier(data_type))
+    return sql.SQL(
+        "INSERT INTO {table} (hash, data_id, data, gm_item_id, updated_at) "
+        "SELECT incoming.hash, incoming.data_id, incoming.data, incoming.gm_item_id, NOW() "
+        "FROM unnest(%b::text[], %b::text[], %b::jsonb[], %b::uuid[]) "
+        "AS incoming(hash, data_id, data, gm_item_id) "
+        "ON CONFLICT (data_id) DO UPDATE "
+        "SET hash = EXCLUDED.hash, data = EXCLUDED.data, "
+        "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
+    ).format(table=sql.Identifier(data_type))
+
+
+def _backfill(column: str, column_type: str, data_type: str) -> sql.Composed:
+    """Return the set-based UPDATE filling one column on hash-unchanged rows."""
+    return sql.SQL(
+        "UPDATE {table} SET {column} = incoming.value, updated_at = NOW() "
+        "FROM unnest(%b::{type}[], %b::text[]) AS incoming(value, data_id) "
+        "WHERE {table}.data_id = incoming.data_id"
+    ).format(table=sql.Identifier(data_type), column=sql.Identifier(column), type=sql.SQL(column_type))
+
+
+def _unzipped(rows: Sequence[tuple[Any, ...]]) -> list[list[Any]]:
+    """Return statement parameters as the one array per column `unnest` reads.
+
+    Bound in binary, which spares the quotes in every JSON payload the array text escaping.
+    """
+    return [list(column) for column in zip(*rows, strict=True)]
 
 
 class BatchRecord(Protocol):
@@ -64,10 +105,13 @@ class PostgreSQLBatchWriter:
         messages: Sequence[BatchRecord],
     ) -> BatchWriteResult:
         """Run SQL while the caller holds the shared pool admission slot."""
+        # One write per document, the latest delivery of it. A set-based upsert may not touch
+        # a row twice, and a superseded payload has nothing left to assert.
+        latest = list({msg.data_id: msg for msg in messages}.values())
         async with self.connection_pool.connection() as conn:
             await conn.set_autocommit(False)
             async with conn.transaction(), conn.cursor() as cursor:
-                data_ids = [msg.data_id for msg in messages]
+                data_ids = [msg.data_id for msg in latest]
                 hash_query = (
                     "SELECT data_id, hash, media IS NULL, gm_item_id IS NULL FROM {table} WHERE data_id = ANY(%s)"
                     if data_type == "releases"
@@ -89,7 +133,7 @@ class PostgreSQLBatchWriter:
                 # transaction's own connection and before any write, so the batch is either
                 # fully identified or rolled back whole. `resolve_aliases` mints the misses
                 # and opens no SAVEPOINT, so a failure surfaces to this transaction.
-                refs = {msg.data_id: alias_ref(data_type, msg.data_id) for msg in messages}
+                refs = {msg.data_id: alias_ref(data_type, msg.data_id) for msg in latest}
                 native_ids = await resolve_aliases(conn, list(refs.values()))
                 unresolved = sorted(data_id for data_id, ref in refs.items() if ref not in native_ids)
                 if unresolved:
@@ -103,16 +147,16 @@ class PostgreSQLBatchWriter:
                 # skipped by hash is exactly the row whose aliases are most likely missing.
                 # Attaching is idempotent, so re-attaching a present alias costs one conflicted
                 # INSERT row and nothing else.
-                alias_attachments = alias_targets(data_type, [(msg.data, native_ids[refs[msg.data_id]]) for msg in messages])
+                alias_attachments = alias_targets(data_type, [(msg.data, native_ids[refs[msg.data_id]]) for msg in latest])
 
                 records_to_upsert: list[tuple[Any, ...]] = []
-                # The documents the hash gate let through, in the same order, so the graph
-                # rows derived below are exactly the rows of the entity rows written above.
+                # The documents the hash gate let through, so the graph rows derived below
+                # are exactly the rows of the entity rows written above.
                 changed_documents: list[tuple[str, dict[str, Any]]] = []
                 unchanged_ids: list[str] = []
                 media_backfills: list[tuple[Jsonb, str]] = []
                 identity_backfills: list[tuple[uuid.UUID, str]] = []
-                for msg in messages:
+                for msg in latest:
                     native_id = native_ids[refs[msg.data_id]]
                     existing_hash = existing_hashes.get(msg.data_id)
                     if existing_hash == msg.sha256:
@@ -163,10 +207,7 @@ class PostgreSQLBatchWriter:
                         data_type=data_type,
                         media_backfilled=len(media_backfills),
                     )
-                    await cursor.executemany(
-                        sql.SQL("UPDATE {table} SET media = %s, updated_at = NOW() WHERE data_id = %s").format(table=sql.Identifier(data_type)),
-                        media_backfills,
-                    )
+                    await cursor.execute(_backfill("media", "jsonb", data_type), _unzipped(media_backfills))
 
                 if identity_backfills:
                     self.logger.info(
@@ -174,34 +215,12 @@ class PostgreSQLBatchWriter:
                         data_type=data_type,
                         identity_backfilled=len(identity_backfills),
                     )
-                    await cursor.executemany(
-                        sql.SQL("UPDATE {table} SET gm_item_id = %s, updated_at = NOW() WHERE data_id = %s").format(table=sql.Identifier(data_type)),
-                        identity_backfills,
-                    )
+                    await cursor.execute(_backfill("gm_item_id", "uuid", data_type), _unzipped(identity_backfills))
 
                 if records_to_upsert:
-                    if data_type == "releases":
-                        await cursor.executemany(
-                            sql.SQL(
-                                "INSERT INTO {table} (hash, data_id, data, media, gm_item_id, updated_at) "
-                                "VALUES (%s, %s, %s, %s, %s, NOW()) "
-                                "ON CONFLICT (data_id) DO UPDATE "
-                                "SET hash = EXCLUDED.hash, data = EXCLUDED.data, media = EXCLUDED.media, "
-                                "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
-                            ).format(table=sql.Identifier(data_type)),
-                            records_to_upsert,
-                        )
-                    else:
-                        await cursor.executemany(
-                            sql.SQL(
-                                "INSERT INTO {table} (hash, data_id, data, gm_item_id, updated_at) "
-                                "VALUES (%s, %s, %s, %s, NOW()) "
-                                "ON CONFLICT (data_id) DO UPDATE "
-                                "SET hash = EXCLUDED.hash, data = EXCLUDED.data, "
-                                "gm_item_id = EXCLUDED.gm_item_id, updated_at = NOW()"
-                            ).format(table=sql.Identifier(data_type)),
-                            records_to_upsert,
-                        )
+                    # Sorted so writers redelivered the same documents lock them in one order.
+                    records_to_upsert.sort(key=itemgetter(1))
+                    await cursor.execute(_upsert(data_type), _unzipped(records_to_upsert))
 
                     self.logger.debug(
                         "🐘 Batch upserted records",

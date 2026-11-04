@@ -11,6 +11,12 @@ Batch mode is enabled by default. Each entity has an in-memory queue; reaching
 upsert. At most two batch flushes acquire PostgreSQL connections concurrently. An
 acknowledgement occurs only after the transaction commits.
 
+A flush writes each table with one `INSERT ... SELECT FROM unnest(...)` rather than one
+execution per row, with rows sorted first so concurrent flushes meet shared `graph` rows
+in the same order and cannot deadlock on them. One bad value now fails the whole statement,
+which is the same outcome as before: the transaction rolls back and bisection narrows the
+failure to the record that caused it.
+
 ```mermaid
 flowchart LR
     queue[RabbitMQ delivery] --> buffer[Per-entity batch]
