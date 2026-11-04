@@ -164,7 +164,7 @@ async def test_release_upsert_backfills_media_on_an_unchanged_hash(
 async def test_batch_writer_updates_conflicts_and_round_trips_jsonb(
     postgres_connection: psycopg.AsyncConnection[Any],
 ) -> None:
-    """The batch executemany path performs its advertised atomic conflict update."""
+    """The batch path performs its advertised atomic conflict update."""
     pool = SingleConnectionPool(postgres_connection)
     writer = PostgreSQLBatchWriter(pool, MagicMock(), lambda data: {"source": data["id"]}, WriteAdmission(1))
     first = BatchRecord("99", {"id": "99", "name": "First"}, "batch-hash-1")

@@ -8,19 +8,23 @@ writes them to the wrong relation — or writes an edge whose endpoint relation 
 resolve its vertex — fails here rather than in production.
 """
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import psycopg
 import pytest
 import pytest_asyncio
 from common import WriteAdmission
 
+from tableinator import graph_writer
+from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
 from tableinator.batch_writer import PostgreSQLBatchWriter
 from tableinator.graph_derivation import EDGE_COLUMNS, VERTEX_COLUMNS
+from tableinator.graph_writer import write_document_graph
 from tableinator.media import media_for_release
 from tableinator.record_persistence import PostgreSQLRecordPersistence
 
@@ -469,3 +473,153 @@ async def test_the_single_record_path_also_skips_an_unchanged_document(
 
     await _persist(graph_connection, "releases", "gw-r1", {**release, "sha256": "gw-r1-v2"})
     assert await _count(graph_connection, "by_artist") == 3
+
+
+# ── Set-based writes ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_each_array_cast_matches_the_promoted_column(graph_connection: psycopg.AsyncConnection[Any]) -> None:
+    """A wrong cast fails only for the relation and value that reach it, so every one is held here."""
+    await _load_catalog(graph_connection)
+
+    declared = await (
+        await graph_connection.execute("SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'graph'")
+    ).fetchall()
+    types = {(relation, column): data_type for relation, column, data_type in declared}
+
+    for relation, columns in {**VERTEX_COLUMNS, **EDGE_COLUMNS}.items():
+        for column in columns:
+            expected = "bigint" if column in graph_writer._BIGINT_COLUMNS else "text"
+            assert types[relation, column] == expected, f"{relation}.{column}"
+
+
+@pytest.mark.asyncio
+async def test_an_all_null_column_is_written_as_null(graph_connection: psycopg.AsyncConnection[Any]) -> None:
+    """A batch whose every value in a column is NULL has no Python type to infer."""
+    companies = {"items": [{"name": "Unnumbered Plant", "role": "Pressed By", "role_category": "manufacture"}]}
+
+    await _write_batch(graph_connection, "releases", [("gw-null", {"companies": companies})])
+
+    row = await (await graph_connection.execute("SELECT name, discogs_label_id FROM graph.company")).fetchone()
+    assert row == ("Unnumbered Plant", None)
+
+
+@pytest.mark.asyncio
+async def test_replaying_a_batch_with_new_hashes_converges_on_the_same_rows(graph_connection: psycopg.AsyncConnection[Any]) -> None:
+    """Delete-then-insert and DO NOTHING together make a rewrite idempotent."""
+    relations = (*VERTEX_COLUMNS, *EDGE_COLUMNS)
+    await _load_catalog(graph_connection)
+    first = await _counts(graph_connection, relations)
+
+    await _load_catalog(graph_connection, suffix="v2")
+
+    assert await _counts(graph_connection, relations) == first
+
+
+@pytest.mark.asyncio
+async def test_a_batch_carrying_one_document_twice_keeps_the_latest(graph_connection: psycopg.AsyncConnection[Any]) -> None:
+    """One statement may not update a row twice, and a redelivery can share a batch with the original."""
+    writer = PostgreSQLBatchWriter(SingleConnectionPool(graph_connection), MagicMock(), media_for_release, WriteAdmission(1))
+    older = BatchRecord("gw-twice", {"id": "gw-twice", "genres": ["Older"]}, "older")
+    newer = BatchRecord("gw-twice", {"id": "gw-twice", "genres": ["Newer"]}, "newer")
+
+    await writer.process_batch("releases", [older, newer])
+
+    stored = await (await graph_connection.execute("SELECT hash, data->'genres' FROM releases WHERE data_id = 'gw-twice'")).fetchone()
+    assert stored == ("newer", ["Newer"])
+    edges = await (await graph_connection.execute("SELECT genre_name FROM graph.in_genre WHERE release_id = 'gw-twice'")).fetchall()
+    assert edges == [("Newer",)]
+
+
+@pytest.mark.asyncio
+async def test_hash_unchanged_rows_are_backfilled_by_the_set_based_updates(graph_connection: psycopg.AsyncConnection[Any]) -> None:
+    await _write_batch(graph_connection, "releases", RELEASES)
+    await graph_connection.execute("UPDATE releases SET media = NULL, gm_item_id = NULL")
+
+    result = await _write_batch(graph_connection, "releases", RELEASES)
+
+    assert result.media_backfilled_ids == result.identity_backfilled_ids == {data_id for data_id, _data in RELEASES}
+    missing = await (await graph_connection.execute("SELECT count(*) FROM releases WHERE media IS NULL OR gm_item_id IS NULL")).fetchone()
+    assert missing == (0,)
+
+
+async def _blocked(watcher: psycopg.AsyncConnection[Any], connection: psycopg.AsyncConnection[Any]) -> None:
+    """Return once CONNECTION's backend is waiting on a lock."""
+    pid = connection.info.backend_pid
+    async with asyncio.timeout(10):
+        while True:
+            row = await (await watcher.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (pid,))).fetchone()
+            if row == ("Lock",):
+                return
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_two_writers_meeting_shared_vertices_in_opposite_orders_do_not_deadlock(graph_connection: psycopg.AsyncConnection[Any]) -> None:
+    """Hold both writers on the middle row, then release them into each other's rows.
+
+    Unsorted, the first has inserted `a` and needs `z`, and the second has inserted `z` and
+    needs `a`, which PostgreSQL ends with `deadlock detected`. Sorted, the second waits on
+    `a` and has taken nothing the first needs.
+    """
+    url = os.environ["TEST_DATABASE_URL"]
+    genres = ["gw-a", "gw-m", "gw-z"]
+
+    async def write(connection: psycopg.AsyncConnection[Any], data_id: str, names: list[str]) -> None:
+        async with connection.transaction(), connection.cursor() as cursor:
+            await write_document_graph(cursor, "releases", [(data_id, {"genres": names})])
+
+    async with (
+        await psycopg.AsyncConnection.connect(url) as holder,
+        await psycopg.AsyncConnection.connect(url) as first,
+        await psycopg.AsyncConnection.connect(url) as second,
+    ):
+        await holder.execute("INSERT INTO graph.genre (name) VALUES ('gw-m')")
+        first_write = asyncio.create_task(write(first, "gw-1", genres))
+        await _blocked(graph_connection, first)
+        second_write = asyncio.create_task(write(second, "gw-2", genres[::-1]))
+        await _blocked(graph_connection, second)
+        await holder.commit()
+
+        await asyncio.gather(first_write, second_write)
+
+    assert await _count(graph_connection, "genre") == 3
+    assert await _count(graph_connection, "in_genre") == 6
+
+
+_POISON = {
+    "a NUL the payload column refuses": {"notes": "before\u0000after"},
+    "a NUL in a text column bound in binary": {"sha256": "before\u0000after"},
+    "a quantity beyond the bigint a graph column holds": {"media": {"items": [{"medium": "vinyl_12", "family": "vinyl", "qty": 10**30}]}},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position", [0, 3, 7])
+@pytest.mark.parametrize("fault", _POISON)
+async def test_a_real_poison_record_is_isolated_to_itself(graph_connection: psycopg.AsyncConnection[Any], fault: str, position: int) -> None:
+    """One bad value fails a whole set-based statement, so bisection has to find it again."""
+    size = 8
+    processor = PostgreSQLBatchProcessor(
+        SingleConnectionPool(graph_connection),
+        BatchConfig(batch_size=size, flush_interval=0.01, max_pending=2 * size, min_batch_size=1, backoff_initial=0.001, backoff_max=0.002),
+        WriteAdmission(1),
+    )
+    acks = [AsyncMock() for _ in range(size)]
+    nacks = [AsyncMock() for _ in range(size)]
+    poison_id = f"gw-p{position}"
+
+    for index in range(size):
+        data_id = f"gw-p{index}"
+        record = {"id": data_id, "sha256": f"{data_id}-v1", "genres": ["Rock"]}
+        if data_id == poison_id:
+            record |= _POISON[fault]
+        await processor.add_message("releases", record, acks[index], nacks[index])
+
+    for index in range(size):
+        assert nacks[index].await_count == (index == position), f"delivery {index}"
+        assert acks[index].await_count == (index != position), f"delivery {index}"
+    stored = await (await graph_connection.execute("SELECT data_id FROM releases ORDER BY data_id")).fetchall()
+    assert [data_id for (data_id,) in stored] == sorted(f"gw-p{index}" for index in range(size) if index != position)
+    assert await _count(graph_connection, "in_genre") == size - 1

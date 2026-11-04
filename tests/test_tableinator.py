@@ -719,11 +719,11 @@ def _entity_upsert_calls(mock_cursor: Any) -> list[Any]:
     """Return the entity-table upserts among everything a cursor executed.
 
     The graph vertex and edge writes share this cursor, so "one conditional upsert" is a
-    claim about the entity statement rather than about the cursor's whole traffic. Graph
-    rows go out through `executemany` and their document-scoped deletes are `DELETE`
-    statements, so the entity upsert is the only `INSERT INTO` among the executes.
+    claim about the entity statement rather than about the cursor's whole traffic. Every
+    graph statement names the `graph` schema, so the entity upsert is the only `INSERT INTO`
+    without it.
     """
-    return [call for call in mock_cursor.execute.call_args_list if "INSERT INTO" in str(call.args[0])]
+    return [call for call in mock_cursor.execute.call_args_list if "INSERT INTO" in str(call.args[0]) and "'graph'" not in str(call.args[0])]
 
 
 def _entity_upsert_call(mock_cursor: Any) -> Any:
@@ -2934,8 +2934,9 @@ class TestPersistRecordIsTransactional:
         mock_message.routing_key = "artists"
 
         mock_cursor = AsyncMock()
-        mock_cursor.execute = AsyncMock(side_effect=lambda *_args, **_kwargs: order.append("execute"))
-        mock_cursor.executemany = AsyncMock(side_effect=lambda *_args, **_kwargs: order.append("executemany"))
+        mock_cursor.execute = AsyncMock(
+            side_effect=lambda statement, *_args, **_kwargs: order.append("graph" if "'graph'" in str(statement) else "execute")
+        )
         mock_cursor_cm = AsyncMock()
         mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
         mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
@@ -2959,7 +2960,7 @@ class TestPersistRecordIsTransactional:
         assert order[1] == "begin"
         assert order[-1] == "commit"
         # The graph rows this artist asserts went out inside that transaction, not after it.
-        assert "executemany" in order[2:-1]
+        assert "graph" in order[2:-1]
 
 
 class TestOnDataMessageFileCompletion:

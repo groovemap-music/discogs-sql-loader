@@ -24,6 +24,13 @@ document re-asserts rather than a row any one document owns. Every edge INSERT i
 relation written additively (`member_of`, `same_as`) converges instead of raising, and so a
 batch in which two documents assert the same row writes it once.
 
+Each relation is written by one set-based statement per batch, its rows sorted first. The
+sort is what makes concurrent batches safe: two transactions inserting one shared vertex row
+wait on each other, so if they reached `graph.genre` in different orders each could hold a row
+the other needs, and PostgreSQL would abort one with `deadlock detected`. With every writer
+walking each relation in one order, and the relations themselves in the fixed order of
+`VERTEX_COLUMNS` and `EDGE_COLUMNS`, no such cycle can form.
+
 One consequence is worth stating before the parity harness finds it. The enricher UPDATES a
 vertex it matches — `SET co.name = c.name` in `MERGE_COMPANY_CYPHER`, `ON MATCH SET m.family
 … m.label` in `MERGE_MEDIA_CYPHER` — where DO NOTHING keeps whatever the first write put
@@ -46,7 +53,7 @@ from tableinator.graph_derivation import DISCOGS_SOURCE, EDGE_COLUMNS, VERTEX_CO
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Iterable, Sequence
 
 
 __all__ = ["GRAPH_SCHEMA", "purge_document_graph", "write_document_graph"]
@@ -108,13 +115,44 @@ _PURGE_SCOPE: Final[dict[str, tuple[str, ...]]] = {
 }
 
 
+# Every written column is `text` except these, which the integration suite holds against the
+# promoted schema.
+_BIGINT_COLUMNS: Final = frozenset({"qty", "track_ordinal", "sub_track_ordinal"})
+
+
 def _insert(relation: str, columns: tuple[str, ...]) -> sql.Composed:
-    """Return the conflict-tolerant INSERT for one graph relation."""
-    return sql.SQL("INSERT INTO {relation} ({columns}) VALUES ({values}) ON CONFLICT DO NOTHING").format(
+    """Return the conflict-tolerant INSERT of one graph relation's rows, one array per column.
+
+    Each array is cast because a parameter's type is otherwise a guess from its Python values,
+    which an all-NULL column does not support, and bound in binary because the text format
+    costs a regular expression per element on the client. The scan of `unnest` hands rows over
+    in array order, and INSERT processes them in that order, so `_columns`'s sort is the lock
+    order.
+    """
+    return sql.SQL("INSERT INTO {relation} ({columns}) SELECT * FROM unnest({arrays}) ON CONFLICT DO NOTHING").format(
         relation=sql.Identifier(GRAPH_SCHEMA, relation),
         columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
-        values=sql.SQL(", ").join([sql.Placeholder()] * len(columns)),
+        arrays=sql.SQL(", ").join(sql.SQL("%b::bigint[]" if column in _BIGINT_COLUMNS else "%b::text[]") for column in columns),
     )
+
+
+def _vertex_order(row: tuple[Any, ...]) -> Any:
+    """Return a vertex row's key, which is its first column.
+
+    The sort is on the key alone so that it stays stable where one batch spells a company two
+    ways: DO NOTHING keeps the first spelling offered, and the first is the batch's own.
+    """
+    return row[0]
+
+
+def _edge_order(row: tuple[Any, ...]) -> tuple[tuple[bool, Any], ...]:
+    """Return the sort key of one edge row; a NULL sorts after every value of its column."""
+    return tuple((value is None, value) for value in row)
+
+
+def _columns(rows: Iterable[tuple[Any, ...]], order: Callable[[tuple[Any, ...]], Any]) -> list[list[Any]]:
+    """Return ROWS, sorted into the one order every writer takes locks in, as column arrays."""
+    return [list(column) for column in zip(*sorted(rows, key=order), strict=True)]
 
 
 def _scoped_delete(relation: str, column: str, source_scoped: bool) -> sql.Composed:
@@ -182,11 +220,12 @@ async def write_document_graph(
     for relation in VERTEX_COLUMNS:
         pending = vertex_rows.get(relation)
         if pending:
-            await cursor.executemany(_insert(relation, VERTEX_COLUMNS[relation]), list(pending))
+            await cursor.execute(_insert(relation, VERTEX_COLUMNS[relation]), _columns(pending, _vertex_order))
 
     # 2. The document-scoped delete, before the insert that re-creates the current set.
-    for relation, data_ids in replaced_ids.items():
+    for relation in sorted(replaced_ids):
         column, source_scoped = _DOCUMENT_SCOPE[relation]
+        data_ids = sorted(replaced_ids[relation])
         parameters: tuple[Any, ...] = (data_ids, DISCOGS_SOURCE) if source_scoped else (data_ids,)
         await cursor.execute(_scoped_delete(relation, column, source_scoped), parameters)
 
@@ -194,7 +233,7 @@ async def write_document_graph(
     for relation in EDGE_COLUMNS:
         pending = edge_rows.get(relation)
         if pending:
-            await cursor.executemany(_insert(relation, EDGE_COLUMNS[relation]), list(pending))
+            await cursor.execute(_insert(relation, EDGE_COLUMNS[relation]), _columns(pending, _edge_order))
 
 
 async def purge_document_graph(cursor: Any, data_type: str, started_at: Any) -> None:

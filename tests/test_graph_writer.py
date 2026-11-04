@@ -16,9 +16,6 @@ class RecordingCursor:
     async def execute(self, statement: Any, parameters: Any = None) -> None:
         self.calls.append(("execute", statement.as_string(None), parameters))
 
-    async def executemany(self, statement: Any, rows: Any) -> None:
-        self.calls.append(("executemany", statement.as_string(None), list(rows)))
-
     def statements(self) -> list[str]:
         return [statement for _kind, statement, _parameters in self.calls]
 
@@ -34,6 +31,10 @@ class RecordingCursor:
             if fragment in statement:
                 return parameters
         raise AssertionError(f"no statement contained {fragment!r}")
+
+    def inserted(self, relation: str) -> list[tuple[Any, ...]]:
+        """Return the rows the one INSERT of RELATION sent, read back from its column arrays."""
+        return list(zip(*self.rows_for(f'INTO "graph"."{relation}"'), strict=True))
 
 
 _RELEASE = {
@@ -56,6 +57,63 @@ async def test_nothing_is_executed_for_an_empty_batch() -> None:
     await write_document_graph(cursor, "releases", [])
 
     assert cursor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_each_relation_is_one_statement_per_batch() -> None:
+    """A row per execution is the cost this path exists to avoid."""
+    cursor = RecordingCursor()
+    other = {**_RELEASE, "genres": ["Jazz", "Rock"], "styles": ["Bop"]}
+
+    await write_document_graph(cursor, "releases", [("r1", _RELEASE), ("r2", other)])
+
+    assert sum('INTO "graph"."genre"' in statement for statement in cursor.statements()) == 1
+    assert sum('INTO "graph"."in_genre"' in statement for statement in cursor.statements()) == 1
+    assert cursor.inserted("in_genre") == [("r1", "Rock"), ("r2", "Jazz"), ("r2", "Rock")]
+
+
+@pytest.mark.asyncio
+async def test_rows_reach_the_server_in_one_order_whatever_order_the_documents_arrived_in() -> None:
+    """Two batches taking shared vertex rows in different orders can deadlock."""
+    first = {"genres": ["Rock", "Jazz"], "styles": ["Bop"]}
+    second = {"genres": ["Blues", "Jazz"], "styles": ["Afrobeat"]}
+    forwards = RecordingCursor()
+    backwards = RecordingCursor()
+
+    await write_document_graph(forwards, "releases", [("r1", first), ("r2", second)])
+    await write_document_graph(backwards, "releases", [("r2", second), ("r1", first)])
+
+    assert forwards.inserted("genre") == [("Blues",), ("Jazz",), ("Rock",)]
+    assert forwards.calls == backwards.calls
+
+
+@pytest.mark.asyncio
+async def test_sorting_keeps_the_first_spelling_a_batch_offers_for_one_vertex() -> None:
+    """DO NOTHING keeps the first row offered, so the sort may not reorder rows sharing a key."""
+
+    def spelled(name: str) -> dict[str, Any]:
+        return {"companies": {"items": [{"discogs_id": "9", "name": name, "role": "Pressed By", "role_category": "manufacture"}]}}
+
+    cursor = RecordingCursor()
+    await write_document_graph(cursor, "releases", [("r1", spelled("Zomba")), ("r2", spelled("Acme"))])
+
+    assert cursor.inserted("company") == [("9", "Zomba", "9"), ("9", "Acme", "9")]
+
+
+@pytest.mark.asyncio
+async def test_a_null_sorts_beside_values_and_stays_null() -> None:
+    """A company with no Discogs label id has a NULL column, which `sorted` cannot compare."""
+    companies = {
+        "items": [
+            {"discogs_id": "9", "name": "Sony DADC", "role": "Pressed By", "role_category": "manufacture"},
+            {"name": "Unnumbered Plant", "role": "Pressed By", "role_category": "manufacture"},
+        ]
+    }
+
+    cursor = RecordingCursor()
+    await write_document_graph(cursor, "releases", [("r1", {"companies": companies})])
+
+    assert [row[2] for row in cursor.inserted("company")] == ["9", None]
 
 
 @pytest.mark.asyncio
@@ -145,7 +203,7 @@ async def test_the_generated_role_category_is_never_named_in_an_insert() -> None
 
     statement = next(s for s in cursor.statements() if 'INTO "graph"."credited_on"' in s)
     assert '"role_category"' not in statement
-    assert cursor.rows_for('INTO "graph"."credited_on"') == [("Nigel Godrich", "r1", "Producer")]
+    assert cursor.inserted("credited_on") == [("Nigel Godrich", "r1", "Producer")]
 
 
 @pytest.mark.asyncio
@@ -168,7 +226,7 @@ async def test_the_generated_role_category_is_never_named_in_a_track_credit_inse
 
     statement = next(s for s in cursor.statements() if 'INTO "graph"."track_credited_on"' in s)
     assert '"role_category"' not in statement
-    assert cursor.rows_for('INTO "graph"."track_credited_on"') == [("Jonny Greenwood", "r1", 1, 0, "A1", "Engineer")]
+    assert cursor.inserted("track_credited_on") == [("Jonny Greenwood", "r1", 1, 0, "A1", "Engineer")]
 
 
 @pytest.mark.asyncio
@@ -177,7 +235,7 @@ async def test_the_plain_role_category_of_credited_to_is_written() -> None:
 
     await write_document_graph(cursor, "releases", [("r1", _RELEASE)])
 
-    assert cursor.rows_for('INTO "graph"."credited_to"') == [("r1", "9", "Pressed By", "manufacture", "discogs")]
+    assert cursor.inserted("credited_to") == [("r1", "9", "Pressed By", "manufacture", "discogs")]
 
 
 @pytest.mark.asyncio
@@ -191,7 +249,7 @@ async def test_one_row_is_written_once_when_two_documents_assert_it() -> None:
         [("a1", {"groups": [{"id": "a2"}]}), ("a2", {"members": [{"id": "a1"}]})],
     )
 
-    assert cursor.rows_for('INTO "graph"."member_of"') == [("a1", "a2")]
+    assert cursor.inserted("member_of") == [("a1", "a2")]
 
 
 @pytest.mark.asyncio
