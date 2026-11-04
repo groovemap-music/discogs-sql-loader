@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "groovemap-discogs-sql-loader"
-version = "0.4.2"
+version = "0.4.3"
 source = { editable = "." }
 dependencies = [
     { name = "aio-pika" },
