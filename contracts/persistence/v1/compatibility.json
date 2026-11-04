@@ -1,5 +1,46 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "activity_event_idempotency": {
+    "backfill": "one-time, in the same statement that creates the claim trigger and under a SHARE ROW EXCLUSIVE lock on activity.events, so no event lands between them without a key; guarded on the trigger's presence, so later inits do not rescan activity.events. Existing duplicate rows are kept, and each key is given to its earliest occurrence",
+    "claim": {
+      "function": "activity.claim_idempotency_key()",
+      "held_key": "honoured only while the event it names is stored: the BEFORE INSERT trigger then returns NULL, so the event row is skipped with no error and no RETURNING row, exactly like an INSERT ... ON CONFLICT DO NOTHING that met its conflict. A key whose event is not stored is moved onto the new event",
+      "occurrence_key": "a row whose (occurred_at, idempotency_key) another subject's stored event already holds is handed to that key unclaimed (ON CONFLICT skips it, a plain INSERT raises), so no key is claimed for a row that is never stored",
+      "trigger": "activity_events_claim_idempotency_key"
+    },
+    "columns": [
+      "subject_id",
+      "idempotency_key",
+      "event_id",
+      "occurred_at",
+      "recorded_at"
+    ],
+    "consumers": [
+      "catalog-api"
+    ],
+    "design_decision": "activity.events is partitioned by occurred_at, so its own unique key must include occurred_at and cannot see a retry stamped a moment later or routed to another partition. This non-partitioned table holds one row per (subject_id, idempotency_key), claimed by a BEFORE INSERT trigger on activity.events, so a second insert of the same key is skipped whatever its occurred_at, including under concurrent inserts. The events table's UNIQUE (occurred_at, idempotency_key) is kept, additively, because writers name it as their ON CONFLICT target; subject-scoping it would be a coordinated breaking change, so the claim defers to it instead.",
+    "erasure": {
+      "count": "activity.erasures.idempotency_keys_deleted, a nullable BIGINT: the erasure procedure counts the subject's keys before it deletes the events, because the triggers delete them",
+      "event_release": "activity_events_release_idempotency_key, AFTER DELETE on activity.events: deleting an event releases the key it holds, so deleting a subject's events removes their keys",
+      "subject_release": "activity_user_subjects_release_idempotency_keys, AFTER DELETE on activity.user_subjects: removing the pseudonym link removes the subject's keys that name no stored event",
+      "summary": "personal data keyed to subject_id, closed at the schema level: catalog-api's existing erasure transaction (delete events and impressions by subject, then the user_subjects link, under SET LOCAL groovemap.erasure = 'on') leaves no key row without naming this table"
+    },
+    "immutability": "activity.reject_key_mutation(): UPDATE and DELETE of a key whose event is stored are rejected unless groovemap.erasure is on, as on activity.events; a key naming no stored event may be moved or removed",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "primary_key": [
+      "subject_id",
+      "idempotency_key"
+    ],
+    "relation": "activity.event_idempotency",
+    "retained_unique_key": "UNIQUE (occurred_at, idempotency_key)",
+    "retention": {
+      "function": "activity.purge_idempotency_keys(older_than TIMESTAMPTZ) RETURNS BIGINT",
+      "index": "idx_activity_event_idempotency_occurred_at ON activity.event_idempotency (occurred_at)",
+      "procedure": "run right after dropping an activity.events month partition, with the dropped partition's upper bound; it removes only keys older than the bound whose event is no longer stored and returns the count. Until then a retry under a dropped month's key is stored afresh, so the dedup window is the retention window"
+    },
+    "consumer_rollout": "expand phase: catalog-api pins the revision containing this table, treats a skipped retry (no RETURNING row) as already recorded, and may record idempotency_keys_deleted in its erasure row; its erasure statements need no change. deployment's partition-drop runbook adds the purge call"
+  },
   "application_runtime": {
     "package": "groovemap-runtime",
     "required_capabilities": [
@@ -7,7 +48,7 @@
       "otel",
       "postgres"
     ],
-    "tested_commit": "9bac0220df80fdb550fde78d4db8228ca4273625",
+    "tested_commit": "6d0425f908e01a446b040e2993045e2afe30460e",
     "tested_version": "0.1.0"
   },
   "catalog_item_supersession": {
@@ -462,6 +503,63 @@
       "undirected": true,
       "writes": "nothing"
     },
+    "free_text_keys": {
+      "availability": "unconditional",
+      "function": "graph.text_key",
+      "hash": "sha256 of the value's UTF-8 bytes",
+      "introduced_in_contract_version": 1,
+      "kind": "additive",
+      "migration": "A guarded transaction per relation builds the unique and hash indexes, then drops the primary key and the indexes that stored the raw column. It runs with the loaders stopped and does not rewrite the table.",
+      "note": "PostgreSQL refuses a btree entry over 2704 bytes after compression, and these columns are free text with no bound, so a credit past the limit could not be stored. Each relation keeps its key columns and its whole value; a UNIQUE index over graph.text_key enforces the key in place of a primary key, and a hash index keeps = on the column. No column is added, so a writer's column list is unchanged. A target-less ON CONFLICT DO NOTHING fires on the unique index; an ON CONFLICT naming the columns does not infer it, and none of the loaders uses one.",
+      "relations": {
+        "company": {
+          "key": [
+            "company_id"
+          ],
+          "lookup": "company_id"
+        },
+        "credited_on": {
+          "key": [
+            "release_id",
+            "person_name",
+            "role"
+          ],
+          "lookup": "person_name"
+        },
+        "credited_to": {
+          "key": [
+            "release_id",
+            "company_id",
+            "role",
+            "source"
+          ],
+          "lookup": "company_id"
+        },
+        "person": {
+          "key": [
+            "name"
+          ],
+          "lookup": "name"
+        },
+        "same_as": {
+          "key": [
+            "artist_id",
+            "person_name"
+          ],
+          "lookup": "person_name"
+        },
+        "track_credited_on": {
+          "key": [
+            "release_id",
+            "track_ordinal",
+            "sub_track_ordinal",
+            "person_name",
+            "role"
+          ],
+          "lookup": "person_name"
+        }
+      }
+    },
     "functions": [
       "graph.bootstrap_fill",
       "graph.credit_role_category",
@@ -470,7 +568,8 @@
       "graph.mb_relationship_type",
       "graph.medium_label",
       "graph.refresh_artist_member_of",
-      "graph.refresh_vertex_degree"
+      "graph.refresh_vertex_degree",
+      "graph.text_key"
     ],
     "introduced_in_contract_version": 1,
     "key_columns": {
