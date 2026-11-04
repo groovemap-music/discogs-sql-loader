@@ -63,9 +63,13 @@ Verification commands:
 ```bash
 just check
 just test-integration
+just test-consumer-recovery
 just test-admission-integration
 just image
 ```
+
+`test-consumer-recovery` runs the real checker, recovery and handlers on the homelab smoke's
+RabbitMQ image with a 2 s `consumer_timeout`. `test-integration` includes it, so CI runs it.
 
 `test-admission-integration` starts its own PostgreSQL and RabbitMQ containers, disables
 RabbitMQ channel-global QoS in the broker configuration, and exercises all four entity queues

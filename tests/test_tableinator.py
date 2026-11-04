@@ -2006,11 +2006,11 @@ class TestPeriodicQueueChecker:
         tableinator.tableinator.message_counts = {"artists": 100}
         assert await check_consumers_unexpectedly_dead() is False
 
-        # Case 3: Not stuck - no messages processed yet (startup)
+        # Case 3: STUCK - nothing processed yet, but nothing re-attaches this loader either
         tableinator.tableinator.consumer_tags = {}
         tableinator.tableinator.completed_files = set()
         tableinator.tableinator.message_counts = {"artists": 0, "labels": 0, "masters": 0, "releases": 0}
-        assert await check_consumers_unexpectedly_dead() is False
+        assert await check_consumers_unexpectedly_dead() is True
 
         # Case 4: STUCK - no consumers, files not completed, has processed messages
         tableinator.tableinator.consumer_tags = {}
@@ -3790,10 +3790,10 @@ class TestPeriodicQueueCheckerTimeNotExpired:
         """Test that huge QUEUE_CHECK_INTERVAL triggers line 306 continue."""
         import tableinator.tableinator
 
-        # is_stuck = False because message_counts all 0 (has_processed_messages = False)
+        # is_stuck = False because every file completed, which leaves only the hourly check
         tableinator.tableinator.message_counts = {"artists": 0, "labels": 0, "masters": 0, "releases": 0}
         tableinator.tableinator.consumer_tags = {}
-        tableinator.tableinator.completed_files = set()
+        tableinator.tableinator.completed_files = set(tableinator.tableinator.DATA_TYPES)
         tableinator.tableinator.active_connection = None
         tableinator.tableinator.shutdown_requested = False
 

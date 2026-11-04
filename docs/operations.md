@@ -86,7 +86,7 @@ preferred for deployed containers.
 | --- | --- | --- |
 | `CONSUMER_CANCEL_DELAY` | `300` seconds | Grace period after `file_complete`; `0` disables cancellation |
 | `QUEUE_CHECK_INTERVAL` | `3600` seconds | Poll interval after all queues become idle |
-| `STUCK_CHECK_INTERVAL` | `30` seconds | Consumer recovery check interval |
+| `STUCK_CHECK_INTERVAL` | `30` seconds | Consumer recovery check interval. A consumer must be missing on two consecutive checks before the connection is rebuilt |
 | `STARTUP_IDLE_TIMEOUT` | `30` seconds | Delay before entering quiet idle mode |
 | `IDLE_LOG_INTERVAL` | `300` seconds | Idle progress-log interval |
 | `HEALTH_PORT` | `8002` | Health server port; `8002` is the role port, the one fixed health port shared by every SQL loader. An invalid value (non-numeric or outside `1`-`65535`) fails startup with a configuration error instead of falling back |
@@ -130,7 +130,15 @@ A `file_complete` delivery is not acknowledged until the batch for that entity h
 flushed successfully. The service then marks the entity complete and, after
 `CONSUMER_CANCEL_DELAY`, cancels that consumer. When all consumers are complete, the
 RabbitMQ connection can close; `QUEUE_CHECK_INTERVAL` controls when the service checks
-for new work and reconnects.
+for new work and reconnects. Only that all-complete state may stay disconnected: a loader
+with incomplete files keeps its consumers attached even when every queue is empty.
+
+aio-pika re-subscribes consumers by itself after a broker cancel, an acknowledgement timeout
+or a closed channel. Every `STUCK_CHECK_INTERVAL` the service also compares its consumer tags
+with the delivery channel's own consumer table, and rebuilds the connection only if a tag
+stays missing on two consecutive checks. Consumers cancelled on purpose are not watched. It
+does not read `consumer_count` from `declare_queue(passive=True)` on that channel, because
+aio-pika's `RobustChannel` answers from a cache for a queue it already knows.
 
 An `extraction_complete` delivery flushes all pending data before guarded stale-row
 cleanup. Cleanup is skipped when a message for that entity was dead-lettered or when
@@ -205,6 +213,10 @@ belongs to the separate `deployment` repository.
 
 - `starting` persists: verify all required PostgreSQL variables and reachability.
 - `unhealthy` with no consumers: inspect RabbitMQ connectivity and stuck-state logs.
+- `Consumers are gone from the delivery channel`: a consumer did not come back after a broker
+  cancel or channel close, so the service is rebuilding its connection. Its unacknowledged
+  deliveries return to the queue. Repeated lines mean the recovery is failing; read the
+  RabbitMQ log for the cause.
 - Terminal delivery is requeued: the pending batch did not commit; inspect PostgreSQL
   availability before retrying.
 - Durable terminal delivery is requeued: consumers are paused first, so the queued
