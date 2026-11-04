@@ -106,8 +106,19 @@ class PostgreSQLFailureClassifier:
 
     _TRANSIENT = (InterfaceError, OperationalError, DatabaseUnavailableError)
     _DETERMINISTIC = (DataError, IntegrityError, ValueError, RuntimeError)
+    # SQLSTATE classes whose cause is the server, connection or its resources, so
+    # the same statement can succeed later: 08 connection exception, 40 rollback
+    # (serialization failure, deadlock), 53 insufficient resources, 55 object not
+    # in prerequisite state, 57 operator intervention (admin shutdown, cannot
+    # connect now, query cancel), 58 system error, F0 config file error.
+    _TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "55", "57", "58", "F0"})
 
     def __call__(self, error: BaseException) -> FailureKind:
+        if isinstance(error, OperationalError) and self.is_data_dependent(error):
+            # psycopg raises e.g. ProgramLimitExceeded (54000, "index row size
+            # exceeds btree maximum") as an OperationalError subclass. It comes
+            # from the record, not the connection, so retrying can never help.
+            return FailureKind.DETERMINISTIC
         if isinstance(error, self._TRANSIENT):
             return FailureKind.TRANSIENT
         if isinstance(error, self._DETERMINISTIC):
@@ -115,6 +126,15 @@ class PostgreSQLFailureClassifier:
         # Preserve the historical safety posture for unknown infrastructure
         # exceptions: retry rather than silently dead-lettering a valid record.
         return FailureKind.TRANSIENT
+
+    @classmethod
+    def is_data_dependent(cls, error: BaseException) -> bool:
+        """True for a server-reported OperationalError that is not a connection-class failure."""
+        sqlstate = getattr(error, "sqlstate", None)
+        if not isinstance(sqlstate, str) or len(sqlstate) != 5:
+            # No server verdict (client-side connection loss, pool timeout): keep retrying.
+            return False
+        return sqlstate[:2] not in cls._TRANSIENT_SQLSTATE_CLASSES
 
 
 @dataclass
@@ -126,6 +146,7 @@ class _FlushState:
     media_backfilled: int = 0
     identity_backfilled: int = 0
     error: BaseException | None = None
+    record_ids: list[str] = field(default_factory=list)
 
 
 class PostgreSQLBatchObserver:
@@ -145,11 +166,13 @@ class PostgreSQLBatchObserver:
 
     def write_result(self, data_type: str, result: BatchWriteResult) -> None:
         state = self._states[data_type]
-        state.media_backfilled = len(result.media_backfilled_ids)
-        state.identity_backfilled = len(result.identity_backfilled_ids)
+        state.media_backfilled += len(result.media_backfilled_ids)
+        state.identity_backfilled += len(result.identity_backfilled_ids)
 
-    def write_failed(self, data_type: str, error: BaseException) -> None:
-        self._states[data_type].error = error
+    def write_failed(self, data_type: str, error: BaseException, record_ids: Sequence[str] = ()) -> None:
+        state = self._states[data_type]
+        state.error = error
+        state.record_ids = list(record_ids)
 
     @contextmanager
     def consume(self, destination: str, headers: object | None) -> Iterator[Any]:
@@ -229,6 +252,10 @@ class PostgreSQLBatchObserver:
                     "❌ Poison batch nacked to the DLQ",
                     data_type=entity,
                     batch_size=state.size,
+                    rejected=state.rejected,
+                    record_ids=state.record_ids[:10],
+                    sqlstate=getattr(state.error, "sqlstate", None),
+                    error_type=type(state.error).__name__ if state.error is not None else None,
                 )
 
     def had_dlq_nacks(self, data_type: str) -> bool:
@@ -248,11 +275,51 @@ class PostgreSQLBatchSink:
     async def write(self, key: str, payloads: Sequence[PendingMessage]) -> Sequence[BatchItemResult]:
         try:
             result = await self._processor._process_batch(key, list(payloads))
+        except Exception as error:
+            if len(payloads) > 1 and PostgreSQLFailureClassifier()(error) is FailureKind.DETERMINISTIC:
+                return await self._isolate(key, list(payloads), error)
+            self._observer.write_failed(key, error, [m.data_id for m in payloads])
+            raise
         except BaseException as error:
             self._observer.write_failed(key, error)
             raise
         self._observer.write_result(key, result)
         return [BatchItemResult(Settlement.ACK, self._outcome(message, result)) for message in payloads]
+
+    async def _isolate(self, key: str, payloads: list[PendingMessage], error: Exception) -> list[BatchItemResult]:
+        """Narrow a deterministic batch failure to the offending record(s).
+
+        The failed transaction rolled back whole, so bisecting rewrites nothing twice.
+        Healthy records are committed and acked; only the records that fail on their
+        own are rejected to the DLQ. Transient failures during isolation propagate so
+        the shared engine retries the whole batch without dead-lettering anything.
+        """
+        if len(payloads) == 1:
+            message = payloads[0]
+            self._observer.write_failed(key, error, [message.data_id])
+            logger.error(
+                "☠️ Record dead-lettered after deterministic PostgreSQL failure",
+                data_type=key,
+                record_id=message.data_id,
+                sqlstate=getattr(error, "sqlstate", None),
+                error_type=type(error).__name__,
+                error=str(error)[:300],
+            )
+            return [BatchItemResult(Settlement.REJECT, "poison")]
+        middle = len(payloads) // 2
+        results: list[BatchItemResult] = []
+        for half in (payloads[:middle], payloads[middle:]):
+            try:
+                outcome = await self._processor._process_batch(key, half)
+            except Exception as half_error:
+                if PostgreSQLFailureClassifier()(half_error) is not FailureKind.DETERMINISTIC:
+                    self._observer.write_failed(key, half_error)
+                    raise
+                results.extend(await self._isolate(key, half, half_error))
+            else:
+                self._observer.write_result(key, outcome)
+                results.extend(BatchItemResult(Settlement.ACK, self._outcome(m, outcome)) for m in half)
+        return results
 
     @staticmethod
     def _outcome(message: PendingMessage, result: BatchWriteResult) -> str:
