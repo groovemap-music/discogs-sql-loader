@@ -484,7 +484,7 @@ class TestPoisonIsolation:
 
     @pytest.mark.asyncio
     async def test_lone_oversized_record_is_dead_lettered_after_bounded_attempts_naming_id_and_sqlstate(self) -> None:
-        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=1, max_poison_retries=3))
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=1, max_poison_retries=3, max_flush_retries=5))
         processor._process_batch = AsyncMock(side_effect=ProgramLimitExceeded("index row size 2888 exceeds btree"))  # type: ignore[method-assign]
         ack, nack = AsyncMock(), AsyncMock()
         with patch("tableinator.batch_processor.logger") as log:
