@@ -18,6 +18,24 @@ its generated bindings and producer-owned persistence contracts are unchanged. T
 producer retains its historical runtime reference; this loader's uv override resolves that
 consumer dependency against the reviewed `WriteAdmission` runtime above.
 
+## Held deliveries and the outage window
+
+During PostgreSQL transient backoff, a batch delivery is held unacknowledged. Once it has been
+held `POSTGRES_BATCH_MAX_HOLD_S` seconds (default 1500), the shared engine returns it with
+`nack(requeue=True)`, so RabbitMQ redelivers it later. Nothing is acked or dropped by this path.
+
+- The bound is checked at each engine flush entry, and `run_periodic` flushes every
+  `POSTGRES_BATCH_FLUSH_INTERVAL` seconds. `BatchConfig` rejects any setting where
+  `max_hold_s + flush_interval + backoff_max` (30 s default) reaches the 1800 s lux `consumer_timeout`.
+  A write that is still blocked when the check is due can delay it further; the engine has no write timeout.
+- Each requeue increments the message's delivery count. Lux queues use `x-delivery-limit` 20, so a
+  record held through 20 requeues is dead-lettered on the next delivery. At 1500 s per hold that is
+  about 30,000 s, roughly **8.3 hours** of continuous outage. At the previous 900 s default it was
+  about 5 hours, and the 1800 s consumer timeout alone would allow about 10 hours.
+- Dead-lettered records go to the DLQ, which is capped at **50,000 messages with drop-head**. Once the cap
+  is reached the oldest dead letters are discarded. Under a long outage, check DLQ depth against this
+  cap, because discarded dead letters cannot be replayed.
+
 `common.delivery.run_delivery` is the single settlement authority for the non-batch persistence
 attempt. `common.batch.AsyncBatchEngine` owns batch capacity, per-entity serialization,
 cross-entity concurrency, adaptive sizing, retry state, periodic flush, bounded drain,

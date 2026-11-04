@@ -31,7 +31,7 @@ from common.postgres_resilient import PostgreSQLFailureClassifier
 from orjson import loads
 
 from tableinator import telemetry
-from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor
+from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
 )
@@ -281,8 +281,8 @@ BATCH_MODE = os.environ.get("POSTGRES_BATCH_MODE", "true").lower() == "true"
 BATCH_SIZE = int(os.environ.get("POSTGRES_BATCH_SIZE", "100"))
 BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.0"))
 # Held-delivery bound: deliveries waiting out PostgreSQL backoff longer than this go back to RabbitMQ
-# with requeue=True. Keep it well below the broker consumer_timeout (lux: 30 minutes).
-BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", "900"))
+# with requeue=True. BatchConfig rejects values that could reach the broker consumer_timeout (lux: 30 minutes).
+BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
 
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12

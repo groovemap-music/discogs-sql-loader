@@ -81,11 +81,21 @@ class TestPolicyAdapters:
         assert policy.max_poison_retries == config.max_poison_retries
         assert policy.max_hold_s == config.max_hold_s
 
-    def test_default_hold_bound_stays_below_the_lux_consumer_timeout(self) -> None:
-        consumer_timeout_s = 1_800  # RabbitMQ consumer_timeout on lux: 1,800,000 ms
-        policy = BatchConfig().runtime_policy()
-        assert policy.max_hold_s == 900.0
-        assert policy.max_hold_s < consumer_timeout_s
+    def test_default_hold_bound_is_1500_seconds_and_budgeted_under_the_lux_consumer_timeout(self) -> None:
+        config = BatchConfig()
+        assert config.max_hold_s == 1500.0
+        assert config.runtime_policy().max_hold_s == 1500.0
+        # Worst case: the hold, one flush interval of check lag, and the longest backoff sleep.
+        assert config.max_hold_s + config.flush_interval + config.backoff_max < 1800.0  # lux consumer_timeout 1,800,000 ms
+
+    def test_hold_plus_check_lag_and_longest_backoff_must_stay_under_consumer_timeout(self) -> None:
+        # 1765 + 5 (flush_interval) + 30 (backoff_max) == 1800: the budget is exhausted, so reject it.
+        with pytest.raises(ValueError, match="consumer_timeout"):
+            BatchConfig(max_hold_s=1765.0, flush_interval=5.0, backoff_max=30.0)
+        BatchConfig(max_hold_s=1764.0, flush_interval=5.0, backoff_max=30.0)
+
+    def test_disabling_the_hold_bound_skips_the_budget(self) -> None:
+        assert BatchConfig(max_hold_s=None, backoff_max=10_000.0).max_hold_s is None
 
     def test_owner_uses_shared_engine_instead_of_a_local_queue_lifecycle(self) -> None:
         processor = PostgreSQLBatchProcessor(MagicMock(), processor_config())

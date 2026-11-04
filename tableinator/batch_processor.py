@@ -34,6 +34,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 DATA_TYPES = ("artists", "labels", "masters", "releases")
+# RabbitMQ consumer_timeout on lux (30 minutes). A held delivery must be returned before it.
+BROKER_CONSUMER_TIMEOUT_S = 1800.0
+# 1500 s x 20 redeliveries (lux x-delivery-limit) = 30,000 s, about 8.3 hours of continuous outage
+# before the quorum queue dead-letters a healthy record. See docs/shared-delivery-runtime.md.
+DEFAULT_MAX_HOLD_S = 1500.0
 
 
 @dataclass
@@ -51,8 +56,22 @@ class BatchConfig:
     max_flush_retries: int = 5
     max_poison_retries: int = 5
     # Longest a delivery may be held in transient backoff before it is returned to RabbitMQ
-    # with requeue=True. Must stay below the broker consumer_timeout (lux: 30 minutes).
-    max_hold_s: float | None = 900.0
+    # with requeue=True. None disables the bound. See __post_init__ for the budget it must meet.
+    max_hold_s: float | None = DEFAULT_MAX_HOLD_S
+
+    def __post_init__(self) -> None:
+        if self.max_hold_s is None:
+            return
+        # The engine checks holds at each flush entry, and run_periodic flushes every
+        # flush_interval. Budget for that gap and for the longest backoff sleep, so the
+        # bound is checked before a hold can reach the broker's consumer_timeout.
+        worst_case_s = self.max_hold_s + self.flush_interval + self.backoff_max
+        if worst_case_s >= BROKER_CONSUMER_TIMEOUT_S:
+            raise ValueError(
+                f"max_hold_s={self.max_hold_s:g} plus flush_interval={self.flush_interval:g} and "
+                f"backoff_max={self.backoff_max:g} can reach {worst_case_s:g} s, which is not below "
+                f"the {BROKER_CONSUMER_TIMEOUT_S:g} s consumer_timeout"
+            )
 
     def runtime_policy(self) -> BatchPolicy:
         """Return the transport-neutral policy consumed by the shared engine."""
