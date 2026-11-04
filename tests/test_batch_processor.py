@@ -492,7 +492,7 @@ class TestPoisonIsolation:
         assert processor._process_batch.await_count == 3  # type: ignore[attr-defined]
         nack.assert_awaited_once()
         ack.assert_not_awaited()
-        final = [c for c in log.error.call_args_list if "Poison batch nacked" in c.args[0]][0]
+        final = next(c for c in log.error.call_args_list if "Poison batch nacked" in c.args[0])
         assert final.kwargs["data_type"] == "releases"
         assert final.kwargs["record_ids"] == ["r-1"]
         assert final.kwargs["sqlstate"] == "54000"
