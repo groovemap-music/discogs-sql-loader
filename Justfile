@@ -38,9 +38,15 @@ coverage: test
 # Starts a pinned disposable PostgreSQL container unless TEST_DATABASE_URL points
 # at an existing disposable database. This lane is intentionally outside `check`.
 # It deselects `parity`, which needs a second engine.
-# PostgreSQL integration suites, in a disposable database.
+# PostgreSQL integration suites, in a disposable database, then the real-broker consumer lane.
 test-integration:
     bash scripts/test-integration.sh
+    bash scripts/test-consumer-recovery.sh
+
+# Consumer loss and recovery on the homelab smoke's RabbitMQ image, in an exclusively owned
+# container. Needs no PostgreSQL. CI runs it through `test-integration`.
+test-consumer-recovery:
+    bash scripts/test-consumer-recovery.sh
 
 # Starts exclusively owned disposable PostgreSQL and RabbitMQ services; deprecated global QoS
 # is disabled in RabbitMQ. Kept outside `check` and `test-integration` by design.

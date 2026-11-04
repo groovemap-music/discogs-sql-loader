@@ -328,13 +328,105 @@ async def test_broker_cancelled_consumers_are_detected_and_recovered() -> None:
     recover.assert_awaited_once()
 
 
+def _delivery_channel(*tags: str) -> MagicMock:
+    """A robust channel whose underlay currently holds these consumer tags."""
+    underlay = MagicMock(consumers=dict.fromkeys(tags))
+    return MagicMock(is_closed=False, get_underlay_channel=AsyncMock(return_value=underlay))
+
+
 @pytest.mark.asyncio
-async def test_zero_broker_consumer_count_is_detected_but_healthy_count_is_not() -> None:
+async def test_live_consumers_are_not_lost_and_the_stale_declare_cache_is_never_read() -> None:
     service.consumer_tags["labels"] = "tag"
-    service.queues["labels"] = MagicMock()
-    service.shutdown_requested = False
-    service.completed_files.discard("labels")
-    for count, lost in ((0, True), (1, False)):
-        queue = MagicMock(declaration_result=MagicMock(consumer_count=count))
-        service.active_channel = MagicMock(is_closed=False, declare_queue=AsyncMock(return_value=queue))
-        assert await service.consumers_lost_at_broker() is lost
+    service.active_channel = _delivery_channel("tag")
+    assert not await service.consumers_lost_at_broker()
+    assert not await service.consumers_lost_at_broker()
+    service.active_channel.declare_queue.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_tag_that_aio_pika_restores_between_checks_is_not_lost() -> None:
+    service.consumer_tags["labels"] = "tag"
+    service.active_channel = _delivery_channel()
+    assert not await service.consumers_lost_at_broker()
+    service.active_channel = _delivery_channel("tag")
+    assert not await service.consumers_lost_at_broker()
+    service.active_channel = _delivery_channel()
+    assert not await service.consumers_lost_at_broker()
+
+
+@pytest.mark.asyncio
+async def test_a_tag_missing_on_two_consecutive_checks_is_lost() -> None:
+    service.consumer_tags["labels"] = "tag"
+    service.active_channel = _delivery_channel()
+    assert not await service.consumers_lost_at_broker()
+    assert await service.consumers_lost_at_broker()
+
+
+@pytest.mark.asyncio
+async def test_an_unavailable_delivery_channel_counts_as_missing() -> None:
+    service.consumer_tags["labels"] = "tag"
+    service.active_channel = MagicMock(is_closed=False, get_underlay_channel=AsyncMock(side_effect=RuntimeError("reconnecting")))
+    assert not await service.consumers_lost_at_broker()
+    assert await service.consumers_lost_at_broker()
+
+
+@pytest.mark.asyncio
+async def test_a_completed_type_is_not_watched() -> None:
+    service.consumer_tags["labels"] = "tag"
+    service.completed_files.add("labels")
+    service.active_channel = _delivery_channel()
+    assert not await service.consumers_lost_at_broker()
+    assert not await service.consumers_lost_at_broker()
+
+
+@pytest.mark.asyncio
+async def test_no_check_runs_during_shutdown_and_suspicion_is_dropped() -> None:
+    service.consumer_tags["labels"] = "tag"
+    service.active_channel = _delivery_channel()
+    assert not await service.consumers_lost_at_broker()
+    service.shutdown_requested = True
+    assert not await service.consumers_lost_at_broker()
+    assert service.suspected_lost_tags == set()
+    assert not await service.check_consumers_unexpectedly_dead()
+
+
+def _recovery_broker(message_count: int) -> tuple[AsyncMock, AsyncMock]:
+    """A recovery transport whose passive declares report `message_count`, and its channel."""
+    declared = MagicMock(declaration_result=MagicMock(message_count=message_count))
+    queue = AsyncMock(declaration_result=declared.declaration_result)
+    queue.consume = AsyncMock(return_value="new-tag")
+    channel = AsyncMock(declare_queue=AsyncMock(return_value=queue))
+    return AsyncMock(channel=AsyncMock(return_value=channel)), channel
+
+
+@pytest.mark.asyncio
+async def test_recovery_keeps_consumers_when_queues_are_empty_and_files_are_incomplete() -> None:
+    connection, channel = _recovery_broker(message_count=0)
+    with patch.object(service, "rabbitmq_manager", AsyncMock(connect=AsyncMock(return_value=connection))):
+        await service._recover_consumers()
+    assert set(service.consumer_tags) == set(service.DATA_TYPES)
+    assert service.active_connection is connection
+    assert service.active_channel is channel
+    connection.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_disconnects_only_when_every_file_completed_and_queues_are_empty() -> None:
+    connection, _channel = _recovery_broker(message_count=0)
+    service.completed_files.update(service.DATA_TYPES)
+    with patch.object(service, "rabbitmq_manager", AsyncMock(connect=AsyncMock(return_value=connection))):
+        await service._recover_consumers()
+    assert service.consumer_tags == {}
+    assert service.active_connection is None
+    connection.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_message_counts_bypass_the_robust_declare_cache() -> None:
+    connection, channel = _recovery_broker(message_count=0)
+    service.completed_files.update(service.DATA_TYPES)
+    with patch.object(service, "rabbitmq_manager", AsyncMock(connect=AsyncMock(return_value=connection))):
+        await service._recover_consumers()
+    passive = [call for call in channel.declare_queue.await_args_list if call.kwargs.get("passive")]
+    assert len(passive) == len(service.DATA_TYPES)
+    assert all(call.kwargs["robust"] is False for call in passive)

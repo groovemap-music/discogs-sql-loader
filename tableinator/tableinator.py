@@ -111,6 +111,8 @@ consumer_cancel_tasks: dict[str, asyncio.Task[None]] = {}  # {"artists": asyncio
 queues: dict[str, Any] = {}  # {"artists": queue_object, ...}
 CONSUMER_CANCEL_TIMEOUT = 5.0  # Bound cancel-ok and uncertain-channel recovery during completion/shutdown.
 consumer_cancellation_failed = False
+# Tags missing from the delivery channel on the previous check; see consumers_lost_at_broker.
+suspected_lost_tags: set[str] = set()
 CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # Default 5 minutes
 
 # Safety cap for the stale-row purge. A resumed extraction skips files completed in an
@@ -665,48 +667,55 @@ async def check_all_consumers_idle() -> bool:
 
 
 async def check_consumers_unexpectedly_dead() -> bool:
-    """Check if consumers have died unexpectedly (no consumers but files not completed).
+    """Check if the loader holds no consumers while file work remains.
 
-    This detects the stuck state where:
-    - No consumers are active (consumer_tags is empty)
-    - Not all files are completed (some work remains)
-    - We've processed at least some messages (not just starting up)
+    Nothing else re-attaches a loader in this state: the hourly check only serves one
+    whose files all completed. That holds even if no message was ever processed, as
+    after a failed recovery on a loader still waiting for its first extraction.
 
     Returns:
-        True if consumers appear to have died unexpectedly
+        True if consumers must be re-established
     """
     no_active_consumers = len(consumer_tags) == 0
     files_incomplete = len(completed_files) < len(DATA_TYPES)
-    has_processed_messages = any(count > 0 for count in message_counts.values())
 
-    return no_active_consumers and files_incomplete and has_processed_messages
+    return no_active_consumers and files_incomplete and not shutdown_requested
 
 
 async def consumers_lost_at_broker() -> bool:
-    """Detect consumers the broker cancelled without this process noticing.
+    """Detect tracked consumers that no longer exist on the delivery channel.
 
-    A delivery-acknowledgement timeout (PRECONDITION_FAILED) closes the channel and a
-    broker-initiated basic.cancel drops the consumer, yet ``consumer_tags`` still lists
-    the tags, so the zero-tag predicate in :func:`check_consumers_unexpectedly_dead`
-    never fires and the queue sits at 0 consumers. This reads the broker's own view.
+    aiormq removes a tag from ``Channel.consumers`` when the broker's basic.cancel
+    arrives, as it does for a delivery-acknowledgement timeout on a quorum queue, and a
+    reopened channel starts without its tags. That table is therefore fed by the frames
+    themselves. Do not ask the broker through ``active_channel.declare_queue(passive=True)``
+    instead: ``RobustChannel`` answers that from its cache for any queue it already knows,
+    so ``consumer_count`` is the value from before ``consume()`` and is always 0.
+
+    aio-pika re-subscribes the same tags by itself within seconds, so recovering on the
+    first sighting would close a connection that is already healing and requeue its
+    in-flight deliveries. Only a tag missing on two consecutive checks is lost. Types whose
+    file completed are not watched: their consumers are cancelled on purpose.
     """
+    global suspected_lost_tags
+
     if not consumer_tags or active_channel is None or shutdown_requested:
+        suspected_lost_tags = set()
         return False
     if getattr(active_channel, "is_closed", False) is True:
         return True
-    pending = [data_type for data_type in consumer_tags if data_type not in completed_files and data_type in queues]
-    for data_type in pending:
-        try:
-            declared = await asyncio.wait_for(
-                active_channel.declare_queue(name=catalog_queue_name(AMQP_CONSUMER_NAME, data_type), passive=True),
-                timeout=CONSUMER_CANCEL_TIMEOUT,
-            )
-        except Exception as exc:
-            logger.warning("⚠️ Could not read broker consumer count", data_type=data_type, error_type=type(exc).__name__)
-            return getattr(active_channel, "is_closed", False) is True
-        if declared.declaration_result.consumer_count == 0:
-            return True
-    return False
+
+    watched = {tag for data_type, tag in consumer_tags.items() if data_type not in completed_files}
+    try:
+        delivery_channel = await asyncio.wait_for(active_channel.get_underlay_channel(), timeout=CONSUMER_CANCEL_TIMEOUT)
+        missing = watched - delivery_channel.consumers.keys()
+    except Exception as exc:
+        logger.warning("⚠️ Delivery channel is unavailable", error_type=type(exc).__name__)
+        missing = watched
+
+    lost = missing & suspected_lost_tags
+    suspected_lost_tags = missing
+    return bool(lost)
 
 
 async def periodic_queue_checker() -> None:
@@ -739,7 +748,7 @@ async def periodic_queue_checker() -> None:
 
             if await consumers_lost_at_broker():
                 logger.error(
-                    "❌ Broker cancelled our consumers (channel closed or consumer_count=0). Re-establishing consumption...",
+                    "❌ Consumers are gone from the delivery channel and did not come back. Re-establishing consumption...",
                     active_consumers=len(consumer_tags),
                     completed_files=list(completed_files),
                 )
@@ -857,19 +866,25 @@ async def _recover_consumers() -> None:
         for data_type in DATA_TYPES:
             queue_name = catalog_queue_name(AMQP_CONSUMER_NAME, data_type)
 
-            # Use queue.declare with passive=True to get message count without affecting the queue
-            declared_queue = await temp_channel.declare_queue(name=queue_name, passive=True)
+            # A passive declare reads the live count only on a channel that does not know the
+            # queue yet, and robust=False keeps it that way and out of aio-pika's restore list.
+            declared_queue = await temp_channel.declare_queue(name=queue_name, passive=True, robust=False)
 
             if declared_queue.declaration_result.message_count > 0:
                 queues_with_messages.append((data_type, declared_queue.declaration_result.message_count))
 
-        if queues_with_messages:
-            total_messages = sum(count for _, count in queues_with_messages)
-            logger.info(
-                "📬 Found messages in queues, restarting consumers",
-                queues=queues_with_messages,
-                total_messages=total_messages,
-            )
+        # An empty queue does not mean the work is done: the extractor may simply not have
+        # published yet. Only a loader whose files all completed may stay disconnected.
+        incomplete_types = [data_type for data_type in DATA_TYPES if data_type not in completed_files]
+        if queues_with_messages or incomplete_types:
+            if queues_with_messages:
+                logger.info(
+                    "📬 Found messages in queues, restarting consumers",
+                    queues=queues_with_messages,
+                    total_messages=sum(count for _, count in queues_with_messages),
+                )
+            else:
+                logger.info("🔌 Queues are empty but files are incomplete, restarting consumers", incomplete_types=incomplete_types)
 
             # Re-establish full connection and start consuming
 
@@ -958,7 +973,7 @@ async def _recover_consumers() -> None:
             idle_mode = False
             # Don't close temp_connection since we're using it as active_connection
         else:
-            logger.info("⏳ No messages in any queue, connection remains closed")
+            logger.info("⏳ No messages in any queue and all files complete, connection remains closed")
             await _close_recovery_broker()
 
     except asyncio.CancelledError:

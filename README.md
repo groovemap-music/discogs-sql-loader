@@ -40,7 +40,8 @@ and installs the wheel, checks licenses, and previews the next version. Tests do
 connect to live PostgreSQL or RabbitMQ services.
 
 Run `just test-integration` to run the PostgreSQL-backed suites against a pinned,
-disposable PostgreSQL 18 container. The lane applies the pinned `database-schema`
+disposable PostgreSQL 18 container, then `just test-consumer-recovery`, which proves
+consumer loss and recovery on a disposable RabbitMQ with the loader's quorum queues. The lane applies the pinned `database-schema`
 initializer once, then exercises single-record and batch upserts in a unique synthetic
 schema (JSONB round trips and `ON CONFLICT` updates), the `graph` vertex and edge
 writes, the derived counters, and the durable derived-refresh worker. It removes the
