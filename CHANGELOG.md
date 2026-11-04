@@ -3,6 +3,14 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.4.2 (2026-11-04)
+
+### Fix
+
+- **tableinator**: detect lost consumers from real frames and always reattach
+- **postgres**: default batch hold to 1500 s and budget it under consumer_timeout
+- **postgres**: adopt shared failure classifier and bound held batch deliveries
+
 ## v0.4.1 (2026-11-04)
 
 ### Fix
