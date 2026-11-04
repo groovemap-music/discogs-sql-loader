@@ -3,6 +3,12 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.4.1 (2026-11-04)
+
+### Fix
+
+- **tableinator**: dead-letter permanent PostgreSQL errors and recover cancelled consumers
+
 ## v0.4.0 (2026-10-31)
 
 ### Operator notes
