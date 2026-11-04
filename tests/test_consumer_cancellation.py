@@ -309,3 +309,32 @@ async def test_failed_channel_open_keeps_temporary_connection_for_cleanup_retry(
     assert service.active_connection is connection
     assert service.active_channel is None
     assert service.consumer_cancellation_failed
+
+
+@pytest.mark.asyncio
+async def test_broker_cancelled_consumers_are_detected_and_recovered() -> None:
+    """A closed channel (ack timeout) leaves stale tags; the checker must still recover."""
+    service.consumer_tags["labels"] = "stale-tag"
+    service.queues["labels"] = MagicMock()
+    service.active_channel = MagicMock(is_closed=True)
+    service.shutdown_requested = False
+    assert await service.consumers_lost_at_broker()
+
+    async def recovered() -> None:
+        service.shutdown_requested = True
+
+    with patch.object(service, "STUCK_CHECK_INTERVAL", 0), patch.object(service, "_recover_consumers", side_effect=recovered) as recover:
+        await asyncio.wait_for(service.periodic_queue_checker(), timeout=0.5)
+    recover.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_zero_broker_consumer_count_is_detected_but_healthy_count_is_not() -> None:
+    service.consumer_tags["labels"] = "tag"
+    service.queues["labels"] = MagicMock()
+    service.shutdown_requested = False
+    service.completed_files.discard("labels")
+    for count, lost in ((0, True), (1, False)):
+        queue = MagicMock(declaration_result=MagicMock(consumer_count=count))
+        service.active_channel = MagicMock(is_closed=False, declare_queue=AsyncMock(return_value=queue))
+        assert await service.consumers_lost_at_broker() is lost

@@ -12,7 +12,7 @@ import pytest
 from common.batch import AsyncBatchEngine
 from common.db_resilience import DatabaseUnavailableError
 from common.delivery import FailureKind
-from psycopg.errors import DataError, InterfaceError, OperationalError
+from psycopg.errors import AdminShutdown, ConnectionFailure, DataError, InterfaceError, OperationalError, ProgramLimitExceeded, SerializationFailure
 
 from tableinator.batch_processor import (
     DATA_TYPES,
@@ -93,6 +93,17 @@ class TestPolicyAdapters:
     @pytest.mark.parametrize("error", [DataError("bad cast"), ValueError("bad payload"), RuntimeError("missing identity")])
     def test_deterministic_data_failures_are_not_retried_as_outages(self, error: BaseException) -> None:
         assert PostgreSQLFailureClassifier()(error) is FailureKind.DETERMINISTIC
+
+    def test_program_limit_exceeded_is_an_operational_error_yet_deterministic(self) -> None:
+        error = ProgramLimitExceeded('index row size 2888 exceeds btree version 4 maximum 2704 for index "person_pkey"')
+        assert isinstance(error, OperationalError)
+        assert error.sqlstate == "54000"
+        assert PostgreSQLFailureClassifier()(error) is FailureKind.DETERMINISTIC
+
+    @pytest.mark.parametrize("error", [AdminShutdown("terminating"), ConnectionFailure("server closed"), SerializationFailure("retry")])
+    def test_connection_class_sqlstates_stay_transient(self, error: BaseException) -> None:
+        assert getattr(error, "sqlstate", None) is not None
+        assert PostgreSQLFailureClassifier()(error) is FailureKind.TRANSIENT
 
     @pytest.mark.asyncio
     async def test_sink_preserves_outcome_sets_and_precedence(self) -> None:
@@ -390,3 +401,98 @@ class TestSharedEngineSafety:
         assert await processor.flush_all()
         ack.assert_awaited_once()
         assert processor.get_stats()["shutdown"] is True
+
+
+class TestPoisonIsolation:
+    @pytest.mark.asyncio
+    async def test_one_oversized_record_is_dead_lettered_and_the_rest_commit(self) -> None:
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=5))
+        committed: list[str] = []
+
+        async def write(_key: str, batch: list[PendingMessage]) -> BatchWriteResult:
+            if any(m.data_id == "bad" for m in batch):
+                raise ProgramLimitExceeded("index row size 2888 exceeds btree version 4 maximum 2704")
+            committed.extend(m.data_id for m in batch)
+            return result()
+
+        processor._process_batch = AsyncMock(side_effect=write)  # type: ignore[method-assign]
+        acks = {i: AsyncMock() for i in ("a", "b", "bad", "c", "d")}
+        nacks = {i: AsyncMock() for i in acks}
+        with patch("tableinator.batch_processor.logger") as log:
+            for i in acks:
+                await processor.add_message("artists", {"id": i}, acks[i], nacks[i])
+
+        assert sorted(committed) == ["a", "b", "c", "d"]
+        assert all(acks[i].await_count == 1 for i in ("a", "b", "c", "d"))
+        assert acks["bad"].await_count == 0
+        nacks["bad"].assert_awaited_once()
+        assert all(nacks[i].await_count == 0 for i in ("a", "b", "c", "d"))
+        assert processor.had_dlq_nacks("artists")
+        assert processor.get_stats()["pending"]["artists"] == 0
+        dlq = [c for c in log.error.call_args_list if "dead-lettered" in c.args[0]]
+        assert len(dlq) == 1
+        assert dlq[0].kwargs["data_type"] == "artists"
+        assert dlq[0].kwargs["record_id"] == "bad"
+        assert dlq[0].kwargs["sqlstate"] == "54000"
+
+    @pytest.mark.asyncio
+    async def test_consumer_continues_with_the_next_batch_after_a_poison_record(self) -> None:
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=2))
+
+        async def write(_key: str, batch: list[PendingMessage]) -> BatchWriteResult:
+            if any(m.data_id == "bad" for m in batch):
+                raise ProgramLimitExceeded("too big")
+            return result()
+
+        processor._process_batch = AsyncMock(side_effect=write)  # type: ignore[method-assign]
+        acks = [AsyncMock() for _ in range(4)]
+        for i, ack in zip(("bad", "a", "b", "c"), acks, strict=True):
+            await processor.add_message("artists", {"id": i}, ack, AsyncMock())
+        await processor.flush_queue("artists")
+        assert [a.await_count for a in acks] == [0, 1, 1, 1]
+
+    @pytest.mark.asyncio
+    async def test_connection_failure_during_isolation_is_retried_not_dead_lettered(self) -> None:
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=2))
+        calls = {"n": 0}
+
+        async def write(_key: str, _batch: list[PendingMessage]) -> BatchWriteResult:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ProgramLimitExceeded("too big")
+            if calls["n"] == 2:
+                raise AdminShutdown("terminating connection due to administrator command")
+            return result()
+
+        processor._process_batch = AsyncMock(side_effect=write)  # type: ignore[method-assign]
+        ack, nack = AsyncMock(), AsyncMock()
+        await processor.add_message("artists", {"id": "1"}, ack, nack)
+        await processor.add_message("artists", {"id": "2"}, AsyncMock(), AsyncMock())
+        nack.assert_not_awaited()
+        assert processor.get_stats()["pending"]["artists"] == 2
+        assert processor.get_stats()["transient_failures"]["artists"] == 1
+
+    @pytest.mark.asyncio
+    async def test_admin_shutdown_alone_is_retried_not_dead_lettered(self) -> None:
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=1))
+        processor._process_batch = AsyncMock(side_effect=[AdminShutdown("down"), result()])  # type: ignore[method-assign]
+        ack, nack = AsyncMock(), AsyncMock()
+        await processor.add_message("artists", {"id": "1"}, ack, nack)
+        nack.assert_not_awaited()
+        assert await processor.flush_queue("artists")
+        ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_lone_oversized_record_is_dead_lettered_after_bounded_attempts_naming_id_and_sqlstate(self) -> None:
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=1, max_poison_retries=3))
+        processor._process_batch = AsyncMock(side_effect=ProgramLimitExceeded("index row size 2888 exceeds btree"))  # type: ignore[method-assign]
+        ack, nack = AsyncMock(), AsyncMock()
+        with patch("tableinator.batch_processor.logger") as log:
+            await processor.add_message("releases", {"id": "r-1"}, ack, nack)
+        assert processor._process_batch.await_count == 3  # type: ignore[attr-defined]
+        nack.assert_awaited_once()
+        ack.assert_not_awaited()
+        final = [c for c in log.error.call_args_list if "Poison batch nacked" in c.args[0]][0]
+        assert final.kwargs["data_type"] == "releases"
+        assert final.kwargs["record_ids"] == ["r-1"]
+        assert final.kwargs["sqlstate"] == "54000"

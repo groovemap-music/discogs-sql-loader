@@ -678,6 +678,33 @@ async def check_consumers_unexpectedly_dead() -> bool:
     return no_active_consumers and files_incomplete and has_processed_messages
 
 
+async def consumers_lost_at_broker() -> bool:
+    """Detect consumers the broker cancelled without this process noticing.
+
+    A delivery-acknowledgement timeout (PRECONDITION_FAILED) closes the channel and a
+    broker-initiated basic.cancel drops the consumer, yet ``consumer_tags`` still lists
+    the tags, so the zero-tag predicate in :func:`check_consumers_unexpectedly_dead`
+    never fires and the queue sits at 0 consumers. This reads the broker's own view.
+    """
+    if not consumer_tags or active_channel is None or shutdown_requested:
+        return False
+    if getattr(active_channel, "is_closed", False) is True:
+        return True
+    pending = [data_type for data_type in consumer_tags if data_type not in completed_files and data_type in queues]
+    for data_type in pending:
+        try:
+            declared = await asyncio.wait_for(
+                active_channel.declare_queue(name=catalog_queue_name(AMQP_CONSUMER_NAME, data_type), passive=True),
+                timeout=CONSUMER_CANCEL_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("⚠️ Could not read broker consumer count", data_type=data_type, error_type=type(exc).__name__)
+            return getattr(active_channel, "is_closed", False) is True
+        if declared.declaration_result.consumer_count == 0:
+            return True
+    return False
+
+
 async def periodic_queue_checker() -> None:
     """Periodically check queue health and recover from stuck states.
 
@@ -705,6 +732,15 @@ async def periodic_queue_checker() -> None:
                 continue
 
             current_time = time.time()
+
+            if await consumers_lost_at_broker():
+                logger.error(
+                    "❌ Broker cancelled our consumers (channel closed or consumer_count=0). Re-establishing consumption...",
+                    active_consumers=len(consumer_tags),
+                    completed_files=list(completed_files),
+                )
+                await _recover_consumers()
+                continue
 
             # Check for stuck state (consumers died but work remains)
             if await check_consumers_unexpectedly_dead():
