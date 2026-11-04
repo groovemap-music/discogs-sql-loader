@@ -27,10 +27,11 @@ from common import (
     shutdown_telemetry,
     start_event_loop_monitor,
 )
+from common.postgres_resilient import PostgreSQLFailureClassifier
 from orjson import loads
 
 from tableinator import telemetry
-from tableinator.batch_processor import BatchConfig, PostgreSQLBatchProcessor, PostgreSQLFailureClassifier
+from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
 )
@@ -279,6 +280,9 @@ batch_processor: PostgreSQLBatchProcessor | None = None
 BATCH_MODE = os.environ.get("POSTGRES_BATCH_MODE", "true").lower() == "true"
 BATCH_SIZE = int(os.environ.get("POSTGRES_BATCH_SIZE", "100"))
 BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.0"))
+# Held-delivery bound: deliveries waiting out PostgreSQL backoff longer than this go back to RabbitMQ
+# with requeue=True. BatchConfig rejects values that could reach the broker consumer_timeout (lux: 30 minutes).
+BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
 
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12
@@ -1313,6 +1317,9 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 # non-batch validation path above. Transient failures are handled
                 # by _flush_queue's re-enqueue+backoff, which never nacks.
                 nack_callback=lambda: message.nack(requeue=False),
+                # A delivery held in PostgreSQL backoff past BATCH_MAX_HOLD_S goes back to the
+                # broker, which redelivers it later. It is never acked or dropped.
+                requeue_callback=lambda: message.nack(requeue=True),
             )
 
             # Only update progress tracking when message was actually accepted
@@ -1654,6 +1661,7 @@ async def main() -> None:
         batch_config = BatchConfig(
             batch_size=BATCH_SIZE,
             flush_interval=BATCH_FLUSH_INTERVAL,
+            max_hold_s=BATCH_MAX_HOLD_S,
         )
         batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config, write_admission)
         logger.info(

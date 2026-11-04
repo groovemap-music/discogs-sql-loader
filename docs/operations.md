@@ -78,6 +78,7 @@ preferred for deployed containers.
 | `POSTGRES_BATCH_MODE` | `true` | Enable transactional batch writes |
 | `POSTGRES_BATCH_SIZE` | `100` | Records that trigger a batch flush |
 | `POSTGRES_BATCH_FLUSH_INTERVAL` | `5.0` seconds | Time that triggers a batch flush |
+| `POSTGRES_BATCH_MAX_HOLD_S` | `1500` seconds | Longest a delivery waits out PostgreSQL backoff before it is returned to RabbitMQ with `requeue=True`. Startup rejects values where hold + flush interval + `backoff_max` (30 s) reach the 1800 s lux `consumer_timeout`. Each requeue uses one of the queue's 20 `x-delivery-limit` deliveries, so this sets the outage the loader survives: about 8.3 hours at 1500 s. See `docs/shared-delivery-runtime.md`. |
 
 ### Lifecycle and health
 

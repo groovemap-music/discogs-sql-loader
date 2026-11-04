@@ -20,9 +20,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from common import WriteAdmission, normalize_record
 from common.batch import AsyncBatchEngine, BatchItemResult, BatchPolicy
-from common.db_resilience import DatabaseUnavailableError
 from common.delivery import DeliveryResult, FailureKind, Settlement
-from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
+from common.postgres_resilient import PostgreSQLFailureClassifier
 
 from tableinator import telemetry
 from tableinator.batch_writer import BatchWriteResult, PostgreSQLBatchWriter
@@ -35,6 +34,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 DATA_TYPES = ("artists", "labels", "masters", "releases")
+# RabbitMQ consumer_timeout on lux (30 minutes). A held delivery must be returned before it.
+BROKER_CONSUMER_TIMEOUT_S = 1800.0
+# 1500 s x 20 redeliveries (lux x-delivery-limit) = 30,000 s, about 8.3 hours of continuous outage
+# before the quorum queue dead-letters a healthy record. See docs/shared-delivery-runtime.md.
+DEFAULT_MAX_HOLD_S = 1500.0
 
 
 @dataclass
@@ -51,6 +55,23 @@ class BatchConfig:
     backoff_multiplier: float = 2.0
     max_flush_retries: int = 5
     max_poison_retries: int = 5
+    # Longest a delivery may be held in transient backoff before it is returned to RabbitMQ
+    # with requeue=True. None disables the bound. See __post_init__ for the budget it must meet.
+    max_hold_s: float | None = DEFAULT_MAX_HOLD_S
+
+    def __post_init__(self) -> None:
+        if self.max_hold_s is None:
+            return
+        # The engine checks holds at each flush entry, and run_periodic flushes every
+        # flush_interval. Budget for that gap and for the longest backoff sleep, so the
+        # bound is checked before a hold can reach the broker's consumer_timeout.
+        worst_case_s = self.max_hold_s + self.flush_interval + self.backoff_max
+        if worst_case_s >= BROKER_CONSUMER_TIMEOUT_S:
+            raise ValueError(
+                f"max_hold_s={self.max_hold_s:g} plus flush_interval={self.flush_interval:g} and "
+                f"backoff_max={self.backoff_max:g} can reach {worst_case_s:g} s, which is not below "
+                f"the {BROKER_CONSUMER_TIMEOUT_S:g} s consumer_timeout"
+            )
 
     def runtime_policy(self) -> BatchPolicy:
         """Return the transport-neutral policy consumed by the shared engine."""
@@ -65,6 +86,7 @@ class BatchConfig:
             backoff_multiplier=self.backoff_multiplier,
             max_drain_retries=self.max_flush_retries,
             max_poison_retries=self.max_poison_retries,
+            max_hold_s=self.max_hold_s,
         )
 
 
@@ -87,6 +109,9 @@ class PendingMessage:
 class _CallbackDelivery:
     ack_callback: Callable[[], Awaitable[None] | None]
     nack_callback: Callable[[], Awaitable[None] | None]
+    # Only set for deliveries the shared engine may return to the broker (max_hold_s). Without
+    # it a requeue request is a programming error, because the batch path otherwise retries in-process.
+    requeue_callback: Callable[[], Awaitable[None] | None] | None = None
 
     async def ack(self) -> None:
         result = self.ack_callback()
@@ -95,46 +120,13 @@ class _CallbackDelivery:
 
     async def nack(self, *, requeue: bool) -> None:
         if requeue:
-            raise ValueError("batch deliveries are retried in-process, not broker-requeued")
-        result = self.nack_callback()
+            if self.requeue_callback is None:
+                raise ValueError("batch deliveries are retried in-process, not broker-requeued")
+            result = self.requeue_callback()
+        else:
+            result = self.nack_callback()
         if inspect.isawaitable(result):
             await result
-
-
-class PostgreSQLFailureClassifier:
-    """Map owner-specific PostgreSQL failures onto the shared retry taxonomy."""
-
-    _TRANSIENT = (InterfaceError, OperationalError, DatabaseUnavailableError)
-    _DETERMINISTIC = (DataError, IntegrityError, ValueError, RuntimeError)
-    # SQLSTATE classes whose cause is the server, connection or its resources, so
-    # the same statement can succeed later: 08 connection exception, 40 rollback
-    # (serialization failure, deadlock), 53 insufficient resources, 55 object not
-    # in prerequisite state, 57 operator intervention (admin shutdown, cannot
-    # connect now, query cancel), 58 system error, F0 config file error.
-    _TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "55", "57", "58", "F0"})
-
-    def __call__(self, error: BaseException) -> FailureKind:
-        if isinstance(error, OperationalError) and self.is_data_dependent(error):
-            # psycopg raises e.g. ProgramLimitExceeded (54000, "index row size
-            # exceeds btree maximum") as an OperationalError subclass. It comes
-            # from the record, not the connection, so retrying can never help.
-            return FailureKind.DETERMINISTIC
-        if isinstance(error, self._TRANSIENT):
-            return FailureKind.TRANSIENT
-        if isinstance(error, self._DETERMINISTIC):
-            return FailureKind.DETERMINISTIC
-        # Preserve the historical safety posture for unknown infrastructure
-        # exceptions: retry rather than silently dead-lettering a valid record.
-        return FailureKind.TRANSIENT
-
-    @classmethod
-    def is_data_dependent(cls, error: BaseException) -> bool:
-        """True for a server-reported OperationalError that is not a connection-class failure."""
-        sqlstate = getattr(error, "sqlstate", None)
-        if not isinstance(sqlstate, str) or len(sqlstate) != 5:
-            # No server verdict (client-side connection loss, pool timeout): keep retrying.
-            return False
-        return sqlstate[:2] not in cls._TRANSIENT_SQLSTATE_CLASSES
 
 
 @dataclass
@@ -379,8 +371,12 @@ class PostgreSQLBatchProcessor:
         ack_callback: Callable[[], Awaitable[None] | None],
         nack_callback: Callable[[], Awaitable[None] | None],
         span_context: Any = None,
+        requeue_callback: Callable[[], Awaitable[None] | None] | None = None,
     ) -> bool:
-        """Normalize and submit one delivery; invalid input is rejected locally."""
+        """Normalize and submit one delivery; invalid input is rejected locally.
+
+        ``requeue_callback`` returns a held delivery to the broker once it exceeds ``max_hold_s``.
+        """
         started = time.perf_counter()
 
         async def reject(error_type: str) -> bool:
@@ -423,7 +419,7 @@ class PostgreSQLBatchProcessor:
         await self._engine.submit(
             data_type,
             pending,
-            _CallbackDelivery(ack_callback, nack_callback),
+            _CallbackDelivery(ack_callback, nack_callback, requeue_callback),
             span_context=span_context,
         )
         self._observer.accepted(data_type, started)

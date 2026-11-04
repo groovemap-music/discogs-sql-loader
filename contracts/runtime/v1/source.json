@@ -8,8 +8,8 @@
     "delivery-admission"
   ],
   "package": "groovemap-runtime",
-  "source_commit": "6d0425f908e01a446b040e2993045e2afe30460e",
+  "source_commit": "5459343ccaf46da5f71db11cda40d9338ce61d8d",
   "source_repository": "https://github.com/groovemap-music/python-libraries",
-  "source_tree": "abec17ef8df697bdb3b0495ac6186315d69f6b56",
+  "source_tree": "722fabc9ceab39fcfb0497b1c8a54ade84616a21",
   "version": "0.1.0"
 }
