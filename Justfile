@@ -59,6 +59,11 @@ test-admission-integration:
 benchmark-write-path *args:
     bash scripts/benchmark-write-path.sh {{args}}
 
+# First-load shaped run at scale (60k releases by default) with optional --defer-indexes and
+# BENCHMARK_PG_ARGS server settings. Disposable PostgreSQL. Documented in docs/first-load-index-and-wal.md.
+benchmark-first-load *args:
+    bash scripts/benchmark-first-load.sh {{args}}
+
 # What one poison record costs per batch size: acked, dead-lettered, writer calls. Disposable
 # PostgreSQL, same container recipe as benchmark-write-path. Documented in docs/write-path-benchmark.md.
 benchmark-poison *args:
