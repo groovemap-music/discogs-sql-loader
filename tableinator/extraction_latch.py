@@ -79,6 +79,7 @@ __all__ = [
     "LOADER_DISCRIMINATOR",
     "ExtractionLatch",
     "LatchRelation",
+    "consecutive_purge_vetoes",
     "extraction_latch_key",
     "mark_extraction_refreshed",
     "probe_latch_relation",
@@ -234,6 +235,12 @@ class LatchRelation:
             relation=self._relation(),
             key=self._key_predicate(),
             data_type=sql.Placeholder("data_type"),
+        )
+
+    def veto_history_statement(self) -> sql.Composed:
+        """Return every extraction's vetoes and signals for this loader, newest first."""
+        return sql.SQL("SELECT purge_vetoed, signals FROM {relation} WHERE {loader} = {value} ORDER BY version DESC").format(
+            relation=self._relation(), loader=sql.Identifier(LOADER_COLUMN), value=sql.Placeholder(LOADER_COLUMN)
         )
 
     def stamp_statement(self) -> sql.Composed:
@@ -408,6 +415,26 @@ async def purge_was_vetoed(connection_pool: Any, latch: LatchRelation, version: 
             await cursor.execute(latch.vetoed_statement(), latch.parameters(version, data_type))
             row = await cursor.fetchone()
     return bool(row and row[0])
+
+
+async def consecutive_purge_vetoes(connection_pool: Any, latch: LatchRelation, data_type: str) -> int:
+    """Return how many extractions in a row, newest first, vetoed DATA_TYPE's purge.
+
+    An extraction that signalled this type without a veto ends the run. One that never reached
+    this type says nothing either way, so it is passed over.
+    """
+    async with connection_pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            await cursor.execute(latch.veto_history_statement(), latch.parameters(""))
+            rows = await cursor.fetchall()
+    consecutive = 0
+    for vetoed, signals in rows:
+        if data_type in vetoed:
+            consecutive += 1
+        elif data_type in signals:
+            break
+    return consecutive
 
 
 async def record_extraction_signal(connection_pool: Any, latch: LatchRelation, version: str, data_type: str) -> ExtractionLatch:

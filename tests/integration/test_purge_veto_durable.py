@@ -36,6 +36,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration, pytest.mark.timeout(
 _DEAD_LETTERS_WAITING = service.dead_letters_waiting
 _PURGE_WAS_VETOED = service.purge_was_vetoed
 _RECORD_PURGE_VETO = service.record_purge_veto
+_CONSECUTIVE_PURGE_VETOES = service.consecutive_purge_vetoes
 
 DATA_TYPE = "artists"
 FRESH_IDS = ("2", "3", "4", "5")
@@ -165,6 +166,7 @@ async def stack() -> AsyncIterator[Stack]:
         patch.object(service, "dead_letters_waiting", _DEAD_LETTERS_WAITING),
         patch.object(service, "purge_was_vetoed", _PURGE_WAS_VETOED),
         patch.object(service, "record_purge_veto", _RECORD_PURGE_VETO),
+        patch.object(service, "consecutive_purge_vetoes", _CONSECUTIVE_PURGE_VETOES),
         patch.object(service, "connection_pool", pool),
         patch.object(service, "write_admission", admission),
         patch.object(service, "extraction_latch", latch),
@@ -264,3 +266,44 @@ async def test_clearing_the_dlq_lets_the_next_extraction_purge(stack: Stack) -> 
 
     assert await stack.rows() == len(FRESH_IDS)
     assert await stack.vetoed("20260301") == []
+
+
+async def test_two_vetoed_extractions_alert_across_a_restart_and_the_veto_still_holds(stack: Stack) -> None:
+    await stack.load_rows()
+    await poison(stack)
+    with patch.object(service.telemetry, "record_purge_consecutive_vetoes") as gauge, patch.object(service, "logger", wraps=service.logger) as logger:
+        await stack.signal("20260201")
+        assert gauge.call_args.args == (DATA_TYPE, 1)
+        assert logger.error.call_count == 0
+
+        with patch.object(service, "batch_processor", fresh_processor(stack.pool, service.write_admission)):
+            await stack.signal("20260301")
+
+        assert gauge.call_args.args == (DATA_TYPE, 2)
+        assert logger.error.call_count == 1
+    assert await stack.rows() == 1 + len(FRESH_IDS)
+
+
+async def test_one_veto_then_a_clean_purge_does_not_alert(stack: Stack) -> None:
+    await stack.load_rows()
+    await poison(stack)
+    with patch.object(service.telemetry, "record_purge_consecutive_vetoes") as gauge, patch.object(service, "logger", wraps=service.logger) as logger:
+        await stack.signal("20260201")
+        assert gauge.call_args.args == (DATA_TYPE, 1)
+        await stack.dlq.purge()
+        await stack.signal("20260301")
+        assert gauge.call_args.args == (DATA_TYPE, 0)
+        assert logger.error.call_count == 0
+    assert await stack.rows() == len(FRESH_IDS)
+
+
+async def test_a_non_batch_rejection_vetoes(stack: Stack) -> None:
+    """Non-batch mode has no in-memory flag at all, so the broker's DLQ is what carries the veto."""
+    await stack.load_rows()
+    with patch.object(service, "BATCH_MODE", False), patch.object(service, "batch_processor", None):
+        await stack.publish(dumps({"id": "99", "name": "bad\x00name", "sha256": "9" * 64}))
+        await stack.dead_lettered(1)
+        await stack.signal("20260201")
+
+    assert await stack.rows() == 1 + len(FRESH_IDS)
+    assert await stack.vetoed("20260201") == [DATA_TYPE]

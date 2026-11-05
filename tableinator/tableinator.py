@@ -55,6 +55,7 @@ from tableinator.durable_refresh import (
 )
 from tableinator.extraction_latch import (
     LatchRelation,
+    consecutive_purge_vetoes,
     extraction_latch_key,
     probe_latch_relation,
     purge_was_vetoed,
@@ -294,6 +295,10 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
 # Times a held delivery may go back to RabbitMQ before it is dead-lettered instead.
 BATCH_MAX_REQUEUES = int(os.environ.get("POSTGRES_BATCH_MAX_REQUEUES", str(DEFAULT_MAX_REQUEUES)))
+
+# Extractions in a row that may veto a type's purge before it is reported as an alert. Dumps are
+# a month apart, so one veto is a bad record to deal with and two mean stale rows are piling up.
+PURGE_VETO_ALERT_RUNS = 2
 
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12
@@ -1064,6 +1069,31 @@ async def persist_purge_veto(data_type: str, data: dict[str, Any]) -> bool:
     return True
 
 
+async def report_purge_vetoes(data_type: str) -> None:
+    """Report how many extractions in a row vetoed this type's purge, and shout at the threshold.
+
+    One veto followed by a clean purge is normal. A record rejected in every dump is not: its
+    veto protects a live row, but stale rows then never clear. Reporting must not hold up the
+    signal, so a failure here is only logged.
+    """
+    admission = write_admission
+    if connection_pool is None or extraction_latch is None or admission is None:
+        return
+    try:
+        async with admission.slot():
+            consecutive = await consecutive_purge_vetoes(connection_pool, extraction_latch, data_type)
+    except Exception as error:
+        logger.warning("⚠️ Could not count consecutive purge vetoes", data_type=data_type, error_type=type(error).__name__)
+        return
+    telemetry.record_purge_consecutive_vetoes(data_type, consecutive)
+    if consecutive >= PURGE_VETO_ALERT_RUNS:
+        logger.error(
+            "🚨 Stale-row purge vetoed on consecutive extractions, so stale rows are not clearing: see docs/operations.md",
+            data_type=data_type,
+            consecutive=consecutive,
+        )
+
+
 async def purge_stale_rows(data_type: str, started_at: str, record_count: int | None = None) -> None:
     """Delete rows not refreshed by the current extraction when safe."""
     if connection_pool is None:
@@ -1373,6 +1403,8 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 # whose records are still in the DLQ.
                 if purge_vetoed and batch_processor is not None:
                     batch_processor.reset_dlq_nacks(data_type)
+                # After the signal commits, because a clean run counts only once it is recorded.
+                await report_purge_vetoes(data_type)
                 record_terminal("processed")
             else:
                 if durable_handoff_failed and not await pause_durable_consumers(data_type, ordered_version(data.get("version"))):
@@ -1730,6 +1762,9 @@ async def main() -> None:
         # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
         # read-only. A miss is a logged degraded mode, never a reason to create the table.
         extraction_latch = await probe_latch_relation(connection_pool, logger)
+        # The gauge lives in this process, so a restart must not read as the problem going away.
+        for data_type in DATA_TYPES:
+            await report_purge_vetoes(data_type)
         if durable_refresh_active:
             durable_refresh_ready = await probe_durable_schema(connection_pool, logger)
             if durable_refresh_ready:

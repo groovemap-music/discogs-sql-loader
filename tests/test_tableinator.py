@@ -1083,7 +1083,10 @@ class TestMain:
             created_tasks.append(task)
             return task
 
-        with patch("asyncio.create_task", side_effect=mock_create_task):
+        with (
+            patch("asyncio.create_task", side_effect=mock_create_task),
+            patch("tableinator.tableinator.report_purge_vetoes", new_callable=AsyncMock) as report_purge_vetoes,
+        ):
             original_sleep = asyncio.sleep
 
             async def mock_sleep(delay: float) -> None:  # noqa: ARG001
@@ -1104,6 +1107,7 @@ class TestMain:
         mock_setup_telemetry.assert_called_once_with("tableinator")
         mock_shutdown_telemetry.assert_called_once_with()
         assert mock_record_consumer_started.call_count == 4  # one per DATA_TYPES entry
+        assert report_purge_vetoes.await_count == 4  # the startup re-read, one per DATA_TYPES entry
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.setup_logging")

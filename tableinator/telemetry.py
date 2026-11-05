@@ -45,6 +45,7 @@ PIPELINE_MESSAGE_DURATION = "groovemap.pipeline.message.duration"
 PIPELINE_BATCH_SIZE = "groovemap.pipeline.batch.size"
 PIPELINE_BATCH_FLUSH_DURATION = "groovemap.pipeline.batch.flush.duration"
 PIPELINE_CONSUMERS_ACTIVE = "groovemap.pipeline.consumers.active"
+PIPELINE_PURGE_CONSECUTIVE_VETOES = "groovemap.pipeline.purge.consecutive_vetoes"
 DERIVED_REFRESH_JOBS = "groovemap.derived_refresh.jobs"
 DERIVED_REFRESH_PENDING_AGE = "groovemap.derived_refresh.pending.age"
 DERIVED_REFRESH_ATTEMPTS = "groovemap.derived_refresh.attempts"
@@ -94,6 +95,10 @@ def _build_instruments() -> dict[str, Any]:
         PIPELINE_CONSUMERS_ACTIVE: meter.create_up_down_counter(
             PIPELINE_CONSUMERS_ACTIVE,
             description="Active RabbitMQ consumers held by this service.",
+        ),
+        PIPELINE_PURGE_CONSECUTIVE_VETOES: meter.create_gauge(
+            PIPELINE_PURGE_CONSECUTIVE_VETOES,
+            description="Extractions in a row that vetoed this entity's stale-row purge.",
         ),
         DERIVED_REFRESH_JOBS: meter.create_counter(
             DERIVED_REFRESH_JOBS,
@@ -204,6 +209,14 @@ def record_consumer_stopped() -> None:
         _instrument(PIPELINE_CONSUMERS_ACTIVE).add(-1, {"source": SOURCE})
     except Exception:  # pragma: no cover - defensive
         logger.debug("Could not record %s stop", PIPELINE_CONSUMERS_ACTIVE, exc_info=True)
+
+
+def record_purge_consecutive_vetoes(entity: str, count: int) -> None:
+    """Record how many extractions in a row vetoed this entity's stale-row purge."""
+    try:
+        _instrument(PIPELINE_PURGE_CONSECUTIVE_VETOES).set(count, {"loader": SOURCE, "entity": entity})
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not record %s", PIPELINE_PURGE_CONSECUTIVE_VETOES, exc_info=True)
 
 
 def record_derived_refresh_transition(outcome: str, duration_s: float) -> None:

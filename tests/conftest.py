@@ -360,7 +360,11 @@ def broker_holds_no_dead_letters(monkeypatch: pytest.MonkeyPatch) -> None:
     async def recorded(*_args: object) -> None:
         return None
 
+    async def no_vetoes(*_args: object) -> int:
+        return 0
+
     monkeypatch.setattr(service, "_real_dead_letters_waiting", service.dead_letters_waiting, raising=False)
     monkeypatch.setattr(service, "dead_letters_waiting", none_waiting)
     monkeypatch.setattr(service, "purge_was_vetoed", not_vetoed)
     monkeypatch.setattr(service, "record_purge_veto", recorded)
+    monkeypatch.setattr(service, "consecutive_purge_vetoes", no_vetoes)
