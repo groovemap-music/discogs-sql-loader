@@ -1083,7 +1083,10 @@ class TestMain:
             created_tasks.append(task)
             return task
 
-        with patch("asyncio.create_task", side_effect=mock_create_task):
+        with (
+            patch("asyncio.create_task", side_effect=mock_create_task),
+            patch("tableinator.tableinator.report_purge_vetoes", new_callable=AsyncMock) as report_purge_vetoes,
+        ):
             original_sleep = asyncio.sleep
 
             async def mock_sleep(delay: float) -> None:  # noqa: ARG001
@@ -1104,6 +1107,7 @@ class TestMain:
         mock_setup_telemetry.assert_called_once_with("tableinator")
         mock_shutdown_telemetry.assert_called_once_with()
         assert mock_record_consumer_started.call_count == 4  # one per DATA_TYPES entry
+        assert report_purge_vetoes.await_count == 4  # the startup re-read, one per DATA_TYPES entry
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.setup_logging")
@@ -1530,6 +1534,35 @@ class TestOnDataMessageExtended:
 
         mock_message.ack.assert_awaited_once()
         mock_batch.reset_dlq_nacks.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_a_veto_that_cannot_be_recorded_requeues_the_signal(self) -> None:
+        """Acking would leave no record of the veto, so the signal goes back, and nothing is purged."""
+        from common import WriteAdmission
+
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_batch = AsyncMock()
+        mock_batch.had_dlq_nacks = MagicMock(return_value=True)
+        mock_batch.reset_dlq_nacks = MagicMock()
+        mock_message.body = json.dumps({"type": "extraction_complete", "version": "20260101", "started_at": "2026-01-01T00:00:00Z"}).encode()
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", mock_batch),
+            patch("tableinator.tableinator.purge_stale_rows", new_callable=AsyncMock) as mock_purge,
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.write_admission", WriteAdmission(1)),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
+            patch("tableinator.tableinator.record_extraction_signal", new=_one_type_signalled),
+            patch("tableinator.tableinator.record_purge_veto", new_callable=AsyncMock, side_effect=OSError("database down")),
+        ):
+            await on_data_message(mock_message, "artists")
+
+        mock_purge.assert_not_called()
+        mock_batch.reset_dlq_nacks.assert_not_called()
+        mock_message.nack.assert_awaited_once_with(requeue=True)
+        mock_message.ack.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
