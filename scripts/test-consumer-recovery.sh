@@ -41,4 +41,4 @@ fi
 rabbitmq_port="$(docker port "${rabbitmq_container}" 5672/tcp)"
 export TEST_AMQP_URL="amqp://guest:guest@127.0.0.1:${rabbitmq_port##*:}/"
 
-uv run pytest tests/integration/test_consumer_recovery.py -m integration --no-cov "$@"
+uv run pytest tests/integration/test_consumer_recovery.py tests/integration/test_redelivery_bound.py -m integration --no-cov "$@"

@@ -29,16 +29,18 @@ from tableinator.media import media_for_release
 
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator, Sequence
+    from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 
 
 logger = structlog.get_logger(__name__)
 DATA_TYPES = ("artists", "labels", "masters", "releases")
 # RabbitMQ consumer_timeout on lux (30 minutes). A held delivery must be returned before it.
 BROKER_CONSUMER_TIMEOUT_S = 1800.0
-# 1500 s x 20 redeliveries (lux x-delivery-limit) = 30,000 s, about 8.3 hours of continuous outage
-# before the quorum queue dead-letters a healthy record. See docs/shared-delivery-runtime.md.
 DEFAULT_MAX_HOLD_S = 1500.0
+# Requeues a held delivery may use before it is dead-lettered. RabbitMQ 4.3.5 and 4.4.0 do not
+# spend x-delivery-limit on nack(requeue=True), so the engine counts x-acquired-count instead.
+# 61 holds of 1500 s is about 25.4 hours of continuous failure. See docs/shared-delivery-runtime.md.
+DEFAULT_MAX_REQUEUES = 60
 
 
 @dataclass
@@ -58,6 +60,9 @@ class BatchConfig:
     # Longest a delivery may be held in transient backoff before it is returned to RabbitMQ
     # with requeue=True. None disables the bound. See __post_init__ for the budget it must meet.
     max_hold_s: float | None = DEFAULT_MAX_HOLD_S
+    # Times a held delivery may go back to RabbitMQ before it is dead-lettered. None keeps
+    # requeueing without a bound.
+    max_requeues: int | None = DEFAULT_MAX_REQUEUES
 
     def __post_init__(self) -> None:
         if self.max_hold_s is None:
@@ -87,6 +92,7 @@ class BatchConfig:
             max_drain_retries=self.max_flush_retries,
             max_poison_retries=self.max_poison_retries,
             max_hold_s=self.max_hold_s,
+            max_requeues=self.max_requeues,
         )
 
 
@@ -112,6 +118,8 @@ class _CallbackDelivery:
     # Only set for deliveries the shared engine may return to the broker (max_hold_s). Without
     # it a requeue request is a programming error, because the batch path otherwise retries in-process.
     requeue_callback: Callable[[], Awaitable[None] | None] | None = None
+    # The broker's headers, which is where the engine reads how often the message came back.
+    headers: Mapping[str, Any] | None = None
 
     async def ack(self) -> None:
         result = self.ack_callback()
@@ -205,11 +213,19 @@ class PostgreSQLBatchObserver:
             )
 
     def settled(self, *, entity: str, result: DeliveryResult, duration_s: float, span: Any) -> None:
+        """Record one terminal settlement.
+
+        The engine settles a delivery released from a hold outside any flush, so there may be no
+        flush state. A failure here is suppressed by the engine, so it must not depend on one: a
+        rejection that missed the veto below would let the purge delete a record still current.
+        """
         _ = duration_s, span
-        state = self._states[entity]
-        state.settled += 1
+        state = self._states.get(entity)
+        if state is not None:
+            state.settled += 1
         started_at = self._accepted_at[entity].popleft()
         terminal_duration = time.perf_counter() - started_at
+        error = state.error if state is not None else None
         if result.settlement is Settlement.ACK:
             outcome = result.outcome
             self.processed_counts[entity] += 1
@@ -217,15 +233,19 @@ class PostgreSQLBatchObserver:
                 self.media_backfilled_counts[entity] += 1
         else:
             outcome = "failed"
-            state.rejected += 1
-            self._had_dlq_nacks[entity] = True
-            if state.error is not None:
-                telemetry.mark_span_error(span, state.error)
+            if result.settlement is Settlement.REJECT:
+                self._had_dlq_nacks[entity] = True
+            if state is not None:
+                state.rejected += 1
+            if error is not None:
+                telemetry.mark_span_error(span, error)
 
-        error_type = type(state.error).__name__ if state.error is not None and outcome == "failed" else None
+        error_type = type(error).__name__ if error is not None and outcome == "failed" else result.error_type
         telemetry.record_message(entity, outcome, terminal_duration)
         telemetry.record_consumed_message(entity, terminal_duration, error_type)
 
+        if state is None:
+            return
         if state.settled == state.size:
             if state.rejected == 0:
                 self.batch_counts[entity] += 1
@@ -372,10 +392,12 @@ class PostgreSQLBatchProcessor:
         nack_callback: Callable[[], Awaitable[None] | None],
         span_context: Any = None,
         requeue_callback: Callable[[], Awaitable[None] | None] | None = None,
+        headers: Mapping[str, Any] | None = None,
     ) -> bool:
         """Normalize and submit one delivery; invalid input is rejected locally.
 
         ``requeue_callback`` returns a held delivery to the broker once it exceeds ``max_hold_s``.
+        ``headers`` are the broker's, which the requeue budget reads.
         """
         started = time.perf_counter()
 
@@ -419,7 +441,7 @@ class PostgreSQLBatchProcessor:
         await self._engine.submit(
             data_type,
             pending,
-            _CallbackDelivery(ack_callback, nack_callback, requeue_callback),
+            _CallbackDelivery(ack_callback, nack_callback, requeue_callback, headers),
             span_context=span_context,
         )
         self._observer.accepted(data_type, started)

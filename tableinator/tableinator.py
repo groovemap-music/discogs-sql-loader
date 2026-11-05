@@ -31,7 +31,7 @@ from common.postgres_resilient import PostgreSQLFailureClassifier
 from orjson import loads
 
 from tableinator import telemetry
-from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, BatchConfig, PostgreSQLBatchProcessor
+from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, DEFAULT_MAX_REQUEUES, BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
 )
@@ -97,10 +97,10 @@ progress_interval = 100  # Log progress every 100 messages
 last_message_time = {"artists": 0.0, "labels": 0.0, "masters": 0.0, "releases": 0.0}
 completed_files: set[str] = set()  # Track which files have completed processing
 
-# Non-batch mode only: throttles requeues while PostgreSQL is unavailable, so an
-# outage cannot burn the quorum queue's x-delivery-limit budget and dead-letter
-# valid records. Batch mode gets the same protection from _flush_queue's
-# re-enqueue+backoff, which never nacks.
+# Non-batch mode only: paces requeues while PostgreSQL is unavailable, because a nacked
+# message comes straight back. run_delivery counts x-acquired-count and dead-letters after
+# 500 requeues, about 8.3 hours at the 60 s cap. Batch mode holds deliveries in memory
+# instead, and BatchConfig.max_requeues bounds how often a hold goes back to the broker.
 outage_backoff = OutageBackoff(SERVICE_NAME)
 current_task = None
 current_progress = 0.0
@@ -285,6 +285,8 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 # Held-delivery bound: deliveries waiting out PostgreSQL backoff longer than this go back to RabbitMQ
 # with requeue=True. BatchConfig rejects values that could reach the broker consumer_timeout (lux: 30 minutes).
 BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
+# Times a held delivery may go back to RabbitMQ before it is dead-lettered instead.
+BATCH_MAX_REQUEUES = int(os.environ.get("POSTGRES_BATCH_MAX_REQUEUES", str(DEFAULT_MAX_REQUEUES)))
 
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12
@@ -449,8 +451,8 @@ async def cancel_all_consumers() -> None:
 async def pause_durable_consumers(data_type: str, version: str) -> bool:
     """Close every delivery tap before requeueing a failed durable terminal.
 
-    A quorum queue counts every nack/redelivery. Leaving a subscriber in place
-    can spend its 20-delivery limit in seconds while PostgreSQL is unavailable.
+    A nack does not spend x-delivery-limit, so nothing stops a subscribed consumer
+    redelivering it hundreds of times a second while PostgreSQL is unavailable.
     Return false when broker cancellation is uncertain; the caller must leave its
     message unacked rather than risk a hot requeue.
     """
@@ -1055,10 +1057,9 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
     if shutdown_requested:
         # Leave the delivery UNACKED — never nack(requeue=True) here. The
         # consumer is still subscribed at this point, so a requeue is redelivered
-        # within milliseconds and nacked again, burning a quorum x-delivery-count
-        # per cycle; at x-delivery-limit=20 valid records are dead-lettered within
-        # a second of a routine restart. Returning without settling lets the
-        # connection close requeue them exactly once.
+        # within milliseconds and nacked again, in a hot loop that nothing ends.
+        # Returning without settling lets the connection close requeue them
+        # exactly once, which spends one x-delivery-count.
         logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
         return
 
@@ -1147,12 +1148,12 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             # so its row's updated_at was never refreshed and would otherwise look
             # stale and get purged — deleting a still-current record beyond the DLQ.
             purge_ok = True
-            if batch_processor is not None and batch_processor.had_dlq_nacks(data_type):
+            purge_vetoed = batch_processor is not None and batch_processor.had_dlq_nacks(data_type)
+            if purge_vetoed:
                 logger.warning(
                     "⚠️ Skipping stale row purge — messages were nacked to the DLQ this run, so some dump-present rows may not have been refreshed",
                     data_type=data_type,
                 )
-                batch_processor.reset_dlq_nacks(data_type)
             elif connection_pool is not None:
                 try:
                     record_counts = data.get("record_counts", {})
@@ -1289,6 +1290,11 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     await schedule_consumer_cancellation(data_type, queues[data_type])
 
                 await message.ack()
+                # Only now is the veto spent. Cleared any earlier, a failed commit or ack
+                # would redeliver this signal with the veto gone, and it would purge rows
+                # whose records are still in the DLQ.
+                if purge_vetoed and batch_processor is not None:
+                    batch_processor.reset_dlq_nacks(data_type)
                 record_terminal("processed")
             else:
                 if durable_handoff_failed and not await pause_durable_consumers(data_type, ordered_version(data.get("version"))):
@@ -1327,14 +1333,15 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 span_context=telemetry.span_context_of(span),
                 # requeue=False: this callback nacks permanently-invalid input
                 # (unknown data_type, missing 'id', normalize failure, poison
-                # batch) — send it straight to the DLQ instead of cycling
-                # x-delivery-limit (20) futile redeliveries. Matches the
-                # non-batch validation path above. Transient failures are handled
-                # by _flush_queue's re-enqueue+backoff, which never nacks.
+                # batch) — send it straight to the DLQ instead of retrying what
+                # cannot succeed. Matches the non-batch validation path above.
+                # Transient failures are held in memory and retried in-process.
                 nack_callback=lambda: message.nack(requeue=False),
                 # A delivery held in PostgreSQL backoff past BATCH_MAX_HOLD_S goes back to the
-                # broker, which redelivers it later. It is never acked or dropped.
+                # broker, which redelivers it later. The engine counts those returns from
+                # these headers and dead-letters one past BatchConfig.max_requeues.
                 requeue_callback=lambda: message.nack(requeue=True),
+                headers=getattr(message, "headers", None),
             )
 
             # Only update progress tracking when message was actually accepted
@@ -1677,6 +1684,7 @@ async def main() -> None:
             batch_size=BATCH_SIZE,
             flush_interval=BATCH_FLUSH_INTERVAL,
             max_hold_s=BATCH_MAX_HOLD_S,
+            max_requeues=BATCH_MAX_REQUEUES,
         )
         batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config, write_admission)
         logger.info(
@@ -1797,7 +1805,7 @@ async def main() -> None:
             queues[data_type] = queue
 
         # Missing durable schema is a hard subscription gate. Merely requeueing
-        # terminal deliveries while subscribed burns the quorum delivery limit.
+        # terminal deliveries while subscribed would redeliver them in a hot loop.
         if not durable_refresh_active or durable_refresh_ready:
             for data_type in DATA_TYPES:
                 handler = make_data_handler(data_type)

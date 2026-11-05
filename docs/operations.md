@@ -78,7 +78,8 @@ preferred for deployed containers.
 | `POSTGRES_BATCH_MODE` | `true` | Enable transactional batch writes |
 | `POSTGRES_BATCH_SIZE` | `100` | Records that trigger a batch flush |
 | `POSTGRES_BATCH_FLUSH_INTERVAL` | `5.0` seconds | Time that triggers a batch flush |
-| `POSTGRES_BATCH_MAX_HOLD_S` | `1500` seconds | Longest a delivery waits out PostgreSQL backoff before it is returned to RabbitMQ with `requeue=True`. Startup rejects values where hold + flush interval + `backoff_max` (30 s) reach the 1800 s lux `consumer_timeout`. Each requeue uses one of the queue's 20 `x-delivery-limit` deliveries, so this sets the outage the loader survives: about 8.3 hours at 1500 s. See `docs/shared-delivery-runtime.md`. |
+| `POSTGRES_BATCH_MAX_HOLD_S` | `1500` seconds | Longest a delivery waits out PostgreSQL backoff before it is returned to RabbitMQ with `requeue=True`. Startup rejects values where hold + flush interval + `backoff_max` (30 s) reach the 1800 s lux `consumer_timeout`. Together with `POSTGRES_BATCH_MAX_REQUEUES` this sets the outage the loader survives: 61 holds, about 25.4 hours at 1500 s. See `docs/shared-delivery-runtime.md`. |
+| `POSTGRES_BATCH_MAX_REQUEUES` | `60` | Times a held delivery goes back to RabbitMQ before it is dead-lettered instead, counted from the broker's `x-acquired-count`. Restarts and channel closes spend the same count. Must be at least 1. See `docs/shared-delivery-runtime.md`. |
 
 ### Lifecycle and health
 
@@ -220,8 +221,8 @@ belongs to the separate `deployment` repository.
 - Terminal delivery is requeued: the pending batch did not commit; inspect PostgreSQL
   availability before retrying.
 - Durable terminal delivery is requeued: consumers are paused first, so the queued
-  message cannot hot-loop through its 20-delivery limit (the most times RabbitMQ redelivers a
-  message before dead-lettering it). Inspect the schema probe,
+  message cannot hot-loop. A nack does not spend `x-delivery-limit`, so nothing else would stop
+  it. Inspect the schema probe,
   legacy-latch reconciliation (at startup, extraction latch rows written before durable refresh
   get a generation, and rows with all four signals that are not yet refreshed become refresh
   jobs; rows older than the current version are skipped), and signal-commit logs. Recovery probes the failed

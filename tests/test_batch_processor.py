@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from common.batch import AsyncBatchEngine
 from common.db_resilience import DatabaseUnavailableError
-from common.delivery import FailureKind
+from common.delivery import DeliveryResult, FailureKind, Settlement
 from psycopg.errors import AdminShutdown, ConnectionFailure, DataError, InterfaceError, OperationalError, ProgramLimitExceeded, SerializationFailure
 
 from tableinator.batch_processor import (
@@ -19,6 +19,7 @@ from tableinator.batch_processor import (
     BatchConfig,
     BatchWriteResult,
     PendingMessage,
+    PostgreSQLBatchObserver,
     PostgreSQLBatchProcessor,
     PostgreSQLBatchSink,
     PostgreSQLFailureClassifier,
@@ -66,7 +67,7 @@ class TestPolicyAdapters:
     def test_runtime_is_pinned_to_the_reviewed_revision(self) -> None:
         pyproject = Path("pyproject.toml").read_text()
         lock = Path("uv.lock").read_text()
-        revision = "ecde48bdc30784ee0370166463f1d1a466544f35"
+        revision = "87c0d75ca457bd38b14e6ce6f713098a2b4c5e26"
         assert revision in pyproject
         assert f"#{revision}" in lock
 
@@ -563,3 +564,23 @@ class TestPoisonIsolation:
         assert final.kwargs["data_type"] == "releases"
         assert final.kwargs["record_ids"] == ["r-1"]
         assert final.kwargs["sqlstate"] == "54000"
+
+
+def test_a_rejection_outside_a_flush_still_vetoes_the_purge() -> None:
+    """A hold's budget ends outside any flush; the engine suppresses failures in ``settled``."""
+    observer = PostgreSQLBatchObserver()
+    observer.accepted("artists", 0.0)
+    observer.settled(entity="artists", result=DeliveryResult(Settlement.REJECT, "redelivery_exhausted"), duration_s=0.0, span=None)
+    assert observer.had_dlq_nacks("artists")
+
+
+def test_a_hold_returned_to_the_broker_does_not_veto_the_purge() -> None:
+    observer = PostgreSQLBatchObserver()
+    observer.accepted("artists", 0.0)
+    observer.settled(entity="artists", result=DeliveryResult(Settlement.REQUEUE, "held_timeout"), duration_s=0.0, span=None)
+    assert not observer.had_dlq_nacks("artists")
+    assert not observer._accepted_at["artists"]
+
+
+def test_the_requeue_budget_reaches_the_engine_policy() -> None:
+    assert BatchConfig().runtime_policy().max_requeues == 60

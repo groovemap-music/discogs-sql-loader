@@ -1475,6 +1475,64 @@ class TestOnDataMessageExtended:
 
     @pytest.mark.asyncio
     @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_a_failed_commit_keeps_the_purge_veto_for_the_redelivery(self) -> None:
+        """The signal goes back, so it must still skip the purge when it comes round again.
+
+        Records in the DLQ never refreshed their rows. Clearing the veto before the commit
+        would let the redelivered signal purge exactly those rows.
+        """
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_batch = AsyncMock()
+        mock_batch.had_dlq_nacks = MagicMock(return_value=True)
+        mock_batch.reset_dlq_nacks = MagicMock()
+        mock_message.body = json.dumps({"type": "extraction_complete", "version": "20260101", "started_at": "2026-01-01T00:00:00Z"}).encode()
+        from common import WriteAdmission
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", mock_batch),
+            patch("tableinator.tableinator.purge_stale_rows", new_callable=AsyncMock) as mock_purge,
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.durable_refresh_active", True),
+            patch("tableinator.tableinator.durable_refresh_ready", True),
+            patch("tableinator.tableinator.write_admission", WriteAdmission(1)),
+            patch("tableinator.tableinator.pause_durable_consumers", new_callable=AsyncMock, return_value=True),
+            patch("tableinator.tableinator.record_durable_signal", new_callable=AsyncMock, side_effect=OSError("commit failed")),
+        ):
+            await on_data_message(mock_message, "artists")
+
+        mock_purge.assert_not_called()
+        mock_batch.reset_dlq_nacks.assert_not_called()
+        mock_message.nack.assert_awaited_once_with(requeue=True)
+        mock_message.ack.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
+    async def test_a_failed_ack_keeps_the_purge_veto_for_the_redelivery(self) -> None:
+        """A signal whose ack failed comes back, so the veto must still be armed for it."""
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.ack.side_effect = ConnectionError("channel closed")
+        mock_batch = AsyncMock()
+        mock_batch.had_dlq_nacks = MagicMock(return_value=True)
+        mock_batch.reset_dlq_nacks = MagicMock()
+        mock_message.body = json.dumps({"type": "extraction_complete", "version": "20260101", "started_at": "2026-01-01T00:00:00Z"}).encode()
+
+        with (
+            patch("tableinator.tableinator.logger"),
+            patch("tableinator.tableinator.batch_processor", mock_batch),
+            patch("tableinator.tableinator.purge_stale_rows", new_callable=AsyncMock),
+            patch("tableinator.tableinator.connection_pool", MagicMock()),
+            patch("tableinator.tableinator.record_extraction_signal", new=_one_type_signalled),
+            patch("tableinator.tableinator.extraction_latch", _DECLARED_LATCH),
+            contextlib.suppress(ConnectionError),
+        ):
+            await on_data_message(mock_message, "artists")
+
+        mock_message.ack.assert_awaited_once()
+        mock_batch.reset_dlq_nacks.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("tableinator.tableinator.shutdown_requested", False)
     async def test_extraction_complete_flushes_batches(self) -> None:
         """Test extraction_complete flushes batch processor."""
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
