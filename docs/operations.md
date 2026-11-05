@@ -157,6 +157,16 @@ cause is fixed, so their rows refresh, or purge the DLQ from the operations cons
 nothing deletes a row until the next extraction, and that extraction refreshes every record still
 in the dump. The next extraction then purges normally.
 
+**`Stale-row purge vetoed on consecutive extractions`.** The gauge
+`groovemap.pipeline.purge.consecutive_vetoes` counts the extractions in a row that vetoed an
+entity's purge, from `purge_vetoed`, so it survives restarts and is read again at startup. From 2 the
+loader logs this line at error level on every signal. It means a dead letter has stayed for two dumps,
+or a record is rejected in every dump, and stale rows for that entity are not clearing. The veto is
+right to hold: it protects live rows. Read the entity's `.dlq` and find why the records fail. Fix the
+cause and replay them, or clear the DLQ if they are not wanted, as above. The next extraction then
+purges and the gauge returns to 0. A single veto followed by a clean purge does not reach the threshold.
+The Grafana rule lives in `deployment`.
+
 This loader requires the `purge_vetoed` column. Against an older schema the startup probe declines
 the latch and the service reports degraded, so the `database-schema` release carrying the column
 must reach the host first.
