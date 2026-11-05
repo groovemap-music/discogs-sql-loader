@@ -416,16 +416,6 @@ EXPECTED_DIFFERENCES: Final[dict[str, ExpectedDifference]] = {
         ),
         only_in_neo4j=frozenset({("pp-a5", "pp-a1")}),
     ),
-    "credited_on": ExpectedDifference(
-        reason=(
-            "`credited_on` is release-scoped, so the loader deletes the release's rows before "
-            "re-inserting the current set and a credit removed upstream goes. The enricher "
-            "MERGEs CREDITED_ON without a matching prune, so every superseded credit stays. "
-            "The two rows here are the artist-linked credit and the second role of the person "
-            "the corrected release still credits once."
-        ),
-        only_in_neo4j=frozenset({("First Member", "pp-r1", "Producer", "production"), ("A Producer", "pp-r1", "Mastered By", "mastering")}),
-    ),
     "in_family": ExpectedDifference(
         reason=(
             "`graph.in_family` is a view over `graph.medium.family`, so a medium belongs to "
