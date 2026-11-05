@@ -114,8 +114,7 @@ def main() -> None:
     dsn = os.environ.get("TEST_DATABASE_URL")
     if not dsn:
         parser.error("TEST_DATABASE_URL is required (a disposable database)")
-    if not args.allow_remote_host and not _WRITE_PATH.is_local_host(dsn):
-        parser.error("TEST_DATABASE_URL host is not loopback or a Unix socket; pass --allow-remote-host only for a disposable remote database")
+    _WRITE_PATH.require_local_database(dsn, allow_remote=args.allow_remote_host)
     asyncio.run(run(args, dsn))
 
 
