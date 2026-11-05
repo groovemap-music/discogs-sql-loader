@@ -53,6 +53,12 @@ test-consumer-recovery:
 test-admission-integration:
     bash scripts/test-admission-integration.sh
 
+# Write-path throughput on a disposable PostgreSQL: synthetic releases through the real batch
+# writer, one JSON line out. Arguments pass through (--releases, --batch-size, --workers, --seed).
+# Opt-in and outside `check`. Documented in docs/write-path-benchmark.md.
+benchmark-write-path *args:
+    bash scripts/benchmark-write-path.sh {{args}}
+
 # Cross-store parity against discogs-graph-enricher: the same fixture events into this
 # loader's PostgreSQL and the enricher's Neo4j, then a per-label comparison of the two
 # graphs. Starts both pinned containers and removes them, and their anonymous volumes,
