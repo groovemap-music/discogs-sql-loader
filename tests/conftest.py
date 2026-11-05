@@ -344,3 +344,23 @@ def span_collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[SpanCollector]:
     yield active
     monkeypatch.setattr(common_telemetry, "_tracer_provider", None)
     active.provider.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def broker_holds_no_dead_letters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests have no broker to ask; a test about dead letters sets its own answer."""
+    import tableinator.tableinator as service
+
+    async def none_waiting(_data_type: str) -> int:
+        return 0
+
+    async def not_vetoed(*_args: object) -> bool:
+        return False
+
+    async def recorded(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_real_dead_letters_waiting", service.dead_letters_waiting, raising=False)
+    monkeypatch.setattr(service, "dead_letters_waiting", none_waiting)
+    monkeypatch.setattr(service, "purge_was_vetoed", not_vetoed)
+    monkeypatch.setattr(service, "record_purge_veto", recorded)

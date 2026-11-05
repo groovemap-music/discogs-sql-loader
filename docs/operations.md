@@ -142,8 +142,33 @@ does not read `consumer_count` from `declare_queue(passive=True)` on that channe
 aio-pika's `RobustChannel` answers from a cache for a queue it already knows.
 
 An `extraction_complete` delivery flushes all pending data before guarded stale-row
-cleanup. Cleanup is skipped when a message for that entity was dead-lettered or when
-the deletion would meet or exceed `PURGE_MAX_DELETE_FRACTION` of a non-empty table.
+cleanup. Cleanup is skipped when a message for that entity is in its dead-letter queue or
+when the deletion would meet or exceed `PURGE_MAX_DELETE_FRACTION` of a non-empty table.
+
+The veto reads three sources, so it survives a restart and covers dead letters the broker made
+itself: this run's rejections in memory, the depth of the entity's `.dlq` on the broker, and
+`loader_extraction_latch.purge_vetoed` for this extraction. If the broker cannot be read, the
+purge is skipped. Every veto is written to `purge_vetoed`, one array per extraction.
+
+**A dead letter keeps vetoing until someone deals with it.** Stale rows for that entity stay until
+the DLQ is empty. Deal with it only after that run's `extraction_complete` has settled: the DLQ is
+what holds the veto across a restart until the signal records it on the latch, so clearing it earlier,
+with a restart in between, loses the veto. Look at what is there first, then do one of these:
+
+- Replay the records once the cause is fixed, so their rows refresh. No GrooveMap tool does this. Use
+  a shovel from the `.dlq` to the entity's live queue, or the RabbitMQ management UI's move-messages
+  action on the `.dlq`. Both need the `rabbitmq_shovel` plugin, and the UI action also needs
+  `rabbitmq_shovel_management`; the deployment does not enable them, so enable them first.
+- Purge the DLQ from the operations console (`POST /admin/api/dlq/purge/{queue}`) if the records are
+  not wanted. Their rows then stay stale until the next extraction, which refreshes every record
+  still in the dump.
+
+The next extraction then purges normally.
+
+This loader requires the `purge_vetoed` column. Ship the `database-schema` release carrying it
+first. In the wrong order nothing is lost: the startup probe declines the latch and the service
+reports degraded until the schema arrives. The derived-relation refresh and the record on the latch
+stop meanwhile, and the veto still reads this run's rejections and the DLQ.
 
 Completion state is in memory. On process restart, the producer may resume and skip
 files completed earlier. The delete guard is therefore part of the restart-safety
