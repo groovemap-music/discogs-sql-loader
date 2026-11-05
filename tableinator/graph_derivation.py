@@ -46,9 +46,14 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
+import structlog
 from common.media import medium_label
+from common.person_names import strip_person_name
 
 from tableinator.media import media_for_release
+
+
+logger = structlog.get_logger(__name__)
 
 
 if TYPE_CHECKING:
@@ -506,15 +511,28 @@ def _credits(value: Any) -> list[tuple[str, str, str | None]]:
     """Return `(person_name, role, artist_id)` for every usable `extraartists` entry.
 
     `entity_projection.process_release` requires both a name and a role before it MERGEs a
-    `:Person` or a `[:CREDITED_ON]`, and reads the name verbatim: `Person.name` is the Neo4j
-    key, so folding or trimming it here would key the vertex differently from the node.
+    `:Person` or a `[:CREDITED_ON]`. `Person.name` is the Neo4j key, so the name is stripped
+    of surrounding padding by the SAME rule the enricher applies,
+    `common.person_names.strip_person_name`, and by nothing else: folding the case or the
+    interior would key the vertex differently from the node. Strip FIRST and test the
+    result, so a name that is all padding is skipped and counted instead of becoming a
+    blank Person. The rule is shared with the enricher and must be adopted in both in the
+    same release, or the two stores' keys split.
     """
     credits: list[tuple[str, str, str | None]] = []
+    padding_only = 0
     for element in _elements(value):
         name = element.get("name")
         role = element.get("role", "")
-        if isinstance(name, str) and name and isinstance(role, str) and role:
-            credits.append((name, role, _entity_id(element.get("id"))))
+        if not (isinstance(name, str) and name and isinstance(role, str) and role):
+            continue
+        if not (name := strip_person_name(name)):
+            padding_only += 1
+            continue
+        credits.append((name, role, _entity_id(element.get("id"))))
+    if padding_only:
+        # Counts only: the name is padding, so there is nothing to log but how many.
+        logger.warning("⚠️ Credit with an all-padding Person name was skipped", skipped=padding_only)
     return credits
 
 

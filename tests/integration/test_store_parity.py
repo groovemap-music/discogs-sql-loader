@@ -81,6 +81,7 @@ import psycopg
 import pytest
 import pytest_asyncio
 from common import WriteAdmission
+from common.person_names import strip_person_name
 from neo4j import AsyncGraphDatabase
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
@@ -322,6 +323,16 @@ RELEASES_V1: Final = [
             # No canonical `companies` block: a pre-cutover record is silent about company
             # credits rather than asserting it has none, so neither store prunes them.
             "formats": [{"name": "CD", "qty": "1", "descriptions": {"description": ["Album"]}}],
+            # Padded credit names, on a release round two leaves alone. Both services must strip
+            # to the same key, so the padded and unpadded spellings are ONE person, and a name
+            # that is only padding mints no person at all. U+200F and U+FEFF are invisible
+            # format characters that `str.strip()` and Cypher `trim` both miss.
+            "extraartists": [
+                {"name": " Padded Person\u200f", "role": "Producer"},
+                {"name": "\ufeffPadded Person ", "role": "Engineer"},
+                {"id": "pp-a3", "name": "\u200fSecond Member", "role": "Mixed By"},
+                {"name": " \u200f\ufeff", "role": "Producer"},
+            ],
         },
     ),
 ]
@@ -724,3 +735,17 @@ async def test_the_relations_predicted_to_agree_are_the_ones_that_do(parity: Par
     assert not parity.divergences["same_as"]
     assert ("pp-a6", "pp-a1") in parity.postgres["member_of"]
     assert ("First Member", "pp-a2") in parity.postgres["same_as"]
+
+
+@pytest.mark.asyncio
+async def test_both_stores_key_a_padded_credit_name_on_its_stripped_person(parity: ParityRun) -> None:
+    """The Person key sets are identical, padding is gone, and no blank Person exists."""
+    postgres_people = {name for (name,) in parity.postgres["person"]}
+    neo4j_people = {name for (name,) in parity.neo4j["person"]}
+
+    assert postgres_people == neo4j_people
+    assert "Padded Person" in postgres_people
+    assert {name for name in postgres_people if not name or strip_person_name(name) != name} == set()
+    assert any(row[:3] == ("Padded Person", "pp-r2", "Producer") for row in parity.postgres["credited_on"])
+    assert any(row[:3] == ("Padded Person", "pp-r2", "Engineer") for row in parity.postgres["credited_on"])
+    assert ("Second Member", "pp-a3") in parity.postgres["same_as"]

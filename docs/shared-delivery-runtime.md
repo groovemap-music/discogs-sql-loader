@@ -1,11 +1,8 @@
 # Shared delivery runtime attestation
 
 Discogs SQL delivery lifecycle behavior is pinned to `groovemap-runtime` source revision
-`87c0d75ca457bd38b14e6ce6f713098a2b4c5e26`, whose Git tree is
-`bf2a2016a8d893e03788d05e1672dcdce915e3da`. It adds `BatchPolicy.max_requeues`, and a delivery that keeps failing now
-dead-letters at a stated bound, which `x-delivery-limit` does not give a nacked message. It builds on
-`ecde48bdc30784ee0370166463f1d1a466544f35` (tree `7ec3ac9338b25797b460bd6140c69ac188f510cd`), which
-superseded `5459343ccaf46da5f71db11cda40d9338ce61d8d`
+`068773653ab0edc78030c38f9c50c91c58815fcf`, whose Git tree is
+`f63beae1760b50e6e76d89e2706b664795b79647`. It supersedes `5459343ccaf46da5f71db11cda40d9338ce61d8d`
 (tree `722fabc9ceab39fcfb0497b1c8a54ade84616a21`), whose batch engine let one queue's backlog starve every other queue's periodic flush
 and retained each handler that crossed the batch threshold, which leaked memory until the container
 restarted. A flush now returns under constant backlog, and returns `True` only when nothing is

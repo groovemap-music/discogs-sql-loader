@@ -59,10 +59,10 @@ packages = ["tableinator"]
 exclude-newer = "7 days"
 # The schema producer's historical runtime URL is immutable; resolve its dev dependency
 # against this loader's active tested runtime rather than locking two revisions.
-override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+https://github.com/groovemap-music/python-libraries.git@87c0d75ca457bd38b14e6ce6f713098a2b4c5e26"]
+override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+https://github.com/groovemap-music/python-libraries.git@068773653ab0edc78030c38f9c50c91c58815fcf"]
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "87c0d75ca457bd38b14e6ce6f713098a2b4c5e26" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "068773653ab0edc78030c38f9c50c91c58815fcf" }
 groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "0f02656a66c03804dbec567984acb7f6f57bb500" }
 
 [tool.ruff]
