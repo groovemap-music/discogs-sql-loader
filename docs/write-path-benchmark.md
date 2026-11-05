@@ -36,7 +36,18 @@ schema and writes rows, so never point it at a real database. Before any DDL or 
 really opened: a Unix socket or a loopback peer passes, anything else is refused unless you also pass
 `--allow-remote-host`. The check looks at the connection, not the DSN text, so `hostaddr`, a `service` entry, and
 `PGHOST` or `PGHOSTADDR` in the environment cannot route it elsewhere. A host that cannot be reached is refused
-too. (An SSH tunnel to a remote server looks like loopback; do not tunnel this at a real database.)
+too.
+
+Two more refusals, both before any DDL or write:
+
+- **More than one host** in the DSN, `hostaddr`, `PGHOST` or `PGHOSTADDR`. The verified address is then written
+  into the DSN (`host`, `hostaddr`, `port`), so the pool the benchmark opens afterwards goes to the address that
+  was checked, not to whatever a name resolves to next time.
+- **A database that is not empty and not the benchmark's own.** A port-forward or SSH tunnel to a real server
+  looks like loopback, but it holds tables. The benchmark applies its schema only to a database with no user
+  relations, or one it has already marked (it sets a database comment after applying the schema), so a rerun
+  against the same disposable database works and a real database is refused. `--allow-remote-host` does not
+  relax this.
 
 ## Reading the numbers
 

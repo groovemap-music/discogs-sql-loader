@@ -27,7 +27,8 @@ def _load() -> ModuleType:
 
 
 bench = _load()
-REMOTE = (socket.AF_INET, ("10.1.2.3", 5432))
+REMOTE = bench.Target(socket.AF_INET, ("10.1.2.3", 5432), "10.1.2.3", "5432", 0, None)
+LOOPBACK = bench.Target(socket.AF_INET, ("127.0.0.1", 5432), "localhost", "5432", 0, None)
 
 
 @pytest.mark.parametrize(
@@ -59,27 +60,70 @@ def test_peer_is_local(family: int, peer: object, expected: bool) -> None:
     ],
 )
 def test_a_dsn_that_connects_remotely_is_refused_whatever_it_says(dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bench, "connected_peer", lambda _dsn: REMOTE)
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: REMOTE)
     with pytest.raises(SystemExit, match="not loopback"):
         bench.require_local_database(dsn)
 
 
 def test_the_override_permits_remote_writes_but_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bench, "connected_peer", lambda _dsn: REMOTE)
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: REMOTE)
     bench.require_local_database("dbname=x", allow_remote=True)
     with pytest.raises(SystemExit):
         bench.require_local_database("dbname=x")
 
 
 def test_a_loopback_connection_passes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bench, "connected_peer", lambda _dsn: (socket.AF_INET, ("127.0.0.1", 5432)))
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: LOOPBACK)
     bench.require_local_database("host=localhost")
 
 
 def test_statements_never_honours_the_remote_override(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    monkeypatch.setattr(bench, "connected_peer", lambda _dsn: REMOTE)
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: REMOTE)
     monkeypatch.setenv("TEST_DATABASE_URL", "dbname=x")
     monkeypatch.setattr("sys.argv", ["benchmark", "--allow-remote-host", "--statements", "5"])
     with pytest.raises(SystemExit, match="not loopback"):
         bench.main()
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("dsn", ["host=a,b dbname=x", "host=localhost hostaddr=127.0.0.1,10.1.2.3 dbname=x"])
+def test_a_dsn_naming_several_hosts_is_refused_before_connecting(dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(_dsn: str) -> None:
+        raise AssertionError("must not connect")
+
+    monkeypatch.setattr(bench, "inspect_target", fail)
+    with pytest.raises(SystemExit, match="more than one host"):
+        bench.require_local_database(dsn)
+
+
+def test_several_hosts_in_the_environment_are_refused_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PGHOST", "127.0.0.1,db.example.com")
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: LOOPBACK)
+    with pytest.raises(SystemExit, match="more than one host"):
+        bench.require_local_database("dbname=x")
+
+
+def test_a_database_that_is_not_empty_and_not_ours_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A port-forward to a real database looks like loopback; its tables give it away."""
+    busy = bench.Target(socket.AF_INET, ("127.0.0.1", 5432), "localhost", "5432", 41, None)
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: busy)
+    with pytest.raises(SystemExit, match="already holds 41 relations"):
+        bench.require_local_database("dbname=x")
+    with pytest.raises(SystemExit, match="already holds 41 relations"):
+        bench.require_local_database("dbname=x", allow_remote=True)
+
+
+def test_the_benchmarks_own_database_is_recognised_by_its_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    ours = bench.Target(socket.AF_INET, ("127.0.0.1", 5432), "localhost", "5432", 300, bench.MARKER)
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: ours)
+    assert "hostaddr=127.0.0.1" in bench.require_local_database("dbname=x")
+
+
+def test_the_returned_dsn_pins_the_verified_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bench, "inspect_target", lambda _dsn: LOOPBACK)
+    pinned = bench.require_local_database("service=prod dbname=x")
+    assert "host=127.0.0.1" in pinned
+    assert "hostaddr=127.0.0.1" in pinned
+    assert "port=5432" in pinned
+    socket_target = bench.Target(socket.AF_UNIX, "/tmp/.s.PGSQL.5432", "/tmp", "5432", 0, None)  # noqa: S108 -- a path string, not a file use
+    assert "host=/tmp" in bench.pinned_dsn("dbname=x", socket_target)

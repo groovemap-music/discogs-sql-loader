@@ -25,6 +25,8 @@ from unittest.mock import MagicMock
 import psycopg
 from common import AsyncPostgreSQLPool, WriteAdmission
 from groovemap_schema.postgres import create_postgres_schema
+from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
 from tableinator.media import media_for_release
@@ -72,36 +74,94 @@ def peer_is_local(family: int, peer: Any) -> bool:
     return address.is_loopback
 
 
-def connected_peer(dsn: str) -> tuple[int, Any]:
-    """Connect with `dsn` and return the address family and peer of the socket libpq really opened.
+MARKER = "discogs-sql-loader write-path benchmark"
+"""The database comment the benchmark leaves after it applies its schema, so a rerun recognises its own."""
+
+
+@dataclass(frozen=True)
+class Target:
+    """What one verification connection learned about where a DSN really points."""
+
+    family: int
+    peer: Any
+    host: str
+    port: str
+    relations: int
+    marker: str | None
+
+
+def inspect_target(dsn: str) -> Target:
+    """Connect with `dsn` and report the socket libpq really opened and what the database holds.
 
     The DSN text cannot say where libpq connects: `hostaddr`, a `service` entry, and `PGHOST`
     or `PGHOSTADDR` in the environment all override or replace its `host`. The open socket is
-    the only answer. This only connects; it issues no statement.
+    the only answer. This issues two read-only queries and no DDL or write.
     """
-    with psycopg.connect(dsn, connect_timeout=10) as connection:
+    with psycopg.connect(dsn, connect_timeout=10, autocommit=True) as connection:
         duplicate = socket.socket(fileno=os.dup(connection.pgconn.socket))
         try:
-            return duplicate.family, duplicate.getpeername()
+            family, peer = duplicate.family, duplicate.getpeername()
         finally:
             duplicate.close()
+        row = connection.execute(
+            "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            " WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')), "
+            "shobj_description((SELECT oid FROM pg_database WHERE datname = current_database()), 'pg_database')"
+        ).fetchone()
+        assert row is not None
+        return Target(family, peer, connection.info.host, str(connection.info.port), int(row[0]), row[1])
 
 
-def require_local_database(dsn: str, *, allow_remote: bool = False) -> None:
-    """Exit unless `dsn` really connects to loopback or a Unix socket, before any DDL or write.
+def _has_several_hosts(dsn: str) -> bool:
+    """Return whether the DSN, or the environment it falls back on, names more than one host."""
+    parts = conninfo_to_dict(dsn)
+    values = [parts.get("host"), parts.get("hostaddr"), os.environ.get("PGHOST"), os.environ.get("PGHOSTADDR")]
+    return any("," in str(value) for value in values if value)
 
-    `allow_remote` skips the refusal for the benchmark's own writes. Anything that changes
-    shared server state (`--statements`) must call this with the default.
+
+def pinned_dsn(dsn: str, target: Target) -> str:
+    """Return `dsn` with the verified address written into it, so later connections cannot go elsewhere.
+
+    Explicit parameters beat `service` and the `PG*` environment, so a pool opened with the
+    result reaches the host that was checked, not whatever the name resolves to next time.
     """
+    if target.family == socket.AF_UNIX:
+        return make_conninfo(dsn, host=target.host, port=target.port, hostaddr="")
+    return make_conninfo(dsn, host=str(target.peer[0]), hostaddr=str(target.peer[0]), port=str(target.peer[1]))
+
+
+def require_local_database(dsn: str, *, allow_remote: bool = False) -> str:
+    """Exit unless `dsn` is safe to write to, before any DDL or write; return the DSN to use afterwards.
+
+    Refused: a DSN naming more than one host; a connection that is not loopback or a Unix
+    socket (unless `allow_remote`, which only the benchmark's own writes may use); and a
+    database that already holds user relations without the marker this benchmark leaves,
+    because a port-forward looks like loopback and the marker is what says it is ours.
+    The returned DSN pins the verified address.
+    """
+    if _has_several_hosts(dsn):
+        raise SystemExit("TEST_DATABASE_URL names more than one host; use exactly one so the checked address is the one used")
     try:
-        family, peer = connected_peer(dsn)
+        target = inspect_target(dsn)
     except psycopg.Error as error:
         raise SystemExit(f"cannot connect to TEST_DATABASE_URL to check where it points: {type(error).__name__}") from error
-    if not peer_is_local(family, peer) and not allow_remote:
+    if not peer_is_local(target.family, target.peer) and not allow_remote:
         raise SystemExit(
-            f"TEST_DATABASE_URL connects to {peer!r}, not loopback or a Unix socket; "
+            f"TEST_DATABASE_URL connects to {target.peer!r}, not loopback or a Unix socket; "
             "this script writes rows, so pass --allow-remote-host only for a disposable remote database"
         )
+    if target.relations and target.marker != MARKER:
+        raise SystemExit(
+            f"TEST_DATABASE_URL points at a database that already holds {target.relations} relations and is not this "
+            "benchmark's own; use an empty disposable database (a port-forward also looks like loopback)"
+        )
+    return pinned_dsn(dsn, target)
+
+
+def mark_benchmark_database(dsn: str) -> None:
+    """Leave the marker that lets a rerun recognise this database as the benchmark's own."""
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        connection.execute(sql.SQL("COMMENT ON DATABASE {} IS {}").format(sql.Identifier(connection.info.dbname), sql.Literal(MARKER)))
 
 
 @dataclass(frozen=True)
@@ -227,6 +287,7 @@ async def run(args: argparse.Namespace, dsn: str) -> dict[str, Any]:
         failures = await create_postgres_schema(pool)
         if failures:
             raise SystemExit(f"{failures} schema statements failed")
+        mark_benchmark_database(dsn)
         rng = random.Random(args.seed)  # noqa: S311 -- deterministic load shape, not security
         entities = max(1000, args.releases // 2)
         records = [BUILDERS[args.data_type](rng, index, entities) for index in range(args.releases)]
@@ -299,7 +360,7 @@ def main() -> None:
         parser.error("TEST_DATABASE_URL is required (a disposable database)")
     # --statements runs CREATE EXTENSION and pg_stat_statements_reset(), which change shared
     # server state, so it never honours --allow-remote-host.
-    require_local_database(dsn, allow_remote=args.allow_remote_host and not args.statements)
+    dsn = require_local_database(dsn, allow_remote=args.allow_remote_host and not args.statements)
     print(json.dumps(asyncio.run(run(args, dsn))))
 
 
