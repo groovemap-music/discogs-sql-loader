@@ -35,5 +35,17 @@ fi
 
 port="$(docker port "${container}" 5432/tcp | head -n1)"
 port="${port##*:}"
+# Run the benchmark as a child we can stop: a signal to this script must not leave it writing
+# into a container the trap is about to remove.
 TEST_DATABASE_URL="postgresql://postgres:benchmark@127.0.0.1:${port}/postgres" \
-    uv run python scripts/benchmark-write-path.py "$@"
+    uv run python scripts/benchmark-write-path.py "$@" &
+child=$!
+
+stop_child() {
+    kill -TERM "${child}" 2>/dev/null || true
+    wait "${child}" 2>/dev/null || true
+    exit 143
+}
+trap stop_child TERM INT
+
+wait "${child}"

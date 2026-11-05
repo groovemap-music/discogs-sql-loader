@@ -25,9 +25,12 @@ credits on about 30%, Zipf-distributed entity ids so vertices conflict as they d
 them through the real `PostgreSQLBatchWriter.process_batch`, `AsyncPostgreSQLPool` and `WriteAdmission`.
 Identifier aliases are not generated; the 7qar audit measured them at about 1% of server time.
 
+Stopping the wrapper with SIGTERM or Ctrl-C stops the benchmark first, then removes the container.
+
 It is not part of `just check` or the default test lane, and it needs Docker. To use your own throwaway
 database instead, run `TEST_DATABASE_URL=... uv run python scripts/benchmark-write-path.py`; it applies the
-schema and writes rows, so never point it at a real database.
+schema and writes rows, so never point it at a real database. The script refuses a `TEST_DATABASE_URL` whose host is not loopback or a
+Unix socket unless you also pass `--allow-remote-host`.
 
 ## Reading the numbers
 

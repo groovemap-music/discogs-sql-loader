@@ -12,6 +12,7 @@ Use only against a throwaway database: it writes rows and applies the pinned sch
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import random
@@ -23,6 +24,7 @@ from unittest.mock import MagicMock
 import psycopg
 from common import AsyncPostgreSQLPool, WriteAdmission
 from groovemap_schema.postgres import create_postgres_schema
+from psycopg.conninfo import conninfo_to_dict
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
 from tableinator.media import media_for_release
@@ -53,6 +55,21 @@ FORMATS = [
     {"name": "Vinyl", "qty": "1", "descriptions": {"description": ['12"', "EP"]}},
     {"name": "Cassette", "qty": "1", "descriptions": {"description": ["Album"]}},
 ]
+
+
+def is_local_host(dsn: str) -> bool:
+    """Return whether every host in `dsn` is loopback or a Unix socket directory (or unset)."""
+    hosts = str(conninfo_to_dict(dsn).get("host") or "").split(",")
+    for host in hosts:
+        if host in ("", "localhost") or host.startswith("/"):
+            continue
+        try:
+            if ipaddress.ip_address(host).is_loopback:
+                continue
+        except ValueError:
+            pass
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -174,12 +191,21 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--allow-remote-host",
+        action="store_true",
+        help="permit a TEST_DATABASE_URL whose host is not loopback or a Unix socket; the script writes rows and applies the schema",
+    )
     args = parser.parse_args()
     if min(args.releases, args.batch_size, args.workers) < 1:
         parser.error("--releases, --batch-size and --workers must be positive")
     dsn = os.environ.get("TEST_DATABASE_URL")
     if not dsn:
         parser.error("TEST_DATABASE_URL is required (a disposable database)")
+    if not args.allow_remote_host and not is_local_host(dsn):
+        parser.error(
+            "TEST_DATABASE_URL host is not loopback or a Unix socket; this script writes rows, so pass --allow-remote-host only for a disposable remote database"
+        )
     print(json.dumps(asyncio.run(run(args, dsn))))
 
 
