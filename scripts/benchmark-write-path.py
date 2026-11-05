@@ -16,6 +16,7 @@ import ipaddress
 import json
 import os
 import random
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -24,7 +25,6 @@ from unittest.mock import MagicMock
 import psycopg
 from common import AsyncPostgreSQLPool, WriteAdmission
 from groovemap_schema.postgres import create_postgres_schema
-from psycopg.conninfo import conninfo_to_dict
 
 from tableinator.batch_writer import PostgreSQLBatchWriter
 from tableinator.media import media_for_release
@@ -57,19 +57,51 @@ FORMATS = [
 ]
 
 
-def is_local_host(dsn: str) -> bool:
-    """Return whether every host in `dsn` is loopback or a Unix socket directory (or unset)."""
-    hosts = str(conninfo_to_dict(dsn).get("host") or "").split(",")
-    for host in hosts:
-        if host in ("", "localhost") or host.startswith("/"):
-            continue
-        try:
-            if ipaddress.ip_address(host).is_loopback:
-                continue
-        except ValueError:
-            pass
+def peer_is_local(family: int, peer: Any) -> bool:
+    """Return whether a connected socket's peer is a Unix socket or a loopback address."""
+    if family == socket.AF_UNIX:
+        return True
+    if family not in (socket.AF_INET, socket.AF_INET6):
         return False
-    return True
+    try:
+        address = ipaddress.ip_address(str(peer[0]).split("%", 1)[0])
+    except ValueError, TypeError, IndexError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def connected_peer(dsn: str) -> tuple[int, Any]:
+    """Connect with `dsn` and return the address family and peer of the socket libpq really opened.
+
+    The DSN text cannot say where libpq connects: `hostaddr`, a `service` entry, and `PGHOST`
+    or `PGHOSTADDR` in the environment all override or replace its `host`. The open socket is
+    the only answer. This only connects; it issues no statement.
+    """
+    with psycopg.connect(dsn, connect_timeout=10) as connection:
+        duplicate = socket.socket(fileno=os.dup(connection.pgconn.socket))
+        try:
+            return duplicate.family, duplicate.getpeername()
+        finally:
+            duplicate.close()
+
+
+def require_local_database(dsn: str, *, allow_remote: bool = False) -> None:
+    """Exit unless `dsn` really connects to loopback or a Unix socket, before any DDL or write.
+
+    `allow_remote` skips the refusal for the benchmark's own writes. Anything that changes
+    shared server state (`--statements`) must call this with the default.
+    """
+    try:
+        family, peer = connected_peer(dsn)
+    except psycopg.Error as error:
+        raise SystemExit(f"cannot connect to TEST_DATABASE_URL to check where it points: {type(error).__name__}") from error
+    if not peer_is_local(family, peer) and not allow_remote:
+        raise SystemExit(
+            f"TEST_DATABASE_URL connects to {peer!r}, not loopback or a Unix socket; "
+            "this script writes rows, so pass --allow-remote-host only for a disposable remote database"
+        )
 
 
 @dataclass(frozen=True)
@@ -194,7 +226,7 @@ def main() -> None:
     parser.add_argument(
         "--allow-remote-host",
         action="store_true",
-        help="permit a TEST_DATABASE_URL whose host is not loopback or a Unix socket; the script writes rows and applies the schema",
+        help="permit a TEST_DATABASE_URL that connects somewhere other than loopback or a Unix socket; the script writes rows and applies the schema",
     )
     args = parser.parse_args()
     if min(args.releases, args.batch_size, args.workers) < 1:
@@ -202,10 +234,7 @@ def main() -> None:
     dsn = os.environ.get("TEST_DATABASE_URL")
     if not dsn:
         parser.error("TEST_DATABASE_URL is required (a disposable database)")
-    if not args.allow_remote_host and not is_local_host(dsn):
-        parser.error(
-            "TEST_DATABASE_URL host is not loopback or a Unix socket; this script writes rows, so pass --allow-remote-host only for a disposable remote database"
-        )
+    require_local_database(dsn, allow_remote=args.allow_remote_host)
     print(json.dumps(asyncio.run(run(args, dsn))))
 
 

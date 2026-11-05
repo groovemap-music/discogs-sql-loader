@@ -29,8 +29,11 @@ Stopping the wrapper with SIGTERM or Ctrl-C stops the benchmark first, then remo
 
 It is not part of `just check` or the default test lane, and it needs Docker. To use your own throwaway
 database instead, run `TEST_DATABASE_URL=... uv run python scripts/benchmark-write-path.py`; it applies the
-schema and writes rows, so never point it at a real database. The script refuses a `TEST_DATABASE_URL` whose host is not loopback or a
-Unix socket unless you also pass `--allow-remote-host`.
+schema and writes rows, so never point it at a real database. Before any DDL or write, the script connects (one connection, no statement) and checks the socket libpq
+really opened: a Unix socket or a loopback peer passes, anything else is refused unless you also pass
+`--allow-remote-host`. The check looks at the connection, not the DSN text, so `hostaddr`, a `service` entry, and
+`PGHOST` or `PGHOSTADDR` in the environment cannot route it elsewhere. A host that cannot be reached is refused
+too. (An SSH tunnel to a remote server looks like loopback; do not tunnel this at a real database.)
 
 ## Reading the numbers
 
