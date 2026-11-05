@@ -23,7 +23,7 @@ set -euo pipefail
 #
 # `uv sync` removes the package again, so nothing here leaks into another lane.
 enricher_repository="https://github.com/groovemap-music/discogs-graph-enricher.git"
-enricher_revision="${PARITY_ENRICHER_REVISION:-24c4f0c37db34106c6d418c33f5484fdbfc5336d}"
+enricher_revision="${PARITY_ENRICHER_REVISION:-22f91857025a201297acb1a22c2ce6f253297041}"
 
 suffix="$$"
 postgres_container="${POSTGRES_PARITY_CONTAINER:-discogs-sql-loader-parity-postgres-${suffix}}"

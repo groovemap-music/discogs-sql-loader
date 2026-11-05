@@ -116,13 +116,12 @@ as declared, on the same side, with the same tuples. A declared difference that 
 materialising fails the run rather than sitting there absolving a relation nobody is
 checking any more.
 
-Six entries are on record. Each reason is stated in full in the registry itself.
+Five entries are on record. Each reason is stated in full in the registry itself.
 
 | relation | shape of the difference | cause |
 | --- | --- | --- |
 | `by_artist` | Neo4j holds an edge to an `Artist` with id `0` | The loader drops the Discogs "no entity" sentinel, because that is what `_usable_id` and the phase 0 views assert. The enricher tests raw truthiness, which drops a numeric `0` but keeps the string `"0"` the dump states. |
 | `alias_of` | Neo4j keeps a withdrawn alias | The loader replaces `alias_of` per asserting document. `process_artist` has no `ALIAS_OF` prune. |
-| `credited_on` | Neo4j keeps two superseded credits | The loader replaces `credited_on` per release. The enricher MERGEs `CREDITED_ON` with no matching prune. |
 | `in_family` | Neo4j keeps an edge to the family the medium left | The view is a projection of `graph.medium.family`, so a medium has exactly one family. `IN_FAMILY` is MERGEd and never pruned. |
 | `medium` | the family property differs | Every vertex INSERT is `ON CONFLICT DO NOTHING`; `MERGE_MEDIA_CYPHER` has `ON MATCH SET m.family`. |
 | `company` | the name property differs | The same, against `MERGE_COMPANY_CYPHER`'s `SET co.name`. |

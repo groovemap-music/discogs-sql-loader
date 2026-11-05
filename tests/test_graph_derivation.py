@@ -9,6 +9,7 @@ same bytes without this repository depending on a sibling checkout.
 from typing import Any, ClassVar
 
 import pytest
+import structlog.testing
 
 from tableinator.graph_derivation import (
     EDGE_COLUMNS,
@@ -214,12 +215,27 @@ class TestCredits:
         """`graph.credited_on.role_category` is GENERATED; naming it in an INSERT is an error."""
         assert EDGE_COLUMNS["credited_on"] == ("person_name", "release_id", "role")
 
-    def test_a_person_vertex_is_keyed_on_the_verbatim_credit_name(self) -> None:
-        """`Person.name` is the Neo4j key, so folding it here would key the vertex apart."""
-        document = derive_document("releases", "r1", {"extraartists": [{"name": " dr. Dre ", "role": "Producer"}]})
+    def test_a_person_vertex_is_keyed_on_the_stripped_credit_name(self) -> None:
+        """`Person.name` is the Neo4j key: padding is stripped, the rest is verbatim."""
+        document = derive_document("releases", "r1", {"extraartists": [{"name": " dr. Dre\u200f", "role": "Producer"}]})
 
-        assert document.vertices["person"] == [(" dr. Dre ",)]
-        assert document.edges["credited_on"] == [(" dr. Dre ", "r1", "Producer")]
+        assert document.vertices["person"] == [("dr. Dre",)]
+        assert document.edges["credited_on"] == [("dr. Dre", "r1", "Producer")]
+
+    def test_interior_characters_of_a_credit_name_are_unchanged(self) -> None:
+        document = derive_document("releases", "r1", {"extraartists": [{"name": "A  B\u200fC", "role": "Producer"}]})
+
+        assert document.vertices["person"] == [("A  B\u200fC",)]
+
+    def test_an_all_padding_name_makes_no_person_and_is_counted(self) -> None:
+        with structlog.testing.capture_logs() as logs:
+            document = derive_document(
+                "releases", "r1", {"extraartists": [{"name": " ", "role": "Producer"}, {"name": "\u200f\ufeff", "role": "Mixed By"}]}
+            )
+
+        assert "person" not in document.vertices
+        assert "credited_on" not in document.edges
+        assert [entry["skipped"] for entry in logs if "skipped" in entry] == [2]
 
     def test_a_credit_needs_both_a_name_and_a_role(self) -> None:
         """The enricher MERGEs neither the `:Person` nor the edge without both."""
