@@ -1,8 +1,16 @@
 # Shared delivery runtime attestation
 
 Discogs SQL delivery lifecycle behavior is pinned to `groovemap-runtime` source revision
-`5459343ccaf46da5f71db11cda40d9338ce61d8d`, whose Git tree is
-`722fabc9ceab39fcfb0497b1c8a54ade84616a21`. It supersedes `6d0425f908e01a446b040e2993045e2afe30460e`
+`ecde48bdc30784ee0370166463f1d1a466544f35`, whose Git tree is
+`7ec3ac9338b25797b460bd6140c69ac188f510cd`. It supersedes `5459343ccaf46da5f71db11cda40d9338ce61d8d`
+(tree `722fabc9ceab39fcfb0497b1c8a54ade84616a21`), whose batch engine let one queue's backlog starve every other queue's periodic flush
+and retained each handler that crossed the batch threshold, which leaked memory until the container
+restarted. A flush now returns under constant backlog, and returns `True` only when nothing is
+pending, handlers still waiting in `submit` included, so `flush_queue` still gates `purge_stale_rows`
+safely. `snapshot()["pending"]` counts those handlers too, so batches can be slightly smaller when
+capacity is exhausted, and a shutdown `flush_all` can take one tick longer.
+
+That revision superseded `6d0425f908e01a446b040e2993045e2afe30460e`
 (tree `abec17ef8df697bdb3b0495ac6186315d69f6b56`), whose loader-local classifier and unbounded batch
 holds it replaces: `PostgreSQLFailureClassifier` now comes from `common.postgres_resilient`, where only
 SQLSTATE class 54 is a permanent `OperationalError`, and `BatchPolicy.max_hold_s` is set from
