@@ -74,3 +74,12 @@ def test_the_override_permits_remote_writes_but_is_off_by_default(monkeypatch: p
 def test_a_loopback_connection_passes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bench, "connected_peer", lambda _dsn: (socket.AF_INET, ("127.0.0.1", 5432)))
     bench.require_local_database("host=localhost")
+
+
+def test_statements_never_honours_the_remote_override(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(bench, "connected_peer", lambda _dsn: REMOTE)
+    monkeypatch.setenv("TEST_DATABASE_URL", "dbname=x")
+    monkeypatch.setattr("sys.argv", ["benchmark", "--allow-remote-host", "--statements", "5"])
+    with pytest.raises(SystemExit, match="not loopback"):
+        bench.main()
+    assert capsys.readouterr().out == ""
