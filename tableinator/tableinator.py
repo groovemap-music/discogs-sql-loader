@@ -1289,12 +1289,12 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
                     await schedule_consumer_cancellation(data_type, queues[data_type])
 
-                # Only now is the veto spent. Cleared any earlier, a failed commit would
-                # requeue this signal with the veto gone, and the redelivery would purge
-                # rows whose records are still in the DLQ.
+                await message.ack()
+                # Only now is the veto spent. Cleared any earlier, a failed commit or ack
+                # would redeliver this signal with the veto gone, and it would purge rows
+                # whose records are still in the DLQ.
                 if purge_vetoed and batch_processor is not None:
                     batch_processor.reset_dlq_nacks(data_type)
-                await message.ack()
                 record_terminal("processed")
             else:
                 if durable_handoff_failed and not await pause_durable_consumers(data_type, ordered_version(data.get("version"))):
