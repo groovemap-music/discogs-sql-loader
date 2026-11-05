@@ -78,7 +78,8 @@ preferred for deployed containers.
 | `POSTGRES_BATCH_MODE` | `true` | Enable transactional batch writes |
 | `POSTGRES_BATCH_SIZE` | `100` | Records that trigger a batch flush |
 | `POSTGRES_BATCH_FLUSH_INTERVAL` | `5.0` seconds | Time that triggers a batch flush |
-| `POSTGRES_BATCH_MAX_HOLD_S` | `1500` seconds | Longest a delivery waits out PostgreSQL backoff before it is returned to RabbitMQ with `requeue=True`. Startup rejects values where hold + flush interval + `backoff_max` (30 s) reach the 1800 s lux `consumer_timeout`. The loader dead-letters a delivery after 20 requeues, so this sets the outage it survives: 21 holds, about 8.75 hours at 1500 s. See `docs/shared-delivery-runtime.md`. |
+| `POSTGRES_BATCH_MAX_HOLD_S` | `1500` seconds | Longest a delivery waits out PostgreSQL backoff before it is returned to RabbitMQ with `requeue=True`. Startup rejects values where hold + flush interval + `backoff_max` (30 s) reach the 1800 s lux `consumer_timeout`. Together with `POSTGRES_BATCH_MAX_REQUEUES` this sets the outage the loader survives: 61 holds, about 25.4 hours at 1500 s. See `docs/shared-delivery-runtime.md`. |
+| `POSTGRES_BATCH_MAX_REQUEUES` | `60` | Times a held delivery goes back to RabbitMQ before it is dead-lettered instead, counted from the broker's `x-acquired-count`. Restarts and channel closes spend the same count. Must be at least 1. See `docs/shared-delivery-runtime.md`. |
 
 ### Lifecycle and health
 

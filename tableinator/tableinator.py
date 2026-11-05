@@ -31,7 +31,7 @@ from common.postgres_resilient import PostgreSQLFailureClassifier
 from orjson import loads
 
 from tableinator import telemetry
-from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, BatchConfig, PostgreSQLBatchProcessor
+from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, DEFAULT_MAX_REQUEUES, BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
 )
@@ -285,6 +285,8 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 # Held-delivery bound: deliveries waiting out PostgreSQL backoff longer than this go back to RabbitMQ
 # with requeue=True. BatchConfig rejects values that could reach the broker consumer_timeout (lux: 30 minutes).
 BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
+# Times a held delivery may go back to RabbitMQ before it is dead-lettered instead.
+BATCH_MAX_REQUEUES = int(os.environ.get("POSTGRES_BATCH_MAX_REQUEUES", str(DEFAULT_MAX_REQUEUES)))
 
 # Fallback pool max when config is not yet loaded (matches TableinatorConfig default).
 _DEFAULT_POOL_MAX = 12
@@ -1146,12 +1148,12 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             # so its row's updated_at was never refreshed and would otherwise look
             # stale and get purged — deleting a still-current record beyond the DLQ.
             purge_ok = True
-            if batch_processor is not None and batch_processor.had_dlq_nacks(data_type):
+            purge_vetoed = batch_processor is not None and batch_processor.had_dlq_nacks(data_type)
+            if purge_vetoed:
                 logger.warning(
                     "⚠️ Skipping stale row purge — messages were nacked to the DLQ this run, so some dump-present rows may not have been refreshed",
                     data_type=data_type,
                 )
-                batch_processor.reset_dlq_nacks(data_type)
             elif connection_pool is not None:
                 try:
                     record_counts = data.get("record_counts", {})
@@ -1287,6 +1289,11 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
                     await schedule_consumer_cancellation(data_type, queues[data_type])
 
+                # Only now is the veto spent. Cleared any earlier, a failed commit would
+                # requeue this signal with the veto gone, and the redelivery would purge
+                # rows whose records are still in the DLQ.
+                if purge_vetoed and batch_processor is not None:
+                    batch_processor.reset_dlq_nacks(data_type)
                 await message.ack()
                 record_terminal("processed")
             else:
@@ -1677,6 +1684,7 @@ async def main() -> None:
             batch_size=BATCH_SIZE,
             flush_interval=BATCH_FLUSH_INTERVAL,
             max_hold_s=BATCH_MAX_HOLD_S,
+            max_requeues=BATCH_MAX_REQUEUES,
         )
         batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config, write_admission)
         logger.info(

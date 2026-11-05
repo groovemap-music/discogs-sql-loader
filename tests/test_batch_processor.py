@@ -583,4 +583,4 @@ def test_a_hold_returned_to_the_broker_does_not_veto_the_purge() -> None:
 
 
 def test_the_requeue_budget_reaches_the_engine_policy() -> None:
-    assert BatchConfig().runtime_policy().max_requeues == 20
+    assert BatchConfig().runtime_policy().max_requeues == 60

@@ -43,11 +43,12 @@ held `POSTGRES_BATCH_MAX_HOLD_S` seconds (default 1500), the shared engine retur
   `x-delivery-count` unset and never dead-letter. A timeout cancels the consumer, requeues the delivery
   and leaves the channel open. Only `basic.reject` and channel or connection closes spend
   `x-delivery-limit` 20, and those dead-letter after the 21st delivery.
-- So the loader counts. `BatchConfig.max_requeues` (default 20) is read against the broker's
+- So the loader counts. `POSTGRES_BATCH_MAX_REQUEUES` (default 60) is read against the broker's
   `x-acquired-count`, which rises on every return, and a delivery past it is logged and dead-lettered
-  instead of requeued, which also vetoes that run's stale-row purge. That is 21 holds, about **8.75
+  instead of requeued, which also vetoes that run's stale-row purge. That is 61 holds, about **25.4
   hours** of continuous outage at 1500 s, and up to a flush interval and a backoff more per hold.
-  Restarts and channel closes spend the same count, so they shorten it.
+  Restarts and channel closes spend the same count, so they shorten it. The veto clears only once the
+  terminal signal has committed, so a failed commit cannot redeliver it into a purge.
 - Non-batch mode has its own bound: `run_delivery` dead-letters after 500 requeues, about 8.3 hours at
   `OutageBackoff`'s 60 s cap.
 - `requeue_callback`, `headers` and the budget work together: without the headers `max_requeues` is

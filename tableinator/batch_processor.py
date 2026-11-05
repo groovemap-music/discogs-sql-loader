@@ -39,8 +39,8 @@ BROKER_CONSUMER_TIMEOUT_S = 1800.0
 DEFAULT_MAX_HOLD_S = 1500.0
 # Requeues a held delivery may use before it is dead-lettered. RabbitMQ 4.3.5 and 4.4.0 do not
 # spend x-delivery-limit on nack(requeue=True), so the engine counts x-acquired-count instead.
-# 21 holds of 1500 s is about 8.75 hours of continuous failure. See docs/shared-delivery-runtime.md.
-DEFAULT_MAX_REQUEUES = 20
+# 61 holds of 1500 s is about 25.4 hours of continuous failure. See docs/shared-delivery-runtime.md.
+DEFAULT_MAX_REQUEUES = 60
 
 
 @dataclass
