@@ -3,6 +3,34 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.4.4 (2026-11-05)
+
+### Operator notes
+
+- **Batch engine fix.** `groovemap-runtime` is pinned to `ecde48b`, which stops one busy queue starving
+  every other queue's periodic flush and the memory growth that followed from it. The pin also carries
+  the other runtime commits since the previous pin, including PostgreSQL pool and health-probe changes.
+- **Pending counts.** The batch snapshot's `pending` now includes handlers still inside `submit`, not
+  only queued records, so it can read higher than before for the same load.
+- **Shutdown.** `flush_all` can take up to one `POSTGRES_BATCH_FLUSH_INTERVAL` longer, because a flush
+  now waits for those handlers before it reports nothing pending.
+- **Lux memory cap.** Lux's 30 GiB cap stays in place until memory is proven under a real backlog.
+- **Set-based `first_year`.** `database-schema` is pinned to `0f02656`, which computes genre and style
+  `first_year` in one pass over releases.
+
+### Fix
+
+- **perf**: refuse multi-host DSNs, pin the verified address, and refuse databases that are not the benchmark's own
+- **perf**: use the connected-socket guard in the poison benchmark
+- **perf**: never let --statements run against a non-loopback database
+- **perf**: refuse --statements on a non-loopback database and scope the profile to inserts
+- **perf**: check the socket the benchmark really opened, not the DSN text
+- **perf**: refuse non-loopback hosts in the benchmark and stop it on SIGTERM
+
+### Perf
+
+- **counters**: compute genre and style first_year in one pass over releases
+
 ## v0.4.3 (2026-11-04)
 
 ### Perf
