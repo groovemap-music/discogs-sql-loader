@@ -18,7 +18,8 @@ cleanup() {
 trap cleanup EXIT
 
 docker run --detach --rm --name "${container}" --env POSTGRES_PASSWORD=benchmark \
-    --publish 127.0.0.1::5432 "${postgres_image}" >/dev/null
+    --publish 127.0.0.1::5432 "${postgres_image}" \
+    -c shared_preload_libraries=pg_stat_statements >/dev/null
 
 ready="false"
 for _attempt in $(seq 1 30); do

@@ -109,6 +109,52 @@ def release(rng: random.Random, index: int, entities: int) -> Record:
     return Record(data_id, data, f"hash-{data_id}")
 
 
+def artist(rng: random.Random, index: int, entities: int) -> Record:
+    """Build one artist: a name plus group memberships and aliases referencing other artists."""
+    data_id = str(2_000_000 + index)
+    data = {
+        "id": data_id,
+        "name": f"Artist {index}",
+        "profile": "x" * rng.randint(0, 800),
+        "members": [{"id": str(_zipf(rng, entities))} for _ in range(rng.choice([0, 0, 0, 2, 4, 8]))],
+        "groups": [{"id": str(_zipf(rng, entities))} for _ in range(rng.choice([0, 0, 1, 2]))],
+        "aliases": [{"id": str(_zipf(rng, entities))} for _ in range(rng.choice([0, 0, 1, 3]))],
+    }
+    return Record(data_id, data, f"hash-{data_id}")
+
+
+def master(rng: random.Random, index: int, entities: int) -> Record:
+    """Build one master release: artists, genres, and styles."""
+    data_id = str(3_000_000 + index)
+    data = {
+        "id": data_id,
+        "title": f"Master {index}",
+        "year": str(rng.choice([1969, 1984, 1999, 2005, 2016, 2021])),
+        "artists": [{"id": str(_zipf(rng, entities))} for _ in range(rng.randint(1, 3))],
+        "genres": rng.sample(GENRES, rng.randint(1, 2)),
+        "styles": rng.sample(STYLES, rng.randint(1, 4)),
+    }
+    return Record(data_id, data, f"hash-{data_id}")
+
+
+BUILDERS = {"releases": release, "artists": artist, "masters": master}
+
+
+async def statement_breakdown(dsn: str, limit: int) -> list[dict[str, Any]]:
+    """Return the costliest statements since `pg_stat_statements_reset()`, by server time."""
+    async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as connection:
+        cursor = await connection.execute(
+            "SELECT left(regexp_replace(query, '\\s+', ' ', 'g'), 110), calls, rows, round(total_exec_time::numeric, 1), wal_bytes "
+            "FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+            "AND query NOT LIKE '%%pg_stat_statements%%' ORDER BY total_exec_time DESC LIMIT %s",
+            (limit,),
+        )
+        return [
+            {"statement": query, "calls": calls, "rows": rows, "server_ms": float(ms), "wal_kb": round(int(wal) / 1024)}
+            for query, calls, rows, ms, wal in await cursor.fetchall()
+        ]
+
+
 async def wal_position(dsn: str) -> int:
     """Return the current WAL insert position in bytes."""
     async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as connection:
@@ -134,7 +180,7 @@ async def run(args: argparse.Namespace, dsn: str) -> dict[str, Any]:
             raise SystemExit(f"{failures} schema statements failed")
         rng = random.Random(args.seed)  # noqa: S311 -- deterministic load shape, not security
         entities = max(1000, args.releases // 2)
-        records = [release(rng, index, entities) for index in range(args.releases)]
+        records = [BUILDERS[args.data_type](rng, index, entities) for index in range(args.releases)]
         batches = [records[start : start + args.batch_size] for start in range(0, len(records), args.batch_size)]
         writer = PostgreSQLBatchWriter(pool, MagicMock(), media_for_release, WriteAdmission(args.workers))
         queue: asyncio.Queue[list[Record]] = asyncio.Queue()
@@ -147,16 +193,22 @@ async def run(args: argparse.Namespace, dsn: str) -> dict[str, Any]:
                     batch = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                await writer.process_batch("releases", batch)
+                await writer.process_batch(args.data_type, batch)
 
+        if args.statements:
+            async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as connection:
+                await connection.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+                await connection.execute("SELECT pg_stat_statements_reset()")
         wal_before = await wal_position(dsn)
         started = time.perf_counter()
         await asyncio.gather(*(worker() for _ in range(args.workers)))
         seconds = time.perf_counter() - started
         wal_bytes = await wal_position(dsn) - wal_before
+        breakdown = await statement_breakdown(dsn, args.statements) if args.statements else None
     finally:
         await pool.close()
-    return {
+    result: dict[str, Any] = {
+        "data_type": args.data_type,
         "releases": args.releases,
         "batch_size": args.batch_size,
         "workers": args.workers,
@@ -165,6 +217,9 @@ async def run(args: argparse.Namespace, dsn: str) -> dict[str, Any]:
         "releases_per_second": round(args.releases / seconds, 1),
         "wal_mb": round(wal_bytes / 1_048_576, 1),
     }
+    if breakdown is not None:
+        result["statements"] = breakdown
+    return result
 
 
 def main() -> None:
@@ -174,6 +229,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--data-type", choices=sorted(BUILDERS), default="releases", help="entity table to write; --releases counts records of it")
+    parser.add_argument("--statements", type=int, default=0, metavar="N", help="also print the N costliest statements from pg_stat_statements")
     args = parser.parse_args()
     if min(args.releases, args.batch_size, args.workers) < 1:
         parser.error("--releases, --batch-size and --workers must be positive")
