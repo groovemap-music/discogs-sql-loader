@@ -1,3 +1,3 @@
 """GrooveMap Discogs SQL loader service."""
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
