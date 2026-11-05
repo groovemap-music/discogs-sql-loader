@@ -85,10 +85,10 @@ and supplies the commit fence through `before_refresh`/`before_commit` below;
 `DERIVED_REFRESH_MODE=inline` retains the old rollback behavior.
 `graphinator` acks the trigger BEFORE its own post-import maintenance starts and runs it
 detached with its own retry, because holding the delivery across unbounded work trips
-RabbitMQ's 30-minute consumer ack timeout, which closes the SHARED channel with
-PRECONDITION_FAILED: all four consumers die, the signal is redelivered, the sweep restarts
-from scratch, and after `x-delivery-limit=20` redeliveries the trigger is dead-lettered and
-maintenance never completes at all. The latch and schema-owned
+RabbitMQ's 30-minute consumer ack timeout. The broker then cancels that consumer and requeues
+the delivery, with the channel left open and no `x-delivery-count` spent, so the signal is
+redelivered, the sweep restarts from scratch, and nothing on the broker ever ends the loop.
+The latch and schema-owned
 job in `tableinator.durable_refresh` make the worker restart-safe; the measurement
 and cutover gates are in `docs/derived-refresh-ack-budget.md`.
 """

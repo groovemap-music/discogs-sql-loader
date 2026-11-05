@@ -132,7 +132,8 @@ confirmation before nacking that delivery. The broker keeps the message queued;
 a periodic recovery probe retries the failed signal's database commit without
 consuming another delivery attempt, and only then resubscribes. The in-memory copy
 is a recovery hint, never the sole obligation or a reason to ack. This prevents a
-database outage from rapidly exhausting the quorum queue's delivery limit of 20.
+database outage from redelivering the signal in a hot loop, which nothing on the broker
+would end: a nack does not spend the quorum queue's delivery limit of 20.
 If broker cancellation cannot be confirmed (including a missing queue mapping or
 failed rollback of a partial resubscription), the service closes the delivery
 connection/channel to requeue unsettled messages once. Recovery remains paused
@@ -180,7 +181,7 @@ last sanitized failure, and timestamps. No loader issues DDL. Required invariant
    job state commit atomically. A process/DB crash before commit leaves the old graph
    and an eligible durable job; a crash after commit is done exactly once per version.
    An expired lease is requeued with bounded backoff and an alert, not silently
-   abandoned after the broker's delivery limit.
+   abandoned.
 4. A newer extraction supersedes an older *pending* job; a straggler cannot schedule
    an old one. A running job rechecks the monotonic generation at commit under a
    short writer/commit fence: if superseded, roll back instead of stamping the old

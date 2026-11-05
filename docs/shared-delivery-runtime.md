@@ -1,8 +1,11 @@
 # Shared delivery runtime attestation
 
 Discogs SQL delivery lifecycle behavior is pinned to `groovemap-runtime` source revision
-`ecde48bdc30784ee0370166463f1d1a466544f35`, whose Git tree is
-`7ec3ac9338b25797b460bd6140c69ac188f510cd`. It supersedes `5459343ccaf46da5f71db11cda40d9338ce61d8d`
+`87c0d75ca457bd38b14e6ce6f713098a2b4c5e26`, whose Git tree is
+`bf2a2016a8d893e03788d05e1672dcdce915e3da`. It adds `BatchPolicy.max_requeues`, and a delivery that keeps failing now
+dead-letters at a stated bound, which `x-delivery-limit` does not give a nacked message. It builds on
+`ecde48bdc30784ee0370166463f1d1a466544f35` (tree `7ec3ac9338b25797b460bd6140c69ac188f510cd`), which
+superseded `5459343ccaf46da5f71db11cda40d9338ce61d8d`
 (tree `722fabc9ceab39fcfb0497b1c8a54ade84616a21`), whose batch engine let one queue's backlog starve every other queue's periodic flush
 and retained each handler that crossed the batch threshold, which leaked memory until the container
 restarted. A flush now returns under constant backlog, and returns `True` only when nothing is
@@ -36,10 +39,22 @@ held `POSTGRES_BATCH_MAX_HOLD_S` seconds (default 1500), the shared engine retur
   `POSTGRES_BATCH_FLUSH_INTERVAL` seconds. `BatchConfig` rejects any setting where
   `max_hold_s + flush_interval + backoff_max` (30 s default) reaches the 1800 s lux `consumer_timeout`.
   A write that is still blocked when the check is due can delay it further; the engine has no write timeout.
-- Each requeue increments the message's delivery count. Lux queues use `x-delivery-limit` 20, so a
-  record held through 20 requeues is dead-lettered on the next delivery. At 1500 s per hold that is
-  about 30,000 s, roughly **8.3 hours** of continuous outage. At the previous 900 s default it was
-  about 5 hours, and the 1800 s consumer timeout alone would allow about 10 hours.
+- RabbitMQ does not bound this. On 4.3.5 and 4.4.0 `nack(requeue=True)` and a consumer timeout leave
+  `x-delivery-count` unset and never dead-letter. A timeout cancels the consumer, requeues the delivery
+  and leaves the channel open. Only `basic.reject` and channel or connection closes spend
+  `x-delivery-limit` 20, and those dead-letter after the 21st delivery.
+- So the loader counts. `BatchConfig.max_requeues` (default 20) is read against the broker's
+  `x-acquired-count`, which rises on every return, and a delivery past it is logged and dead-lettered
+  instead of requeued, which also vetoes that run's stale-row purge. That is 21 holds, about **8.75
+  hours** of continuous outage at 1500 s, and up to a flush interval and a backoff more per hold.
+  Restarts and channel closes spend the same count, so they shorten it.
+- Non-batch mode has its own bound: `run_delivery` dead-letters after 500 requeues, about 8.3 hours at
+  `OutageBackoff`'s 60 s cap.
+- `requeue_callback`, `headers` and the budget work together: without the headers `max_requeues` is
+  never reached, and the shared engine warns once.
+- `file_complete` and `extraction_complete` are not bounded this way. A marker that cannot drain goes
+  back with `nack(requeue=True)` after `flush_queue`'s retries, and it keeps going until PostgreSQL
+  answers.
 - Dead-lettered records go to the DLQ, which is capped at **50,000 messages with drop-head**. Once the cap
   is reached the oldest dead letters are discarded. Under a long outage, check DLQ depth against this
   cap, because discarded dead letters cannot be replayed.
