@@ -53,7 +53,14 @@ from tableinator.durable_refresh import (
     record_durable_signal,
     run_worker_loop,
 )
-from tableinator.extraction_latch import LatchRelation, extraction_latch_key, probe_latch_relation, record_extraction_signal
+from tableinator.extraction_latch import (
+    LatchRelation,
+    extraction_latch_key,
+    probe_latch_relation,
+    purge_was_vetoed,
+    record_extraction_signal,
+    record_purge_veto,
+)
 from tableinator.graph_counters import refresh_derived_relations
 from tableinator.media import media_for_release
 from tableinator.queue_names import (
@@ -987,6 +994,76 @@ async def _recover_consumers() -> None:
         await _close_recovery_broker()
 
 
+async def dead_letters_waiting(data_type: str) -> int | None:
+    """Return how many dead letters the broker holds for one type, or None if it cannot say.
+
+    The broker is the only record that survives a restart and sees its own delivery_limit
+    dead-letters, which never reach this process. A new channel, because a passive declare
+    reads the live count only on a channel that does not know the queue yet.
+    """
+    connection = active_connection
+    if connection is None:
+        return None
+    channel = None
+    try:
+        channel = await connection.channel()
+        dlq = await channel.declare_queue(
+            name=catalog_dead_letter_queue_name(AMQP_CONSUMER_NAME, data_type),
+            passive=True,
+            robust=False,
+        )
+        return int(dlq.declaration_result.message_count)
+    except Exception as error:
+        logger.warning("⚠️ Could not read the dead-letter queue", data_type=data_type, error_type=type(error).__name__)
+        return None
+    finally:
+        if channel is not None:
+            with contextlib.suppress(Exception):
+                await channel.close()
+
+
+async def purge_veto_reason(data_type: str, data: dict[str, Any]) -> str | None:
+    """Return why this type's purge must not run for this extraction, or None if it may.
+
+    A dead-lettered record that is still in the dump never had its row refreshed, so a purge
+    would delete a current record beyond the DLQ. Dead letters left unreplayed keep vetoing
+    until an operator replays or clears them: see docs/operations.md.
+    """
+    if batch_processor is not None and batch_processor.had_dlq_nacks(data_type):
+        return "records were dead-lettered this run"
+    waiting = await dead_letters_waiting(data_type)
+    if waiting is None:
+        return "the dead-letter queue could not be read"
+    if waiting > 0:
+        return f"{waiting} dead letters are waiting"
+    version = extraction_latch_key(data)
+    if connection_pool is None or extraction_latch is None or version is None:
+        return None
+    try:
+        vetoed = await purge_was_vetoed(connection_pool, extraction_latch, version, data_type)
+    except Exception as error:
+        logger.warning("⚠️ Could not read the recorded purge veto", data_type=data_type, error_type=type(error).__name__)
+        return "the recorded veto could not be read"
+    return "an earlier delivery of this signal was vetoed" if vetoed else None
+
+
+async def persist_purge_veto(data_type: str, data: dict[str, Any]) -> bool:
+    """Record a veto on the latch. False means the signal must go back rather than be acked."""
+    version = extraction_latch_key(data)
+    if connection_pool is None or extraction_latch is None or version is None:
+        return True
+    try:
+        admission = write_admission
+        if admission is None:
+            raise DatabaseUnavailableError("Write admission not initialized")
+        async with admission.slot():
+            await record_purge_veto(connection_pool, extraction_latch, version, data_type)
+    except Exception as error:
+        logger.error("❌ Could not record the purge veto — requeueing terminal signal", data_type=data_type, error_type=type(error).__name__)
+        return False
+    return True
+
+
 async def purge_stale_rows(data_type: str, started_at: str, record_count: int | None = None) -> None:
     """Delete rows not refreshed by the current extraction when safe."""
     if connection_pool is None:
@@ -1141,19 +1218,20 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     record_terminal("failed", "invalid_extraction_version")
                     return
 
-            # Purge stale rows from prior extractions. Skip entirely if any message
-            # for this data_type was nacked to the DLQ this run (poison batch,
-            # flush-retry exhaustion, or normalize/missing-id failure): a DLQ'd
-            # record that is still present in the current dump was never upserted,
-            # so its row's updated_at was never refreshed and would otherwise look
-            # stale and get purged — deleting a still-current record beyond the DLQ.
+            # Purge stale rows from prior extractions, unless a record of this type is in the
+            # DLQ: it was never upserted, so its row's updated_at was never refreshed and would
+            # otherwise look stale and get purged. The veto is written to the latch first, so it
+            # holds for a redelivery of this signal and can be counted across dumps.
             purge_ok = True
-            purge_vetoed = batch_processor is not None and batch_processor.had_dlq_nacks(data_type)
+            veto_reason = await purge_veto_reason(data_type, data)
+            purge_vetoed = veto_reason is not None
             if purge_vetoed:
                 logger.warning(
-                    "⚠️ Skipping stale row purge — messages were nacked to the DLQ this run, so some dump-present rows may not have been refreshed",
+                    "⚠️ Skipping stale row purge — some dump-present rows may not have been refreshed",
                     data_type=data_type,
+                    reason=veto_reason,
                 )
+                purge_ok = await persist_purge_veto(data_type, data)
             elif connection_pool is not None:
                 try:
                     record_counts = data.get("record_counts", {})
@@ -1290,7 +1368,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     await schedule_consumer_cancellation(data_type, queues[data_type])
 
                 await message.ack()
-                # Only now is the veto spent. Cleared any earlier, a failed commit or ack
+                # Only now is this process's flag spent; the latch and the DLQ still hold. Cleared any earlier, a failed commit or ack
                 # would redeliver this signal with the veto gone, and it would purge rows
                 # whose records are still in the DLQ.
                 if purge_vetoed and batch_processor is not None:

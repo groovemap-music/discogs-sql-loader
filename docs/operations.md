@@ -142,8 +142,24 @@ does not read `consumer_count` from `declare_queue(passive=True)` on that channe
 aio-pika's `RobustChannel` answers from a cache for a queue it already knows.
 
 An `extraction_complete` delivery flushes all pending data before guarded stale-row
-cleanup. Cleanup is skipped when a message for that entity was dead-lettered or when
-the deletion would meet or exceed `PURGE_MAX_DELETE_FRACTION` of a non-empty table.
+cleanup. Cleanup is skipped when a message for that entity is in its dead-letter queue or
+when the deletion would meet or exceed `PURGE_MAX_DELETE_FRACTION` of a non-empty table.
+
+The veto reads three sources, so it survives a restart and covers dead letters the broker made
+itself: this run's rejections in memory, the depth of the entity's `.dlq` on the broker, and
+`loader_extraction_latch.purge_vetoed` for this extraction. If the broker cannot be read, the
+purge is skipped. Every veto is written to `purge_vetoed`, one array per extraction.
+
+**A dead letter keeps vetoing until someone deals with it.** Stale rows for that entity stay until
+the DLQ is empty. To clear it, look at what is there first, then either replay the records once the
+cause is fixed, so their rows refresh, or purge the DLQ from the operations console (`POST
+/api/admin/dlq/purge/{queue}`) if the records are not wanted. Purging is safe for the database, because
+nothing deletes a row until the next extraction, and that extraction refreshes every record still
+in the dump. The next extraction then purges normally.
+
+This loader requires the `purge_vetoed` column. Against an older schema the startup probe declines
+the latch and the service reports degraded, so the `database-schema` release carrying the column
+must reach the host first.
 
 Completion state is in memory. On process restart, the producer may resume and skip
 files completed earlier. The delete guard is therefore part of the restart-safety

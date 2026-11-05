@@ -82,7 +82,9 @@ __all__ = [
     "extraction_latch_key",
     "mark_extraction_refreshed",
     "probe_latch_relation",
+    "purge_was_vetoed",
     "record_extraction_signal",
+    "record_purge_veto",
 ]
 
 # This loader's value for the `loader` column. `musicbrainz-sql-loader` writes 'musicbrainz'
@@ -106,6 +108,7 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, str | None]]] = {
     "created_at": ("timestamp with time zone", None),
     "updated_at": ("timestamp with time zone", None),
     "refreshed_at": ("timestamp with time zone", None),
+    "purge_vetoed": ("ARRAY", "_text"),
 }
 
 # The columns every statement keys on, and the ones `ON CONFLICT` names.
@@ -208,6 +211,29 @@ class LatchRelation:
             values=values,
             data_type=sql.Placeholder("data_type"),
             newer_scope=newer_scope,
+        )
+
+    def veto_statement(self) -> sql.Composed:
+        """Return the statement recording that this extraction vetoed one type's purge.
+
+        It can run before the type's first signal, so it may create the row. Signals and the
+        generation are written by their own statements, which treat an existing row as usual.
+        """
+        columns = sql.SQL(", ").join(sql.Identifier(name) for name in self.key_columns)
+        values = sql.SQL(", ").join(sql.Placeholder(name) for name in self.key_columns)
+        return sql.SQL(
+            "INSERT INTO {relation} AS latch ({columns}, purge_vetoed) VALUES ({values}, ARRAY[{data_type}]::text[]) "
+            "ON CONFLICT ({columns}) DO UPDATE "
+            "SET purge_vetoed = (SELECT array_agg(DISTINCT vetoed ORDER BY vetoed) FROM unnest(latch.purge_vetoed || EXCLUDED.purge_vetoed) AS vetoed), "
+            "updated_at = NOW()"
+        ).format(relation=self._relation(), columns=columns, values=values, data_type=sql.Placeholder("data_type"))
+
+    def vetoed_statement(self) -> sql.Composed:
+        """Return the statement reading whether this extraction vetoed one type's purge."""
+        return sql.SQL("SELECT {data_type} = ANY(purge_vetoed) FROM {relation} WHERE {key}").format(
+            relation=self._relation(),
+            key=self._key_predicate(),
+            data_type=sql.Placeholder("data_type"),
         )
 
     def stamp_statement(self) -> sql.Composed:
@@ -359,6 +385,29 @@ async def probe_latch_relation(connection_pool: Any, logger: Any) -> LatchRelati
             error=str(exc),
         )
         return None
+
+
+async def record_purge_veto(connection_pool: Any, latch: LatchRelation, version: str, data_type: str) -> None:
+    """Record that this extraction vetoed DATA_TYPE's purge, so it outlives this process.
+
+    Raises:
+        Exception: Whatever PostgreSQL raised. The caller must requeue the signal, because
+            acking it would leave no record of the veto.
+    """
+    async with connection_pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            await cursor.execute(latch.veto_statement(), latch.parameters(version, data_type))
+
+
+async def purge_was_vetoed(connection_pool: Any, latch: LatchRelation, version: str, data_type: str) -> bool:
+    """Return whether this extraction already vetoed DATA_TYPE's purge."""
+    async with connection_pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            await cursor.execute(latch.vetoed_statement(), latch.parameters(version, data_type))
+            row = await cursor.fetchone()
+    return bool(row and row[0])
 
 
 async def record_extraction_signal(connection_pool: Any, latch: LatchRelation, version: str, data_type: str) -> ExtractionLatch:

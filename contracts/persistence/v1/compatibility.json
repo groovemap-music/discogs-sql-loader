@@ -143,10 +143,16 @@
       "loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
       "loader_extraction_latch.generation": "BIGINT NULL (legacy rows retain NULL until the loader cutover)",
       "loader_extraction_latch.loader": "TEXT NOT NULL",
+      "loader_extraction_latch.purge_vetoed": "TEXT[] NOT NULL DEFAULT '{}' (entity types whose stale-row purge this extraction vetoed; rows written before the column read as none)",
       "loader_extraction_latch.refreshed_at": "TIMESTAMPTZ",
       "loader_extraction_latch.signals": "TEXT[] NOT NULL DEFAULT '{}'",
       "loader_extraction_latch.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
       "loader_extraction_latch.version": "TEXT NOT NULL"
+    },
+    "column_writers": {
+      "loader_extraction_latch.purge_vetoed": [
+        "discogs-sql-loader"
+      ]
     },
     "consumers": [
       "discogs-sql-loader",
@@ -655,6 +661,54 @@
         "graph.member_of",
         "graph.mb_rel_artist_artist"
       ]
+    },
+    "neo4j_only": {
+      "availability": "unconditional",
+      "kind": "additive",
+      "decision": "Recorded as Neo4j-only, not published relationally. No relational reader of any of these is known today, and publishing a relation of about 5.0M rows (the distinct-pairs count from Postgres; lux has no HAS_STYLE edges yet) with no reader and no writer would add load cost for nothing. Publishing them later is additive; would_publish_as names the shape a later bead would add.",
+      "artist_properties": {
+        "label": "artist",
+        "published": [
+          "degree"
+        ],
+        "neo4j_only": [
+          "release_count",
+          "label_count",
+          "primary_genre"
+        ],
+        "writer": "discogs-graph-enricher",
+        "would_publish_as": "graph.artist_stats keyed on artist_id, joined into graph.artist_vertex beside graph.artist_degree, with discogs-sql-loader as writer",
+        "note": "graph_schema.counter_properties.labels.artist.properties stays [degree] on purpose: check-contracts.py proves each listed property is a column of graph.artist_vertex, and these three are not."
+      },
+      "relationships": {
+        "HAS_STYLE": {
+          "pattern": "(:Label)-[:HAS_STYLE {release_count}]->(:Style)",
+          "derived_from": [
+            "ON",
+            "IS"
+          ],
+          "writer": "discogs-graph-enricher (post-import maintenance)",
+          "cardinality": "one per label and style, no cap",
+          "observed_count": "about 5.0M distinct (label, style) pairs, counted from Postgres; lux has no HAS_STYLE edges yet",
+          "in_shortest_path_types": false,
+          "effect_on_path_surface": "None. HAS_STYLE is outside the relationship types graph.find_shortest_path walks, so that function, graph_path rels and edge_relations are unchanged.",
+          "would_publish_as": "a loader-written graph.label_style table keyed (label_id, style_name) carrying release_count, derived from graph.on_label and graph.in_style"
+        }
+      },
+      "node_properties": {
+        "ExtractionCompletion.stats_version": {
+          "type": "integer",
+          "writer": "discogs-graph-enricher",
+          "reader": "catalog-api",
+          "note": "A persisted property of the Neo4j ExtractionCompletion node. It is not a column of this schema and is not published relationally."
+        },
+        "MaintenanceCheckpoint.run_key": {
+          "format": "<version>@stats-<N>",
+          "writer": "discogs-graph-enricher",
+          "note": "A persisted property of the Neo4j MaintenanceCheckpoint node; it is not graph.extraction_latch, which keys on (loader, extraction) and is unchanged."
+        }
+      },
+      "indexes_and_constraints": "None added or required."
     },
     "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, one more is the cross-provenance MEMBER_OF union recorded under graph_schema.member_of_union, one more is the per-vertex degree recorded under graph_schema.vertex_degree, two more (graph.track_credited_on and graph.track_by_artist) are the track-level credits and performers that never had a view, which makes thirty-one tables, and the remaining thirty-seven relations are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
     "path_function": {

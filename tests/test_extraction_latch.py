@@ -43,6 +43,7 @@ DECLARED_COLUMNS = [
     ("created_at", TIMESTAMP, "timestamptz"),
     ("updated_at", TIMESTAMP, "timestamptz"),
     ("refreshed_at", TIMESTAMP, "timestamptz"),
+    ("purge_vetoed", "ARRAY", "_text"),
 ]
 
 # `loader_extraction_latch_pkey`, as `pg_constraint` reports its columns.
