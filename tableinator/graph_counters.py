@@ -167,13 +167,17 @@ SELECT genre.name AS name,
           FROM graph.in_genre AS in_genre
           JOIN graph.in_style AS in_style ON in_style.release_id = in_genre.release_id
          WHERE in_genre.genre_name = genre.name) AS style_count,
-       (SELECT min(btrim(release.year)::integer)
-          FROM graph.in_genre AS edge
-          JOIN graph.release AS release ON release.release_id = edge.release_id
-         WHERE edge.genre_name = genre.name
-           AND btrim(release.year) ~ '^[0-9]+$'
-           AND btrim(release.year)::numeric > 0) AS first_year
+       first_year.first_year AS first_year
 FROM graph.genre AS genre
+LEFT JOIN (
+    SELECT edge.genre_name AS name, min(btrim(release.year)::integer) AS first_year
+      FROM graph.in_genre AS edge
+      JOIN (SELECT releases.data_id::text AS release_id, releases.data ->> 'year' AS year
+              FROM public.releases AS releases) AS release ON release.release_id = edge.release_id
+     WHERE btrim(release.year) ~ '^[0-9]+$'
+       AND btrim(release.year)::numeric > 0
+     GROUP BY edge.genre_name
+) AS first_year ON first_year.name = genre.name
 """,
     "style_stats": """
 SELECT style.name AS name,
@@ -190,13 +194,17 @@ SELECT style.name AS name,
           FROM graph.in_style AS in_style
           JOIN graph.in_genre AS in_genre ON in_genre.release_id = in_style.release_id
          WHERE in_style.style_name = style.name) AS genre_count,
-       (SELECT min(btrim(release.year)::integer)
-          FROM graph.in_style AS edge
-          JOIN graph.release AS release ON release.release_id = edge.release_id
-         WHERE edge.style_name = style.name
-           AND btrim(release.year) ~ '^[0-9]+$'
-           AND btrim(release.year)::numeric > 0) AS first_year
+       first_year.first_year AS first_year
 FROM graph.style AS style
+LEFT JOIN (
+    SELECT edge.style_name AS name, min(btrim(release.year)::integer) AS first_year
+      FROM graph.in_style AS edge
+      JOIN (SELECT releases.data_id::text AS release_id, releases.data ->> 'year' AS year
+              FROM public.releases AS releases) AS release ON release.release_id = edge.release_id
+     WHERE btrim(release.year) ~ '^[0-9]+$'
+       AND btrim(release.year)::numeric > 0
+     GROUP BY edge.style_name
+) AS first_year ON first_year.name = style.name
 """,
     "label_stats": """
 SELECT label.label_id AS label_id,
