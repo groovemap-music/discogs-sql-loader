@@ -3,6 +3,29 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.4.5 (2026-11-05)
+
+### Operator notes
+
+- **Behaviour change: an outage past about 25.4 hours dead-letters held records.** While PostgreSQL is
+  down the loader holds each delivery and returns it to RabbitMQ. A delivery now goes back at most
+  `POSTGRES_BATCH_MAX_REQUEUES` times (default 60, so 61 holds, about 25.4 hours at the 1500 s hold),
+  counted from the broker's `x-acquired-count`, and is then dead-lettered instead of requeued. Records
+  held past that are in the DLQ, not lost, and a dead-lettered record vetoes that run's stale-row
+  purge. Restarts and channel closes spend the same count. Before this, a held record could return
+  forever. Raise `POSTGRES_BATCH_MAX_REQUEUES` (at least 1) to survive a longer outage.
+- **Person names.** A credit name is stripped of surrounding whitespace, control and format characters
+  (for example U+200C, U+200F, U+FEFF) before it keys a Person, and a name that is only padding is
+  skipped and counted. Release together with discogs-graph-enricher v0.6.1: stripping in one store
+  alone splits the Person keys. `groovemap-runtime` is pinned to `0687736`.
+
+### Fix
+
+- **person-names**: strip padding from a credit name before it keys a Person
+- **redelivery**: clear the purge veto only after the ack succeeds
+- **redelivery**: keep the purge veto until the terminal signal commits
+- **redelivery**: dead-letter a record that keeps failing at a stated bound
+
 ## v0.4.4 (2026-11-05)
 
 ### Operator notes
