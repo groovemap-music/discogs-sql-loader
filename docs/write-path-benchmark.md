@@ -15,7 +15,8 @@ It prints one JSON line:
 
 Arguments: `--releases` (the record count, whatever the type), `--batch-size`, `--workers`, `--seed`
 (default 5000, 500, 1, 1), `--data-type releases|artists|masters` (default `releases`), and `--statements N`,
-which also prints the N costliest statements from `pg_stat_statements` (calls, rows, server milliseconds, WAL).
+which (loopback or Unix-socket databases only, even with `--allow-remote-host`, because it runs `CREATE EXTENSION` and
+`pg_stat_statements_reset()`) also prints the N costliest statements from `pg_stat_statements` (calls, rows, server milliseconds, WAL).
 
 ## What it does
 
@@ -27,9 +28,12 @@ credits on about 30%, Zipf-distributed entity ids so vertices conflict as they d
 them through the real `PostgreSQLBatchWriter.process_batch`, `AsyncPostgreSQLPool` and `WriteAdmission`.
 Identifier aliases are not generated; the 7qar audit measured them at about 1% of server time.
 
+Stopping the wrapper with SIGTERM or Ctrl-C stops the benchmark first, then removes the container.
+
 It is not part of `just check` or the default test lane, and it needs Docker. To use your own throwaway
 database instead, run `TEST_DATABASE_URL=... uv run python scripts/benchmark-write-path.py`; it applies the
-schema and writes rows, so never point it at a real database.
+schema and writes rows, so never point it at a real database. The script refuses a `TEST_DATABASE_URL` whose host is not loopback or a
+Unix socket unless you also pass `--allow-remote-host`.
 
 ## Reading the numbers
 
@@ -39,6 +43,10 @@ throughput repeated within 1% (368.0 and 364.7 releases/s on 2026-11-04, Docker 
 under about 15% as noise on a busy machine, and run each variant more than once.
 
 ## Artist and master write paths (gm-discogs-sql-loader-2njb)
+
+**Scope: these numbers cover the insert path only.** Every record written is new, so the hash gate never finds an
+existing row. The changed-row path (hash differs: upsert conflict update, `DELETE` then re-insert of derived edges)
+and the unchanged-row path (`updated_at` refresh, backfills) are not measured here.
 
 Measured 2026-11-04 on the same machine and a disposable PostgreSQL 18, v0.4.3 (`c74843c`) with the
 harness above: 20 000 records, batch 500, one worker, seed 1.
