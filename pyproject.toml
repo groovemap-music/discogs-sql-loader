@@ -40,7 +40,7 @@ dev = [
     "build>=1.6.1",
     "commitizen>=4.19.2",
     "cyclonedx-bom>=7.5.0",
-    "groovemap-database-schema==0.6.1",
+    "groovemap-database-schema==0.6.3",
     "mypy>=2.4.0",
     "pip-audit>=2.10.1",
     "pip-licenses>=5.5.5",
@@ -63,7 +63,7 @@ override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "5459343ccaf46da5f71db11cda40d9338ce61d8d" }
-groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "707b24121c51d1f6458df13e4576bb2ea3cb2792" }
+groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "0f02656a66c03804dbec567984acb7f6f57bb500" }
 
 [tool.ruff]
 extend-exclude = ["tableinator/catalog_contract.py"]

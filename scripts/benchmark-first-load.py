@@ -70,6 +70,7 @@ async def run(args: argparse.Namespace, dsn: str) -> None:
     try:
         if await create_postgres_schema(pool):
             raise SystemExit("schema statements failed")
+        _WRITE_PATH.mark_benchmark_database(dsn)
 
         deferred: list[tuple[str, str, str]] = []
         dropped_in = 0.0
@@ -154,7 +155,7 @@ def main() -> None:
     dsn = os.environ.get("TEST_DATABASE_URL")
     if not dsn:
         parser.error("TEST_DATABASE_URL is required (a disposable database)")
-    _WRITE_PATH.require_local_database(dsn, allow_remote=args.allow_remote_host)
+    dsn = _WRITE_PATH.require_local_database(dsn, allow_remote=args.allow_remote_host)
     asyncio.run(run(args, dsn))
 
 

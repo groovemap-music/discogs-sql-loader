@@ -64,6 +64,11 @@ benchmark-write-path *args:
 benchmark-first-load *args:
     bash scripts/benchmark-first-load.sh {{args}}
 
+# What one poison record costs per batch size: acked, dead-lettered, writer calls. Disposable
+# PostgreSQL, same container recipe as benchmark-write-path. Documented in docs/write-path-benchmark.md.
+benchmark-poison *args:
+    BENCHMARK_SCRIPT=scripts/benchmark-poison.py bash scripts/benchmark-write-path.sh {{args}}
+
 # Cross-store parity against discogs-graph-enricher: the same fixture events into this
 # loader's PostgreSQL and the enricher's Neo4j, then a per-label comparison of the two
 # graphs. Starts both pinned containers and removes them, and their anonymous volumes,

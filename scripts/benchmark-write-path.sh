@@ -39,7 +39,7 @@ port="${port##*:}"
 # Run the benchmark as a child we can stop: a signal to this script must not leave it writing
 # into a container the trap is about to remove.
 TEST_DATABASE_URL="postgresql://postgres:benchmark@127.0.0.1:${port}/postgres" \
-    uv run python scripts/benchmark-write-path.py "$@" &
+    uv run python "${BENCHMARK_SCRIPT:-scripts/benchmark-write-path.py}" "$@" &
 child=$!
 
 stop_child() {

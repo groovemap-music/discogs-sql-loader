@@ -251,7 +251,7 @@ def test_a_vocabulary_row_no_release_names_still_gets_a_row(relation: str, verte
     the zero row; the counts themselves are `count(...)`, which is 0 rather than NULL.
     """
     body = COUNTER_BODIES[relation]
-    assert body.rstrip().endswith(f"FROM {vertex} AS {vertex.split('.')[1]}")
+    assert f"FROM {vertex} AS {vertex.split('.')[1]}\nLEFT JOIN (" in body
     assert "count(*)" in body
 
 
