@@ -59,6 +59,11 @@ test-admission-integration:
 benchmark-write-path *args:
     bash scripts/benchmark-write-path.sh {{args}}
 
+# First-load shaped run at scale (60k releases by default) with optional --defer-indexes and
+# BENCHMARK_PG_ARGS server settings. Disposable PostgreSQL. Documented in docs/first-load-index-and-wal.md.
+benchmark-first-load *args:
+    bash scripts/benchmark-first-load.sh {{args}}
+
 # Cross-store parity against discogs-graph-enricher: the same fixture events into this
 # loader's PostgreSQL and the enricher's Neo4j, then a per-label comparison of the two
 # graphs. Starts both pinned containers and removes them, and their anonymous volumes,
