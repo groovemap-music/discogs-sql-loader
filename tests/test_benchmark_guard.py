@@ -7,9 +7,13 @@ replaced with the peer a real libpq would have reported for each DSN shape.
 import importlib.util
 import socket
 from pathlib import Path
-from types import ModuleType
+from typing import TYPE_CHECKING
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 
 def _load() -> ModuleType:
