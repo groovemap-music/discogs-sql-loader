@@ -84,3 +84,56 @@ document-scoped `DELETE`s each cost under 80 ms in total.
   there is no redundant work to remove.
 
 **Fixes filed:** none. No statement in either path is out of proportion to the rows it writes.
+
+## Batch size and worker count (gm-discogs-sql-loader-pf94)
+
+Measured 2026-11-04 on v0.4.3 with the pinned schema (`groovemap-database-schema` 0.6.1), real PostgreSQL 18 in
+a fresh container per cell, 12 000 releases, seed 1, two repetitions per cell. Insert path only (see above).
+Records per second, both repetitions, then the mean:
+
+| Batch size | 1 worker | 2 workers | 4 workers |
+| ---: | --- | --- | --- |
+| 100 | 228, 308 (268) | 389, 263 (326) | 436, 314 (375) |
+| 500 | 406, 389 (397) | 388, 373 (380) | 423, 364 (393) |
+| 1000 | 393, 426 (409) | 432, 368 (400) | 446, 311 (379) |
+| 2000 | 404, 400 (402) | 428, 222 (325) | 451, 307 (379) |
+| 4000 | 400, 349 (374) | 440, 349 (394) | 434, 295 (364) |
+
+WAL was 177-180 MB in every cell, so the work done is identical. Repetitions of the same cell differ by up to
+about 40% on this machine (swap pressure, other developers' containers), so only large effects are readable:
+
+- **Batch 100 is clearly worse** than 500 and up (about 270 against about 400 records/s with one worker).
+- **Batch 500 to 4000 is flat** within the noise. The 7qar audit's 26.3 s to 15.2 s (1.7x) for 500 to 2000 does
+  not reproduce on the current code: it was measured before the set-based writes landed, and with them the
+  per-batch round-trip overhead it removed is already gone.
+- **Workers 1 to 4 add at most about 10%** and not consistently. The cost is server-side CPU in the
+  schema's generated `role_category` column (audit item 1), which more connections do not shorten.
+
+**Recommendation: keep batch size 500 and the current writer admission; change neither for the first load.**
+A larger batch buys nothing measurable and costs more per poison isolation (below) and more unacked
+deliveries held (prefetch is `max(200, 2 x batch)` per consumer). If any deployment still runs the code
+default of 100, moving it to 500 is the one change the data supports. The lever that moves the full-load time
+is the schema's `credit_role_category` cost, which is a database-schema change.
+
+### Poison isolation and the hold budget
+
+`just benchmark-poison` puts one record in a batch that PostgreSQL rejects (a NUL character in a JSON string,
+SQLSTATE 22P05) and drains it through the real batch processor. Results, poison at the middle of the batch:
+
+| Batch size | Acked | Dead-lettered | Healthy dead-lettered | Writer calls | Seconds |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 99 | 1 | 0 | 13 | 2.3 |
+| 500 | 499 | 1 | 0 | 17 | 5.3 |
+| 1000 | 999 | 1 | 0 | 19 | 9.9 |
+| 2000 | 1999 | 1 | 0 | 21 | 13.7 |
+| 4000 | 3999 | 1 | 0 | 23 | 24.3 |
+
+Position 0 gave the same counts at 500 (4.1 s) and 2000 (11.6 s). The engine bisects to exactly the poison
+record: no healthy record is dead-lettered at any size, and the writer calls grow with log2(batch size). Time
+grows about linearly with batch size (a bisection rewrites each half), from 2 s to 24 s per poison record
+between 100 and 4000.
+
+The hold budget (`max_hold_s` 1500 s, plus the 5 s flush interval and 30 s maximum backoff, must stay under the
+1800 s broker `consumer_timeout`) bounds time spent in transient backoff. One poison isolation at 4000 takes
+24 s, so batch size does not threaten it, but a dump with frequent poison records would pay that per record:
+isolation cost is the reason not to raise the batch size without a measured gain.
