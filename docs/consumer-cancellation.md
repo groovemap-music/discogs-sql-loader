@@ -46,6 +46,24 @@ run's grace timer. Timer cleanup removes only its own reference, so a canceled o
 timer cannot erase a replacement timer. Recovery also resets completion for types
 with pending messages; initially empty types reset when their first record arrives.
 
+## Terminal signals that arrive after the cancel
+
+The extractor publishes `extraction_complete` to every type only after the last file, so
+for a long-running file the earlier types are already cancelled and the signal is queued
+with no consumer. A cancelled consumer holds nothing, so the loader does not keep it
+subscribed for the whole run. Instead, while a type is complete, unsubscribed, and its
+`extraction_complete` is not yet settled, the periodic checker probes that queue every
+`MARKER_CHECK_INTERVAL` seconds (default `5`) with a passive declare and resubscribes
+only the type that holds a message. The consumer cancels again `CONSUMER_CANCEL_DELAY`
+after the marker is settled, so the bound on what a consumer holds is unchanged. If the
+transport is closed, the same tick runs the full queue probe.
+
+A queued marker is therefore waiting for at most `MARKER_CHECK_INTERVAL` plus one
+resubscribe. Before this, it waited for the idle reconnect, up to `QUEUE_CHECK_INTERVAL`
+(one hour) after everything was idle. Because a broker-side `NO CONSUMER` is expected
+for that long, `/health` lists the types in `awaiting_extraction_complete`; an operator
+console should treat a queue in that list as an expected wait, not a critical state.
+
 After every entity completes, the service closes its RabbitMQ connection. It reconnects
 on the next periodic queue check when new messages are available. The interval is
 controlled by `QUEUE_CHECK_INTERVAL` and defaults to one hour.

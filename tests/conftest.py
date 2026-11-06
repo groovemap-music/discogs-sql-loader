@@ -182,6 +182,7 @@ def reset_service_state() -> Iterator[None]:
         service.consumer_tags = {}
         service.consumer_cancel_tasks = {}
         service.completed_files = set()
+        service.extraction_signalled = set()
         service.queues = {}
         service.idle_mode = False
         service.durable_refresh_active = False

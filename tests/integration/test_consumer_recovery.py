@@ -332,3 +332,85 @@ async def test_consumer_cancelled_on_purpose_is_not_treated_as_lost(loader: Load
     assert loader.recoveries == []
     assert await loader.consumers(HOLD_TYPE) == 0
     assert all([await loader.consumers(data_type) == 1 for data_type in other_types])
+
+
+PARKED_TYPES = ("artists", "labels", "masters")
+LONG_RUNNING_TYPE = "releases"
+MARKER_INTERVAL = 2
+# One probe tick, a resubscribe and the handler, with margin. The incident waited up to QUEUE_CHECK_INTERVAL (3600 s).
+PARKED_MARKER_BOUND = MARKER_INTERVAL + 5
+# Hard deadline for a run whose probe is disabled (LATENCY_BASELINE=1) and must wait for the idle reconnect.
+BASELINE_DEADLINE = 150
+BASELINE_QUEUE_CHECK_INTERVAL = 60
+
+
+@pytest.mark.timeout(BASELINE_DEADLINE + 30)
+@pytest.mark.asyncio
+async def test_extraction_complete_parked_on_cancelled_consumers_lands_within_the_probe_interval(loader: Loader) -> None:
+    """The 2026-11-06 ingest: markers published after three consumers were cancelled, releases still running.
+
+    LATENCY_BASELINE=1 disables the probe to measure the old behaviour on the same broker; it then
+    only has to finish inside its hard deadline.
+    """
+    baseline = os.environ.get("LATENCY_BASELINE") == "1"
+    probe = service.recover_parked_markers
+
+    async def disabled() -> bool:
+        return False
+
+    with (
+        patch.object(service, "CONSUMER_CANCEL_DELAY", 1),
+        patch.object(service, "MARKER_CHECK_INTERVAL", MARKER_INTERVAL),
+        patch.object(service, "QUEUE_CHECK_INTERVAL", BASELINE_QUEUE_CHECK_INTERVAL),
+        patch.object(service, "recover_parked_markers", disabled if baseline else probe),
+    ):
+        # The checker's first idle check fires at once (its last-check clock starts at 0). Spend it, so the
+        # run starts like a production ingest, hours after the last full check.
+        # Only the idle path sets the checker's clock: all files complete and the broker closed.
+        service.completed_files.update(service.DATA_TYPES)
+        service.extraction_signalled.update(service.DATA_TYPES)
+        await service._close_recovery_broker()
+        spent = len(loader.recoveries)
+
+        async def idle_check_ran() -> bool:
+            return len(loader.recoveries) > spent
+
+        await _until(idle_check_ran, 10, "the checker's first idle check")
+
+        async def disconnected() -> bool:
+            return service.active_connection is None
+
+        await _until(disconnected, 10, "the idle check to leave the loader disconnected")
+        service.completed_files.clear()
+        service.extraction_signalled.clear()
+        # The checker re-attaches the loader itself; a second, concurrent recovery would double-subscribe.
+        await _until(lambda: _all_attached(loader), 15, "the checker to re-attach the loader")
+
+        for data_type in PARKED_TYPES:
+            await loader.publish(data_type, type="file_complete", total_processed=0)
+
+        async def parked_consumers_cancelled() -> bool:
+            return not any([await loader.consumers(data_type) for data_type in PARKED_TYPES])
+
+        await _until(parked_consumers_cancelled, 10, "the three finished types to have their consumers cancelled")
+        assert await loader.consumers(LONG_RUNNING_TYPE) == 1, "the long-running type keeps its consumer"
+        # An idle cancelled consumer holds nothing: the queues are empty and nothing is unacked.
+        assert not any([await loader.ready(data_type) for data_type in PARKED_TYPES])
+        assert not any(service.consumer_tags.get(data_type) for data_type in PARKED_TYPES)
+
+        await loader.publish(LONG_RUNNING_TYPE, type="file_complete", total_processed=0)
+        started = time.monotonic()
+        for data_type in service.DATA_TYPES:
+            await loader.publish(data_type, type="extraction_complete", version="20261106", started_at="2026-11-06T00:00:00Z")
+
+        async def all_signalled() -> bool:
+            return all(loader.was_handled(data_type, "extraction_complete") for data_type in service.DATA_TYPES)
+
+        await _until(all_signalled, BASELINE_DEADLINE if baseline else PARKED_MARKER_BOUND, "extraction_complete on every queue")
+        elapsed = time.monotonic() - started
+        print(f"\nPARKED_MARKER_LATENCY mode={'baseline-no-probe' if baseline else 'probe'} seconds={elapsed:.2f}")
+
+        assert set(service.extraction_signalled) == set(service.DATA_TYPES)
+        # The resubscribed consumers cancel again after the marker: the bound on what they hold is unchanged.
+        await _until(parked_consumers_cancelled, 10, "the resubscribed consumers to be cancelled again")
+        assert not any([await loader.ready(data_type) for data_type in service.DATA_TYPES])
