@@ -84,7 +84,7 @@ async def _database_rows(connection: psycopg.AsyncConnection[Any]) -> int:
 
 
 @pytest_asyncio.fixture
-async def loader(postgres_connection: psycopg.AsyncConnection[Any]) -> AsyncIterator[Loader]:
+async def loader(request: pytest.FixtureRequest, postgres_connection: psycopg.AsyncConnection[Any]) -> AsyncIterator[Loader]:
     amqp_url = os.environ.get("TEST_AMQP_URL")
     database_url = os.environ.get("TEST_DATABASE_URL")
     if not amqp_url or not database_url:
@@ -99,7 +99,15 @@ async def loader(postgres_connection: psycopg.AsyncConnection[Any]) -> AsyncIter
         health_check_interval=3600,
     )
     await pool.initialize()
-    config = BatchConfig(batch_size=4, min_batch_size=1, flush_interval=0.05, max_pending=12, backoff_initial=0.05, backoff_max=0.1, max_hold_s=0.5)
+    config = BatchConfig(
+        batch_size=4,
+        min_batch_size=1,
+        flush_interval=0.05,
+        max_pending=12,
+        backoff_initial=0.05,
+        backoff_max=0.1,
+        max_hold_s=getattr(request, "param", 0.5),
+    )
     processor = PostgreSQLBatchProcessor(pool, config, WriteAdmission(1))
 
     connection = await aio_pika.connect(amqp_url)
@@ -258,6 +266,12 @@ async def test_closing_one_types_channel_leaves_the_others_consuming() -> None:
             before = {data_type: await consumers(data_type) for data_type in service.DATA_TYPES}
 
             await channels["labels"].close()
+
+            async def labels_detached() -> bool:
+                return await consumers("labels") == 0
+
+            # The broker drops a closed channel's consumer asynchronously.
+            await until(labels_detached, 10, "the broker to drop the closed channel's consumer")
             after = {data_type: await consumers(data_type) for data_type in service.DATA_TYPES}
             print(f"\nCHANNELS: consumers per queue before {before}, after closing the labels channel {after}")
             assert before == dict.fromkeys(service.DATA_TYPES, 1)
@@ -284,3 +298,54 @@ async def test_closing_one_types_channel_leaves_the_others_consuming() -> None:
         await manager_connection.close()
         await publishing.close()
         await observer.close()
+
+
+@pytest.mark.parametrize("loader", [1.2], indirect=True)
+async def test_records_held_and_requeued_through_an_outage_stay_unhealthy_across_every_requeue(loader: Loader) -> None:
+    """The lux shape: PostgreSQL stays down, each hold ends in a requeue, and health must not flip back.
+
+    A requeue hands the record back to the broker unwritten, so it neither counts as progress nor
+    restarts the wait. Before, the requeue reset both and health reported healthy for part of every
+    hold with no row written.
+    """
+    observer = loader.processor._observer
+    real_write = loader.processor._process_batch
+    outage = True
+
+    async def write(data_type: str, messages: list[Any]) -> Any:
+        if outage:
+            raise OperationalError("server closed the connection unexpectedly")
+        return await real_write(data_type, messages)
+
+    timeline: list[tuple[float, str]] = []
+    with patch.object(loader.processor, "_process_batch", write):
+        await loader.publish(2)
+        started = time.monotonic()
+        while observer.requeued_counts[DATA_TYPE] < 4 or time.monotonic() - started < 4.0:
+            assert time.monotonic() - started < 30, "the held records were never requeued"
+            timeline.append((time.monotonic() - started, loader.health()["status"]))
+            await asyncio.sleep(0.05)
+
+        first_unhealthy = next(at for at, status in timeline if status == "unhealthy")
+        flips = [at for at, status in timeline if at > first_unhealthy and status != "unhealthy"]
+        print(
+            f"\nHELD: unhealthy from {first_unhealthy:.2f}s; {observer.requeued_counts[DATA_TYPE]} requeues over {timeline[-1][0]:.1f}s; "
+            f"healthy samples after that: {len(flips)} of {len([1 for at, _ in timeline if at > first_unhealthy])}"
+        )
+        assert observer.requeued_counts[DATA_TYPE] >= 4
+        assert first_unhealthy <= STALL_S + PROBE_S + 1.0
+        assert flips == [], f"health flipped back to healthy at {flips[:3]} with nothing written"
+        assert await _database_rows_via(loader) == 0
+
+        outage = False
+        await until(lambda: observer.processed_counts[DATA_TYPE] == 2, 30, "the held records to be written once PostgreSQL is back")
+    await until(lambda: loader.health()["status"] == "healthy", 10, "health to recover after the first ACK")
+    assert observer.held_since[DATA_TYPE] is None
+    assert observer.outstanding_accepted() == dict.fromkeys(service.DATA_TYPES, 0)
+
+
+async def _database_rows_via(loader: Loader) -> int:
+    async with loader.processor.connection_pool.connection() as connection:
+        row = await (await connection.execute("SELECT count(*) FROM artists")).fetchone()
+    assert row is not None
+    return int(row[0])

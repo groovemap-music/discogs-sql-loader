@@ -31,7 +31,14 @@ from common.postgres_resilient import PostgreSQLFailureClassifier
 from orjson import loads
 
 from tableinator import telemetry
-from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, DEFAULT_MAX_REQUEUES, DEFAULT_STALL_S, BatchConfig, PostgreSQLBatchProcessor
+from tableinator.batch_processor import (
+    DEFAULT_MAX_HOLD_S,
+    DEFAULT_MAX_REQUEUES,
+    DEFAULT_STALL_S,
+    BatchConfig,
+    PostgreSQLBatchProcessor,
+    validate_stall_s,
+)
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
 )
@@ -245,7 +252,7 @@ def get_health_data() -> dict[str, Any]:
     if is_stuck:
         active_task = "STUCK - consumers died, awaiting recovery"
 
-    stalled_batches = batch_processor.stalled(BATCH_STALL_S) if batch_processor is not None else {}
+    stalled_batches = batch_processor.report_stall_gauges(BATCH_STALL_S) if batch_processor is not None else {}
     if stalled_batches:
         active_task = "STALLED - batches are not settling"
 
@@ -812,6 +819,10 @@ async def _recover_data_type(data_type: str) -> bool:
     Returns False when the old channel cannot be confirmed closed or the new consumer cannot start,
     so the caller falls back to rebuilding the whole connection.
     """
+    # The same gate as _recover_consumers: a paused or not-ready durable refresh keeps every consumer
+    # closed on purpose, and a restarted one would be handed terminals it can only requeue.
+    if durable_refresh_active and (durable_refresh_paused or not durable_refresh_ready):
+        return False
     old_channel = delivery_channels.pop(data_type, None)
     old_tag = consumer_tags.get(data_type)
     if old_channel is not None:
@@ -1684,6 +1695,18 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
         )
 
 
+BATCH_STALL_REPORT_INTERVAL_S = 15.0
+
+
+async def batch_stall_reporter() -> None:
+    """Publish the stall gauges on a clock, so a stall shows in metrics even when nothing polls /health."""
+    while not shutdown_requested:
+        await asyncio.sleep(BATCH_STALL_REPORT_INTERVAL_S)
+        if batch_processor is not None:
+            with contextlib.suppress(Exception):
+                batch_processor.report_stall_gauges(BATCH_STALL_S)
+
+
 async def progress_reporter() -> None:
     global idle_mode
 
@@ -1909,6 +1932,10 @@ async def main() -> None:
 
     # Initialize async batch processor if enabled
     if BATCH_MODE:
+        try:
+            validate_stall_s(BATCH_STALL_S, BATCH_MAX_HOLD_S)
+        except ValueError as e:
+            raise StartupFailure(str(e)) from e
         batch_config = BatchConfig(
             batch_size=BATCH_SIZE,
             flush_interval=BATCH_FLUSH_INTERVAL,
@@ -2060,8 +2087,10 @@ async def main() -> None:
 
         # Start batch processor periodic flush task if enabled
         batch_flush_task = None
+        batch_stall_task = None
         if BATCH_MODE and batch_processor is not None:
             batch_flush_task = asyncio.create_task(batch_processor.periodic_flush())
+            batch_stall_task = asyncio.create_task(batch_stall_reporter())
             logger.info("🔄 Started batch processor periodic flush task")
 
         try:
@@ -2108,6 +2137,10 @@ async def main() -> None:
                 batch_flush_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await batch_flush_task
+            if batch_stall_task:
+                batch_stall_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await batch_stall_task
             if batch_processor:
                 batch_processor.shutdown()
                 try:
