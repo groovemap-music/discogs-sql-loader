@@ -1,8 +1,15 @@
 # Shared delivery runtime attestation
 
 Discogs SQL delivery lifecycle behavior is pinned to `groovemap-runtime` source revision
-`068773653ab0edc78030c38f9c50c91c58815fcf`, whose Git tree is
-`f63beae1760b50e6e76d89e2706b664795b79647`. It supersedes `5459343ccaf46da5f71db11cda40d9338ce61d8d`
+`89811f45331df19b2ce065e2fec86fd516a47a43`, whose Git tree is
+`518247bc6abf66e76a982484dc557a7ef5c86329`. It supersedes `068773653ab0edc78030c38f9c50c91c58815fcf`
+(tree `f63beae1760b50e6e76d89e2706b664795b79647`), whose engine reported a key complete while its records
+were on the broker, so `extraction_complete` could purge rows those records were about to refresh, and
+which bounded neither a hung write nor a delivery waiting for capacity. Returned deliveries now count
+as pending until they are back, each write is bounded by `max_write_s`, and `max_hold_s` covers every
+wait from `submit()`.
+
+That revision superseded `5459343ccaf46da5f71db11cda40d9338ce61d8d`
 (tree `722fabc9ceab39fcfb0497b1c8a54ade84616a21`), whose batch engine let one queue's backlog starve every other queue's periodic flush
 and retained each handler that crossed the batch threshold, which leaked memory until the container
 restarted. A flush now returns under constant backlog, and returns `True` only when nothing is
@@ -28,13 +35,17 @@ consumer dependency against the reviewed `WriteAdmission` runtime above.
 
 ## Held deliveries and the outage window
 
-During PostgreSQL transient backoff, a batch delivery is held unacknowledged. Once it has been
-held `POSTGRES_BATCH_MAX_HOLD_S` seconds (default 1500), the shared engine returns it with
-`nack(requeue=True)`, so RabbitMQ redelivers it later. Nothing is acked or dropped by this path.
+A batch delivery waits unacknowledged while it is queued, or while it waits for capacity. Once it
+has waited `POSTGRES_BATCH_MAX_HOLD_S` seconds (default 1500), counted from when it arrived, the
+shared engine returns it with `nack(requeue=True)`, so RabbitMQ redelivers it later. Nothing is
+acked or dropped by this path. A working type spares the batch it is about to write.
 
-- The bound is checked at each engine flush entry, and `run_periodic` flushes every
+- The bound is checked before every batch of a drain, and `run_periodic` flushes every
   `POSTGRES_BATCH_FLUSH_INTERVAL` seconds. `BatchConfig` rejects any setting where
-  `max_hold_s + flush_interval + backoff_max` (30 s default) reaches the 1800 s lux `consumer_timeout`.
+  `max_hold_s + 2 × (max_write_s + 5 s) + flush_interval + backoff_max` (30 s default) reaches the
+  1800 s lux `consumer_timeout`. The loader sets `max_pending` to prefetch × 4, because QoS is per
+  consumer, so every delivery can reach a slot: one past capacity would go back unwritten when its
+  hold ends, spending a requeue.
   A write that is still blocked when the check is due can delay it further; the engine has no write timeout.
 - RabbitMQ does not bound this. On 4.3.5 and 4.4.0 `nack(requeue=True)` and a consumer timeout leave
   `x-delivery-count` unset and never dead-letter. A timeout cancels the consumer, requeues the delivery

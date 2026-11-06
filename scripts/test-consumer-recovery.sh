@@ -61,5 +61,7 @@ rabbitmq_port="$(docker port "${rabbitmq_container}" 5672/tcp)"
 postgres_port="$(docker port "${postgres_container}" 5432/tcp)"
 export TEST_AMQP_URL="amqp://guest:guest@127.0.0.1:${rabbitmq_port##*:}/"
 export TEST_DATABASE_URL="postgresql://postgres:integration-test@127.0.0.1:${postgres_port##*:}/postgres"
+# The hold tests freeze the server with docker pause.
+export POSTGRES_CONTAINER="${postgres_container}"
 
-uv run pytest tests/integration/test_consumer_recovery.py tests/integration/test_redelivery_bound.py tests/integration/test_purge_veto_durable.py tests/integration/test_stall_health.py -m integration --no-cov "$@"
+uv run pytest tests/integration/test_consumer_recovery.py tests/integration/test_redelivery_bound.py tests/integration/test_purge_veto_durable.py tests/integration/test_stall_health.py tests/integration/test_hold_bounds_real.py -m integration --no-cov "$@"

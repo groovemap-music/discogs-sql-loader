@@ -12,6 +12,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 import pytest
 from aio_pika.abc import AbstractIncomingMessage
 
+import tableinator.tableinator as service_module
 from tableinator.extraction_latch import LatchRelation
 from tableinator.tableinator import (
     StartupFailure,
@@ -4871,3 +4872,24 @@ class TestDerivedRelationRefresh:
                 await on_data_message(message, data_type)
 
         refresh.assert_awaited_once_with(ANY, ANY, "2026-03-01T00:00:00Z", _DECLARED_LATCH)
+
+
+class TestBatchConfigFromEnvironment:
+    @pytest.mark.parametrize("batch_size", [100, 500])
+    def test_capacity_covers_a_full_prefetch_window_on_every_type(self, batch_size: int) -> None:
+        """QoS is per consumer. At lux's 500 that is 4000 unacked, which 1000 left waiting with no slot."""
+        with patch.object(service_module, "BATCH_MODE", True), patch.object(service_module, "BATCH_SIZE", batch_size):
+            config = service_module.batch_config()
+
+        assert config.max_pending >= service_module.channel_prefetch() * len(service_module.DATA_TYPES)
+
+    def test_lux_settings_pass_the_consumer_timeout_budget(self) -> None:
+        with (
+            patch.object(service_module, "BATCH_MODE", True),
+            patch.object(service_module, "BATCH_SIZE", 500),
+            patch.object(service_module, "BATCH_FLUSH_INTERVAL", 2.0),
+        ):
+            config = service_module.batch_config()
+
+        assert config.max_pending == 4000
+        assert config.max_write_s == service_module.BATCH_MAX_WRITE_S

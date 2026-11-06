@@ -9,6 +9,7 @@ writer, failure taxonomy, telemetry, and stale-row purge veto in the owner hive.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
 import time
@@ -19,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from common import WriteAdmission, normalize_record
-from common.batch import AsyncBatchEngine, BatchItemResult, BatchPolicy
+from common.batch import DEFAULT_MAX_WRITE_S, WRITE_CANCEL_GRACE_S, AsyncBatchEngine, BatchItemResult, BatchPolicy
 from common.delivery import DeliveryResult, FailureKind, Settlement
 from common.postgres_resilient import PostgreSQLFailureClassifier
 
@@ -81,19 +82,25 @@ class BatchConfig:
     # Times a held delivery may go back to RabbitMQ before it is dead-lettered. None keeps
     # requeueing without a bound.
     max_requeues: int | None = DEFAULT_MAX_REQUEUES
+    # Longest one write may run before it counts as a transient failure. Keep it above the longest
+    # legitimate write. None leaves a frozen PostgreSQL unbounded, so a hold bound rejects it.
+    max_write_s: float | None = DEFAULT_MAX_WRITE_S
 
     def __post_init__(self) -> None:
         if self.max_hold_s is None:
             return
-        # The engine checks holds at each flush entry, and run_periodic flushes every
-        # flush_interval. Budget for that gap and for the longest backoff sleep, so the
-        # bound is checked before a hold can reach the broker's consumer_timeout.
-        worst_case_s = self.max_hold_s + self.flush_interval + self.backoff_max
+        if self.max_write_s is None:
+            raise ValueError("max_write_s=None leaves a hung write unbounded, so max_hold_s cannot hold")
+        # A delivery can start a write just inside the hold, having waited behind another type's
+        # write for a flush slot: two writes, each with its cancel grace. Then the flush tick that
+        # returns it, and the longest backoff sleep. All of it must stay below the broker's timeout.
+        write_budget_s = 2 * (self.max_write_s + WRITE_CANCEL_GRACE_S)
+        worst_case_s = self.max_hold_s + write_budget_s + self.flush_interval + self.backoff_max
         if worst_case_s >= BROKER_CONSUMER_TIMEOUT_S:
             raise ValueError(
-                f"max_hold_s={self.max_hold_s:g} plus flush_interval={self.flush_interval:g} and "
-                f"backoff_max={self.backoff_max:g} can reach {worst_case_s:g} s, which is not below "
-                f"the {BROKER_CONSUMER_TIMEOUT_S:g} s consumer_timeout"
+                f"max_hold_s={self.max_hold_s:g} plus {write_budget_s:g} s of writes at max_write_s={self.max_write_s:g}, "
+                f"flush_interval={self.flush_interval:g} and backoff_max={self.backoff_max:g} can reach {worst_case_s:g} s, "
+                f"which is not below the {BROKER_CONSUMER_TIMEOUT_S:g} s consumer_timeout"
             )
 
     def runtime_policy(self) -> BatchPolicy:
@@ -111,6 +118,7 @@ class BatchConfig:
             max_poison_retries=self.max_poison_retries,
             max_hold_s=self.max_hold_s,
             max_requeues=self.max_requeues,
+            max_write_s=self.max_write_s,
         )
 
 
@@ -192,6 +200,11 @@ class PostgreSQLBatchObserver:
 
     def accepted(self, data_type: str, started_at: float) -> None:
         self._accepted_at[data_type].append(started_at)
+
+    def withdrawn(self, data_type: str, started_at: float) -> None:
+        """Take back an :meth:`accepted` for a delivery the engine never took and will never settle."""
+        with contextlib.suppress(ValueError):
+            self._accepted_at[data_type].remove(started_at)
 
     def write_result(self, data_type: str, result: BatchWriteResult) -> None:
         state = self._states[data_type]
@@ -499,13 +512,19 @@ class PostgreSQLBatchProcessor:
             telemetry_started_at=started,
             span_context=span_context,
         )
-        await self._engine.submit(
-            data_type,
-            pending,
-            _CallbackDelivery(ack_callback, nack_callback, requeue_callback, headers),
-            span_context=span_context,
-        )
+        # Before submit: a delivery waiting for capacity can be settled inside it, and an entry added
+        # after that settlement would never be taken, leaving health stalled until a restart.
         self._observer.accepted(data_type, started)
+        try:
+            await self._engine.submit(
+                data_type,
+                pending,
+                _CallbackDelivery(ack_callback, nack_callback, requeue_callback, headers),
+                span_context=span_context,
+            )
+        except BaseException:
+            self._observer.withdrawn(data_type, started)
+            raise
         snapshot = self._snapshot()
         threshold = min(snapshot["batch_sizes"][data_type], self.config.max_pending)
         if snapshot["pending"][data_type] >= threshold:
