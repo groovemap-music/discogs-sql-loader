@@ -31,7 +31,7 @@ from common.postgres_resilient import PostgreSQLFailureClassifier
 from orjson import loads
 
 from tableinator import telemetry
-from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, DEFAULT_MAX_REQUEUES, BatchConfig, PostgreSQLBatchProcessor
+from tableinator.batch_processor import DEFAULT_MAX_HOLD_S, DEFAULT_MAX_REQUEUES, DEFAULT_STALL_S, BatchConfig, PostgreSQLBatchProcessor
 from tableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
 )
@@ -213,7 +213,10 @@ connection_pool: AsyncPostgreSQLPool | None = None
 
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
 active_connection: Any = None  # Current active connection
-active_channel: Any = None  # Current active channel
+active_channel: Any = None  # Current active channel; declares topology and answers passive queries
+# One channel per data type carries that type's deliveries, so a channel the broker closes (a
+# delivery-acknowledgement timeout, a precondition failure) stops one queue and not all four.
+delivery_channels: dict[str, Any] = {}
 connection_check_task: asyncio.Task[None] | None = None  # Background task for periodic queue checks
 
 
@@ -242,6 +245,10 @@ def get_health_data() -> dict[str, Any]:
     if is_stuck:
         active_task = "STUCK - consumers died, awaiting recovery"
 
+    stalled_batches = batch_processor.stalled(BATCH_STALL_S) if batch_processor is not None else {}
+    if stalled_batches:
+        active_task = "STALLED - batches are not settling"
+
     # Determine health status:
     # - "starting" if connection pool not yet initialized (startup in progress)
     # - "unhealthy" if connection pool was initialized but is now None (connection lost)
@@ -256,6 +263,7 @@ def get_health_data() -> dict[str, Any]:
             status = "unhealthy"
     elif (
         is_stuck
+        or bool(stalled_batches)
         or consumer_cancellation_failed
         or (durable_refresh_active and (not durable_refresh_ready or durable_refresh_health.get("status") == "degraded"))
     ):
@@ -271,6 +279,8 @@ def get_health_data() -> dict[str, Any]:
         "message_counts": message_counts.copy(),
         "last_message_time": last_message_time.copy(),
         "consumer_cancellation_failed": consumer_cancellation_failed,
+        # Types whose oldest delivery has waited longer than the bound with nothing settling, in seconds.
+        "stalled_batches": {data_type: round(age, 1) for data_type, age in stalled_batches.items()},
         "active_consumers": list(consumer_tags.keys()),
         "completed_files": list(completed_files),
         # A refresh that is silently not happening is the failure this field exists to surface.
@@ -295,6 +305,9 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
 # Times a held delivery may go back to RabbitMQ before it is dead-lettered instead.
 BATCH_MAX_REQUEUES = int(os.environ.get("POSTGRES_BATCH_MAX_REQUEUES", str(DEFAULT_MAX_REQUEUES)))
+# Health turns unhealthy once a type's oldest delivery has waited this long with nothing settling. See
+# batch_processor.DEFAULT_STALL_S. It must stay below BATCH_MAX_HOLD_S, or a hold would never show.
+BATCH_STALL_S = float(os.environ.get("POSTGRES_BATCH_STALL_S", str(DEFAULT_STALL_S)))
 
 # Extractions in a row that may veto a type's purge before it is reported as an alert. Dumps are
 # a month apart, so one veto is a bad record to deal with and two mean stale rows are piling up.
@@ -509,7 +522,8 @@ async def _reset_durable_broker() -> bool:
 
     connection = active_connection
     channel = active_channel
-    if connection is None and channel is None and consumer_tags:
+    channels = [*delivery_channels.values(), *([channel] if channel is not None else [])]
+    if connection is None and not channels and consumer_tags:
         logger.error("❌ Cannot confirm closure of a tagged durable consumer without its delivery channel")
         return False
     try:
@@ -517,19 +531,24 @@ async def _reset_durable_broker() -> bool:
             await asyncio.wait_for(connection.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
             active_connection = None
             active_channel = None
-        elif channel is not None:
-            await asyncio.wait_for(channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
+            delivery_channels.clear()
+        else:
+            for open_channel in channels:
+                await asyncio.wait_for(open_channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
             active_channel = None
+            delivery_channels.clear()
     except Exception as exc:
         logger.error("❌ Could not close uncertain durable delivery channel", error_type=type(exc).__name__)
-        if channel is None:
+        if not channels:
             return False
         try:
-            await asyncio.wait_for(channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
+            for open_channel in channels:
+                await asyncio.wait_for(open_channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
         except Exception as channel_exc:
             logger.error("❌ Durable channel close also failed", error_type=type(channel_exc).__name__)
             return False
         active_channel = None
+        delivery_channels.clear()
     for _ in range(len(consumer_tags)):
         telemetry.record_consumer_stopped()
     consumer_tags.clear()
@@ -537,6 +556,43 @@ async def _reset_durable_broker() -> bool:
     consumer_cancellation_failed = False
     logger.warning("⚠️ Closed durable delivery channel; broker will requeue unsettled terminals once")
     return True
+
+
+async def _start_consumer(data_type: str) -> str:
+    """Consume ``data_type`` on its own channel, opening (or reopening) that channel first.
+
+    ``queues[data_type]`` becomes the queue bound to that channel, because cancelling a consumer
+    has to go through the channel that holds it.
+    """
+    channel = delivery_channels.get(data_type)
+    if channel is None or getattr(channel, "is_closed", False) is True:
+        channel = await active_connection.channel()
+        await channel.set_qos(prefetch_count=channel_prefetch(), global_=False)
+        delivery_channels[data_type] = channel
+    # Redeclaring with the topology's own arguments is idempotent, and aio-pika restores the queue
+    # and its consumer on this channel with them after a reconnect.
+    queue = await channel.declare_queue(
+        auto_delete=False,
+        durable=True,
+        name=catalog_queue_name(AMQP_CONSUMER_NAME, data_type),
+        arguments={
+            "x-queue-type": "quorum",
+            "x-dead-letter-exchange": catalog_dead_letter_exchange_name(AMQP_CONSUMER_NAME, data_type),
+            "x-delivery-limit": 20,
+        },
+    )
+    queues[data_type] = queue
+    consumer_tag: str = await queue.consume(make_data_handler(data_type))
+    return consumer_tag
+
+
+async def _close_delivery_channels() -> None:
+    """Close every per-type channel, best effort; the connection close that follows is the proof."""
+    channels = list(delivery_channels.values())
+    delivery_channels.clear()
+    for channel in channels:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
 
 
 async def attempt_durable_recovery() -> bool:
@@ -585,7 +641,7 @@ async def attempt_durable_recovery() -> bool:
             if active_connection is not None and active_channel is not None:
                 for type_name in sorted(durable_refresh_resume_types):
                     if type_name not in consumer_tags and type_name in queues:
-                        consumer_tags[type_name] = await queues[type_name].consume(make_data_handler(type_name))
+                        consumer_tags[type_name] = await _start_consumer(type_name)
                         telemetry.record_consumer_started()
             else:
                 await _recover_consumers()
@@ -696,8 +752,8 @@ async def check_consumers_unexpectedly_dead() -> bool:
     return no_active_consumers and files_incomplete and not shutdown_requested
 
 
-async def consumers_lost_at_broker() -> bool:
-    """Detect tracked consumers that no longer exist on the delivery channel.
+async def lost_consumer_types() -> set[str]:
+    """Data types whose tracked consumer no longer exists on its delivery channel.
 
     aiormq removes a tag from ``Channel.consumers`` when the broker's basic.cancel
     arrives, as it does for a delivery-acknowledgement timeout on a quorum queue, and a
@@ -708,28 +764,79 @@ async def consumers_lost_at_broker() -> bool:
 
     aio-pika re-subscribes the same tags by itself within seconds, so recovering on the
     first sighting would close a connection that is already healing and requeue its
-    in-flight deliveries. Only a tag missing on two consecutive checks is lost. Types whose
-    file completed are not watched: their consumers are cancelled on purpose.
+    in-flight deliveries. Only a tag missing on two consecutive checks is lost, except that a
+    channel the client reports closed is lost at once. Types whose file completed are not
+    watched: their consumers are cancelled on purpose.
+
+    Each type is judged on its own channel, so one type's loss names only that type.
     """
     global suspected_lost_tags
 
-    if not consumer_tags or active_channel is None or shutdown_requested:
+    if not consumer_tags or shutdown_requested:
         suspected_lost_tags = set()
+        return set()
+
+    watched = {data_type: tag for data_type, tag in consumer_tags.items() if data_type not in completed_files}
+    closed: set[str] = set()
+    missing: dict[str, str] = {}
+    for data_type, tag in consumer_tags.items():
+        channel = delivery_channels.get(data_type, active_channel)
+        if channel is None:
+            continue
+        if getattr(channel, "is_closed", False) is True:
+            closed.add(data_type)
+            continue
+        if data_type not in watched:
+            continue
+        try:
+            delivery_channel = await asyncio.wait_for(channel.get_underlay_channel(), timeout=CONSUMER_CANCEL_TIMEOUT)
+            if tag not in delivery_channel.consumers:
+                missing[data_type] = tag
+        except Exception as exc:
+            logger.warning("⚠️ Delivery channel is unavailable", data_type=data_type, error_type=type(exc).__name__)
+            missing[data_type] = tag
+
+    lost = {data_type for data_type, tag in missing.items() if tag in suspected_lost_tags}
+    suspected_lost_tags = set(missing.values())
+    return lost | closed
+
+
+async def consumers_lost_at_broker() -> bool:
+    """Whether any tracked consumer is gone from its delivery channel; see :func:`lost_consumer_types`."""
+    return bool(await lost_consumer_types())
+
+
+async def _recover_data_type(data_type: str) -> bool:
+    """Re-establish one type's consumer on a fresh channel, leaving every other type consuming.
+
+    Returns False when the old channel cannot be confirmed closed or the new consumer cannot start,
+    so the caller falls back to rebuilding the whole connection.
+    """
+    old_channel = delivery_channels.pop(data_type, None)
+    old_tag = consumer_tags.get(data_type)
+    if old_channel is not None:
+        try:
+            await asyncio.wait_for(old_channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
+        except Exception as exc:
+            if getattr(old_channel, "is_closed", False) is not True:
+                delivery_channels[data_type] = old_channel
+                logger.warning("⚠️ Could not close the lost consumer's channel", data_type=data_type, error_type=type(exc).__name__)
+                return False
+    if old_tag is not None:
+        consumer_tags.pop(data_type, None)
+        telemetry.record_consumer_stopped()
+    if active_connection is None:
         return False
-    if getattr(active_channel, "is_closed", False) is True:
-        return True
-
-    watched = {tag for data_type, tag in consumer_tags.items() if data_type not in completed_files}
     try:
-        delivery_channel = await asyncio.wait_for(active_channel.get_underlay_channel(), timeout=CONSUMER_CANCEL_TIMEOUT)
-        missing = watched - delivery_channel.consumers.keys()
+        consumer_tags[data_type] = await _start_consumer(data_type)
     except Exception as exc:
-        logger.warning("⚠️ Delivery channel is unavailable", error_type=type(exc).__name__)
-        missing = watched
-
-    lost = missing & suspected_lost_tags
-    suspected_lost_tags = missing
-    return bool(lost)
+        logger.error("❌ Could not restart the consumer on a new channel", data_type=data_type, error_type=type(exc).__name__)
+        delivery_channels.pop(data_type, None)
+        return False
+    telemetry.record_consumer_started()
+    last_message_time[data_type] = time.time()
+    logger.info("✅ Restarted consumer on its own channel", data_type=data_type)
+    return True
 
 
 async def periodic_queue_checker() -> None:
@@ -760,12 +867,18 @@ async def periodic_queue_checker() -> None:
 
             current_time = time.time()
 
-            if await consumers_lost_at_broker():
+            lost_types = await lost_consumer_types()
+            if lost_types:
                 logger.error(
-                    "❌ Consumers are gone from the delivery channel and did not come back. Re-establishing consumption...",
+                    "❌ Consumers are gone from their delivery channel and did not come back. Re-establishing consumption...",
+                    lost_types=sorted(lost_types),
                     active_consumers=len(consumer_tags),
                     completed_files=list(completed_files),
                 )
+                # Only the lost types move to new channels. The rest keep consuming, and their
+                # in-flight deliveries are not requeued by a connection close.
+                if all([await _recover_data_type(data_type) for data_type in sorted(lost_types)]):
+                    continue
                 await _recover_consumers()
                 continue
 
@@ -806,21 +919,24 @@ async def _close_recovery_broker() -> bool:
     global active_connection, active_channel, queues, consumer_cancellation_failed
 
     connection, channel = active_connection, active_channel
-    if connection is None and channel is None:
+    if connection is None and channel is None and not delivery_channels:
         if consumer_tags:
             consumer_cancellation_failed = True
             logger.error("❌ Cannot confirm recovery cleanup without the tagged transport")
             return False
         return True
 
-    channel_closed = channel is None
+    channels = [*delivery_channels.values(), *([channel] if channel is not None else [])]
+    channel_closed = not channels
     try:
-        if channel is not None:
-            try:
-                await asyncio.wait_for(channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
-                channel_closed = True
-            except Exception as exc:
-                logger.warning("⚠️ Recovery channel close failed", error_type=type(exc).__name__)
+        if channels:
+            channel_closed = True
+            for open_channel in channels:
+                try:
+                    await asyncio.wait_for(open_channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
+                except Exception as exc:
+                    channel_closed = False
+                    logger.warning("⚠️ Recovery channel close failed", error_type=type(exc).__name__)
         if connection is not None:
             # Connection closure also confirms all of its channels and consumers stopped.
             await asyncio.wait_for(connection.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
@@ -837,6 +953,7 @@ async def _close_recovery_broker() -> bool:
 
     active_connection = None
     active_channel = None
+    delivery_channels.clear()
     queues = {}
     for _ in range(len(consumer_tags)):
         telemetry.record_consumer_stopped()
@@ -964,8 +1081,7 @@ async def _recover_consumers() -> None:
             pending_counts = dict(queues_with_messages)
             for data_type in DATA_TYPES:
                 if data_type in queues and data_type not in consumer_tags:
-                    handler = make_data_handler(data_type)
-                    consumer_tag = await queues[data_type].consume(handler)
+                    consumer_tag = await _start_consumer(data_type)
                     consumer_tags[data_type] = consumer_tag
                     telemetry.record_consumer_started()
                     # Re-arm backlogged types now; a later first record also resets
@@ -1921,8 +2037,7 @@ async def main() -> None:
         # terminal deliveries while subscribed would redeliver them in a hot loop.
         if not durable_refresh_active or durable_refresh_ready:
             for data_type in DATA_TYPES:
-                handler = make_data_handler(data_type)
-                consumer_tags[data_type] = await queues[data_type].consume(handler)
+                consumer_tags[data_type] = await _start_consumer(data_type)
                 telemetry.record_consumer_started()
         if durable_refresh_active:
             durable_refresh_recovery_task = asyncio.create_task(durable_recovery_loop())
