@@ -4874,6 +4874,55 @@ class TestDerivedRelationRefresh:
         refresh.assert_awaited_once_with(ANY, ANY, "2026-03-01T00:00:00Z", _DECLARED_LATCH)
 
 
+class ProcessorBuilt(Exception):
+    """Stops main() at the point under test, so a test sees that it got there."""
+
+
+class TestMainBuildsTheBatchConfig:
+    @pytest.mark.asyncio
+    async def test_every_limit_reaches_the_processor_and_capacity_covers_four_prefetches(self) -> None:
+        """A dropped argument raises nothing: capacity would quietly go back to 1000."""
+        config = MagicMock()
+        config.postgres_host = "localhost:5432"
+        config.postgres_pool_max_size = 12
+        config.postgres_pool_min_size = 2
+        processor_class = MagicMock(side_effect=ProcessorBuilt)
+        collaborators: dict[str, Any] = {
+            "setup_logging": MagicMock(),
+            "setup_telemetry": MagicMock(),
+            "shutdown_telemetry": MagicMock(),
+            "start_event_loop_monitor": MagicMock(),
+            "HealthServer": MagicMock(),
+            "AsyncPostgreSQLPool": MagicMock(return_value=MagicMock(initialize=AsyncMock())),
+            "probe_latch_relation": AsyncMock(return_value=None),
+            "report_purge_vetoes": AsyncMock(),
+            "PostgreSQLBatchProcessor": processor_class,
+        }
+        # main() assigns these for the process, and a later main() refuses to start over them.
+        process_state: dict[str, Any] = {"connection_pool": None, "write_admission": None, "extraction_latch": None, "batch_processor": None}
+        settings: dict[str, Any] = {
+            "BATCH_MODE": True,
+            "BATCH_SIZE": 500,
+            "BATCH_FLUSH_INTERVAL": 2.5,
+            "BATCH_MAX_HOLD_S": 600.0,
+            "BATCH_MAX_REQUEUES": 11,
+            "BATCH_MAX_WRITE_S": 77.0,
+        }
+        with (
+            patch.multiple(service_module, **collaborators, **process_state, **settings),
+            patch.object(service_module.signal, "signal"),
+            patch.object(service_module.TableinatorConfig, "from_env", return_value=config),
+            patch.dict("os.environ", {"STARTUP_DELAY": "0", "DERIVED_REFRESH_MODE": "inline"}),
+            pytest.raises(ProcessorBuilt),
+        ):
+            await main()
+
+        built = processor_class.call_args.args[1]
+        assert built.max_pending == 4000
+        assert (built.batch_size, built.flush_interval) == (500, 2.5)
+        assert (built.max_hold_s, built.max_requeues, built.max_write_s) == (600.0, 11, 77.0)
+
+
 class TestBatchConfigFromEnvironment:
     @pytest.mark.parametrize("batch_size", [100, 500])
     def test_capacity_covers_a_full_prefetch_window_on_every_type(self, batch_size: int) -> None:
