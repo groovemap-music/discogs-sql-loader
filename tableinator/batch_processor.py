@@ -259,7 +259,10 @@ class PostgreSQLBatchObserver:
         started_at = accepted.popleft() if accepted else time.perf_counter()
         terminal_duration = time.perf_counter() - started_at
         if result.settlement is Settlement.REQUEUE:
-            if self.held_since[entity] is None:
+            # Only a hold that timed out is a record still waiting to be written. A delivery_lost
+            # report names a delivery whose channel died, and it can arrive after the redelivered
+            # copy was acked: starting a wait then would never be cleared.
+            if result.outcome == "held_timeout" and self.held_since[entity] is None:
                 self.held_since[entity] = time.monotonic() - terminal_duration
             telemetry.record_batch_requeued(entity, result.outcome)
         else:

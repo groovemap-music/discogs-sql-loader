@@ -10,7 +10,8 @@ from common.delivery import DeliveryResult, Settlement
 
 import tableinator.tableinator as service
 from tableinator import telemetry
-from tableinator.batch_processor import PostgreSQLBatchObserver, PostgreSQLBatchProcessor, validate_stall_s
+from tableinator.batch_processor import BatchConfig, PostgreSQLBatchObserver, PostgreSQLBatchProcessor, validate_stall_s
+from tableinator.batch_writer import BatchWriteResult
 
 
 def settle(observer: PostgreSQLBatchObserver, settlement: Settlement, outcome: str = "processed") -> None:
@@ -63,6 +64,34 @@ class TestWhatCountsAsProgress:
             settle(observer, Settlement.ACK)
         counter.assert_called_once_with("artists", "held_timeout")
         assert observer.requeued_counts["artists"] == 1
+
+
+class TestLostDeliveriesDoNotStartAWait:
+    def test_a_delivery_lost_report_never_sets_held_since(self) -> None:
+        observer = PostgreSQLBatchObserver()
+        settle(observer, Settlement.REQUEUE, "delivery_lost")
+        assert observer.held_since["artists"] is None
+        assert observer.requeued_counts["artists"] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_real_engine_reports_a_lost_delivery_after_the_acks_and_health_stays_clear(self) -> None:
+        """A batch whose ack fails on a dead channel: the engine acks the rest, then reports the loss."""
+        processor = PostgreSQLBatchProcessor(MagicMock(), BatchConfig(batch_size=3, min_batch_size=1, flush_interval=0.01))
+        processor._process_batch = AsyncMock(return_value=BatchWriteResult(set(), set(), set()))  # type: ignore[method-assign]
+        good, dead = AsyncMock(), AsyncMock(side_effect=ConnectionResetError("channel closed"))
+        for record_id, ack in (("1", good), ("2", dead), ("3", good)):
+            await processor.add_message("artists", {"id": record_id, "name": record_id, "sha256": record_id}, ack, AsyncMock())
+        assert await processor.flush_queue("artists")
+
+        observer = processor._observer
+        assert good.await_count == 2
+        assert observer.processed_counts["artists"] == 2
+        assert observer.requeued_counts["artists"] == 1, "the lost delivery was reported as a requeue"
+        assert observer.held_since["artists"] is None, "...and that report did not start a wait the broker's redelivery will never end"
+        assert observer.outstanding_accepted()["artists"] == 0
+
+        observer.last_settled_at["artists"] -= 10_000.0
+        assert processor.stalled(300.0) == {}
 
 
 class TestStalledIncludesTheHeldWait:
