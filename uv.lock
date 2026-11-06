@@ -7,7 +7,7 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [manifest]
-overrides = [{ name = "groovemap-runtime", extras = ["neo4j", "otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=068773653ab0edc78030c38f9c50c91c58815fcf" }]
+overrides = [{ name = "groovemap-runtime", extras = ["neo4j", "otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=89811f45331df19b2ce065e2fec86fd516a47a43" }]
 
 [[package]]
 name = "aio-pika"
@@ -469,7 +469,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aio-pika", specifier = ">=10.1.1" },
-    { name = "groovemap-runtime", extras = ["otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=068773653ab0edc78030c38f9c50c91c58815fcf" },
+    { name = "groovemap-runtime", extras = ["otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=89811f45331df19b2ce065e2fec86fd516a47a43" },
     { name = "orjson", specifier = ">=3.13.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.5" },
     { name = "structlog", specifier = ">=26.1.0" },
@@ -495,7 +495,7 @@ dev = [
 [[package]]
 name = "groovemap-runtime"
 version = "0.1.0"
-source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=068773653ab0edc78030c38f9c50c91c58815fcf#068773653ab0edc78030c38f9c50c91c58815fcf" }
+source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=89811f45331df19b2ce065e2fec86fd516a47a43#89811f45331df19b2ce065e2fec86fd516a47a43" }
 dependencies = [
     { name = "orjson" },
     { name = "structlog" },

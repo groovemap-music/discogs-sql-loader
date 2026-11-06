@@ -34,6 +34,7 @@ from tableinator import telemetry
 from tableinator.batch_processor import (
     DEFAULT_MAX_HOLD_S,
     DEFAULT_MAX_REQUEUES,
+    DEFAULT_MAX_WRITE_S,
     DEFAULT_STALL_S,
     BatchConfig,
     PostgreSQLBatchProcessor,
@@ -312,6 +313,9 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("POSTGRES_BATCH_FLUSH_INTERVAL", "5.
 BATCH_MAX_HOLD_S = float(os.environ.get("POSTGRES_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
 # Times a held delivery may go back to RabbitMQ before it is dead-lettered instead.
 BATCH_MAX_REQUEUES = int(os.environ.get("POSTGRES_BATCH_MAX_REQUEUES", str(DEFAULT_MAX_REQUEUES)))
+# Longest one batch write may run before it counts as a transient failure, which is what lets the hold
+# act on a frozen PostgreSQL. BatchConfig counts it against the broker's consumer_timeout.
+BATCH_MAX_WRITE_S = float(os.environ.get("POSTGRES_BATCH_MAX_WRITE_S", str(DEFAULT_MAX_WRITE_S)))
 # Health turns unhealthy once a type's oldest delivery has waited this long with nothing settling. See
 # batch_processor.DEFAULT_STALL_S. It must stay below BATCH_MAX_HOLD_S, or a hold would never show.
 BATCH_STALL_S = float(os.environ.get("POSTGRES_BATCH_STALL_S", str(DEFAULT_STALL_S)))
@@ -364,6 +368,24 @@ def channel_prefetch() -> int:
         return max(200, BATCH_SIZE * 2)
     pool_max = config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
     return pool_max
+
+
+def batch_config() -> BatchConfig:
+    """Build the batch policy from the environment.
+
+    ``max_pending`` follows the prefetch: QoS is per consumer, so every type can have a full window
+    unacked at once, and a delivery past capacity goes back to the broker unwritten when its hold
+    ends, spending a requeue. Those deliveries are in this process either way, so this costs no
+    memory: it only changes where they wait.
+    """
+    return BatchConfig(
+        batch_size=BATCH_SIZE,
+        flush_interval=BATCH_FLUSH_INTERVAL,
+        max_pending=channel_prefetch() * len(DATA_TYPES),
+        max_hold_s=BATCH_MAX_HOLD_S,
+        max_requeues=BATCH_MAX_REQUEUES,
+        max_write_s=BATCH_MAX_WRITE_S,
+    )
 
 
 # Global shutdown flag
@@ -1936,13 +1958,7 @@ async def main() -> None:
             validate_stall_s(BATCH_STALL_S, BATCH_MAX_HOLD_S)
         except ValueError as e:
             raise StartupFailure(str(e)) from e
-        batch_config = BatchConfig(
-            batch_size=BATCH_SIZE,
-            flush_interval=BATCH_FLUSH_INTERVAL,
-            max_hold_s=BATCH_MAX_HOLD_S,
-            max_requeues=BATCH_MAX_REQUEUES,
-        )
-        batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config, write_admission)
+        batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config(), write_admission)
         logger.info(
             "🚀 Async batch processing enabled",
             batch_size=BATCH_SIZE,

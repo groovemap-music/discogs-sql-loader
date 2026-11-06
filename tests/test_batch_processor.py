@@ -67,7 +67,7 @@ class TestPolicyAdapters:
     def test_runtime_is_pinned_to_the_reviewed_revision(self) -> None:
         pyproject = Path("pyproject.toml").read_text()
         lock = Path("uv.lock").read_text()
-        revision = "068773653ab0edc78030c38f9c50c91c58815fcf"
+        revision = "89811f45331df19b2ce065e2fec86fd516a47a43"
         assert revision in pyproject
         assert f"#{revision}" in lock
 
@@ -86,14 +86,28 @@ class TestPolicyAdapters:
         config = BatchConfig()
         assert config.max_hold_s == 1500.0
         assert config.runtime_policy().max_hold_s == 1500.0
-        # Worst case: the hold, one flush interval of check lag, and the longest backoff sleep.
-        assert config.max_hold_s + config.flush_interval + config.backoff_max < 1800.0  # lux consumer_timeout 1,800,000 ms
+        # Worst case: the hold, two bounded writes with their cancel grace, the tick that returns the
+        # delivery, and the longest backoff sleep.
+        assert config.max_write_s == 120.0
+        assert config.runtime_policy().max_write_s == 120.0
+        writes = 2 * (config.max_write_s + 5.0)
+        assert config.max_hold_s + writes + config.flush_interval + config.backoff_max < 1800.0  # lux consumer_timeout 1,800,000 ms
 
     def test_hold_plus_check_lag_and_longest_backoff_must_stay_under_consumer_timeout(self) -> None:
-        # 1765 + 5 (flush_interval) + 30 (backoff_max) == 1800: the budget is exhausted, so reject it.
+        # 1515 + 250 (two writes) + 5 (flush_interval) + 30 (backoff_max) == 1800: the budget is exhausted.
         with pytest.raises(ValueError, match="consumer_timeout"):
-            BatchConfig(max_hold_s=1765.0, flush_interval=5.0, backoff_max=30.0)
-        BatchConfig(max_hold_s=1764.0, flush_interval=5.0, backoff_max=30.0)
+            BatchConfig(max_hold_s=1515.0, flush_interval=5.0, backoff_max=30.0)
+        BatchConfig(max_hold_s=1514.0, flush_interval=5.0, backoff_max=30.0)
+
+    def test_the_write_bound_counts_against_the_consumer_timeout(self) -> None:
+        # 1500 + 2 * (130 + 5) + 5 + 30 == 1805.
+        with pytest.raises(ValueError, match="max_write_s=130"):
+            BatchConfig(max_hold_s=1500.0, max_write_s=130.0)
+        BatchConfig(max_hold_s=1500.0, max_write_s=125.0)
+
+    def test_a_hold_bound_refuses_an_unbounded_write(self) -> None:
+        with pytest.raises(ValueError, match="max_write_s=None"):
+            BatchConfig(max_write_s=None)
 
     def test_disabling_the_hold_bound_skips_the_budget(self) -> None:
         assert BatchConfig(max_hold_s=None, backoff_max=10_000.0).max_hold_s is None
@@ -462,7 +476,37 @@ class TestHeldDeliveryRequeue:
         requeue.assert_awaited_once()
         ack.assert_not_awaited()
         nack.assert_not_awaited()
-        assert processor.get_stats()["pending"]["artists"] == 0
+        # Still owed: the record is unwritten on the broker until a handler submits it again.
+        assert processor.get_stats()["pending"]["artists"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_delivery_settled_inside_submit_leaves_nothing_accepted(self) -> None:
+        """A waiter past capacity is returned inside submit, so accepted has to come first."""
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config())
+
+        async def returned_while_waiting(key: str, *_args: Any, **_kwargs: Any) -> None:
+            result = DeliveryResult(Settlement.REQUEUE, "held_timeout")
+            processor._observer.settled(entity=key, result=result, duration_s=0.0, span=None)
+
+        with patch.object(processor._engine, "submit", returned_while_waiting):
+            assert await processor.add_message("artists", {"id": "waiter"}, AsyncMock(), AsyncMock(), requeue_callback=AsyncMock())
+
+        assert processor._observer.outstanding_accepted()["artists"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_handler_withdraws_what_it_was_accepted_for(self) -> None:
+        """The engine never took it, so no settlement would clear the entry and health would stall."""
+        processor = PostgreSQLBatchProcessor(MagicMock(), processor_config(batch_size=10, max_pending=1, max_hold_s=30.0))
+        assert await processor.add_message("artists", {"id": "held"}, AsyncMock(), AsyncMock(), requeue_callback=AsyncMock())
+        waiter = asyncio.create_task(processor.add_message("artists", {"id": "waiter"}, AsyncMock(), AsyncMock(), requeue_callback=AsyncMock()))
+        await asyncio.sleep(0)
+        assert processor._observer.outstanding_accepted()["artists"] == 2
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert processor._observer.outstanding_accepted()["artists"] == 1
 
     @pytest.mark.asyncio
     async def test_requeue_without_a_requeue_callback_is_still_refused(self) -> None:

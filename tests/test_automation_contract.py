@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 AUTOMATION_CI_REVISION = "dbf22ed83d486e9484fc8c6385c7c3e5995700e4"
 AUTOMATION_RELEASE_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
-PYTHON_LIBRARIES_REVISION = "068773653ab0edc78030c38f9c50c91c58815fcf"
+PYTHON_LIBRARIES_REVISION = "89811f45331df19b2ce065e2fec86fd516a47a43"
 
 
 def test_reusable_workflows_are_immutably_pinned() -> None:
