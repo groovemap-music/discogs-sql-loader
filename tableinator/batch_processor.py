@@ -41,6 +41,24 @@ DEFAULT_MAX_HOLD_S = 1500.0
 # spend x-delivery-limit on nack(requeue=True), so the engine counts x-acquired-count instead.
 # 61 holds of 1500 s is about 25.4 hours of continuous failure. See docs/shared-delivery-runtime.md.
 DEFAULT_MAX_REQUEUES = 60
+# A type is stalled when its oldest queued delivery is older than this AND nothing of that type has
+# settled for as long. Either alone is normal: a deep queue behind long flushes has old heads while
+# still settling, and a quiet queue has no old head. Health reports unhealthy within this bound of
+# the last settlement (or of the stuck delivery's arrival, if that came later).
+DEFAULT_STALL_S = 300.0
+
+
+def validate_stall_s(stall_s: float, max_hold_s: float | None) -> float:
+    """Return ``stall_s`` if it is positive and below ``max_hold_s``; raise ``ValueError`` otherwise.
+
+    A bound at or above the hold would let a delivery be returned to the broker before health could
+    ever report it, and a bound of zero or less would report every busy moment as a stall.
+    """
+    if not stall_s > 0:
+        raise ValueError(f"POSTGRES_BATCH_STALL_S={stall_s:g} must be positive")
+    if max_hold_s is not None and stall_s >= max_hold_s:
+        raise ValueError(f"POSTGRES_BATCH_STALL_S={stall_s:g} must be below POSTGRES_BATCH_MAX_HOLD_S={max_hold_s:g}")
+    return stall_s
 
 
 @dataclass
@@ -154,9 +172,20 @@ class PostgreSQLBatchObserver:
 
     def __init__(self) -> None:
         self._accepted_at = {data_type: deque[float]() for data_type in DATA_TYPES}
+        # Monotonic time of each type's latest ACK or REJECT, the only settlements that mean a record
+        # was dealt with. A REQUEUE hands the record back to the broker unwritten, so it is not
+        # progress. The start counts as progress: a stall is measured from when this observer began
+        # watching at the earliest.
+        self.last_settled_at = dict.fromkeys(DATA_TYPES, time.monotonic())
+        # Monotonic time the type's oldest unwritten record began waiting, kept across requeues: a
+        # held record that goes back to the broker and comes back is the same wait. Set on the first
+        # REQUEUE (back-dated to when that delivery was accepted), cleared on ACK or REJECT.
+        self.held_since: dict[str, float | None] = dict.fromkeys(DATA_TYPES)
         self._states: dict[str, _FlushState] = {}
         self._had_dlq_nacks = dict.fromkeys(DATA_TYPES, False)
         self.processed_counts = dict.fromkeys(DATA_TYPES, 0)
+        # Deliveries returned to the broker for redelivery (held too long, or lost with their channel).
+        self.requeued_counts = dict.fromkeys(DATA_TYPES, 0)
         self.batch_counts = dict.fromkeys(DATA_TYPES, 0)
         self.media_backfilled_counts = dict.fromkeys(DATA_TYPES, 0)
         self.identity_backfilled_counts = dict.fromkeys(DATA_TYPES, 0)
@@ -223,8 +252,22 @@ class PostgreSQLBatchObserver:
         state = self._states.get(entity)
         if state is not None:
             state.settled += 1
-        started_at = self._accepted_at[entity].popleft()
+        # Every settlement owns exactly one accepted_at entry, whether the delivery was acked,
+        # dead-lettered, requeued after a hold, or lost with its channel. Taking it first means no
+        # branch below can leave one behind; an empty deque only follows a double report.
+        accepted = self._accepted_at[entity]
+        started_at = accepted.popleft() if accepted else time.perf_counter()
         terminal_duration = time.perf_counter() - started_at
+        if result.settlement is Settlement.REQUEUE:
+            # Only a hold that timed out is a record still waiting to be written. A delivery_lost
+            # report names a delivery whose channel died, and it can arrive after the redelivered
+            # copy was acked: starting a wait then would never be cleared.
+            if result.outcome == "held_timeout" and self.held_since[entity] is None:
+                self.held_since[entity] = time.monotonic() - terminal_duration
+            telemetry.record_batch_requeued(entity, result.outcome)
+        else:
+            self.last_settled_at[entity] = time.monotonic()
+            self.held_since[entity] = None
         error = state.error if state is not None else None
         if result.settlement is Settlement.ACK:
             outcome = result.outcome
@@ -235,6 +278,10 @@ class PostgreSQLBatchObserver:
             outcome = "failed"
             if result.settlement is Settlement.REJECT:
                 self._had_dlq_nacks[entity] = True
+            elif result.settlement is Settlement.REQUEUE:
+                # Back to the broker, not to the dead-letter queue: the purge veto must not read it as a
+                # rejection, and the record is not lost.
+                self.requeued_counts[entity] += 1
             if state is not None:
                 state.rejected += 1
             if error is not None:
@@ -269,6 +316,20 @@ class PostgreSQLBatchObserver:
                     sqlstate=getattr(state.error, "sqlstate", None),
                     error_type=type(state.error).__name__ if state.error is not None else None,
                 )
+
+    def oldest_unsettled_age_s(self, data_type: str) -> float:
+        """Age of the oldest delivery accepted and not yet settled, including one inside a running write."""
+        accepted = self._accepted_at[data_type]
+        return time.perf_counter() - accepted[0] if accepted else 0.0
+
+    def held_age_s(self, data_type: str) -> float:
+        """How long the type's oldest unwritten record has waited, requeues included; 0 when none is held."""
+        since = self.held_since[data_type]
+        return time.monotonic() - since if since is not None else 0.0
+
+    def outstanding_accepted(self) -> dict[str, int]:
+        """Deliveries accepted but not yet settled, by type. Zero once the engine is drained."""
+        return {data_type: len(entries) for data_type, entries in self._accepted_at.items()}
 
     def had_dlq_nacks(self, data_type: str) -> bool:
         return self._had_dlq_nacks.get(data_type, False)
@@ -505,6 +566,36 @@ class PostgreSQLBatchProcessor:
             "transient_failures": snapshot["transient_attempts"],
             "shutdown": snapshot["shutdown"],
         }
+
+    def stalled(self, stall_s: float = DEFAULT_STALL_S) -> dict[str, float]:
+        """Types whose oldest queued delivery is older than ``stall_s`` with no settlement for as long.
+
+        Maps each stalled type to the age of its oldest queued delivery in seconds. A deep queue behind
+        long but finishing flushes keeps settling and is not stalled; a write that never returns, or a
+        capacity wait that never frees, stops settlement and is.
+        """
+        # The engine's age covers what is still queued. A batch inside a write that never returns has
+        # left the queue, so it is the observer's accepted-and-unsettled age that shows it.
+        queued = self._snapshot()["oldest_pending_age_s"]
+        now = time.monotonic()
+        ages = {
+            data_type: max(float(queued.get(data_type, 0.0)), self._observer.oldest_unsettled_age_s(data_type), self._observer.held_age_s(data_type))
+            for data_type in DATA_TYPES
+        }
+        return {data_type: age for data_type, age in ages.items() if age > stall_s and now - self._observer.last_settled_at[data_type] > stall_s}
+
+    def report_stall_gauges(self, stall_s: float = DEFAULT_STALL_S) -> dict[str, float]:
+        """Publish each type's stall state and oldest wait to telemetry; returns the stalled types."""
+        stalled = self.stalled(stall_s)
+        queued = self._snapshot()["oldest_pending_age_s"]
+        for data_type in DATA_TYPES:
+            age = max(
+                float(queued.get(data_type, 0.0)),
+                self._observer.oldest_unsettled_age_s(data_type),
+                self._observer.held_age_s(data_type),
+            )
+            telemetry.record_batch_stall(data_type, data_type in stalled, age)
+        return stalled
 
     def had_dlq_nacks(self, data_type: str) -> bool:
         return self._observer.had_dlq_nacks(data_type)

@@ -4298,8 +4298,9 @@ class TestMainFullRun:
 
             # Connect + channel + QoS were configured.
             mock_rabbitmq_instance.connect.assert_awaited()
-            mock_channel.set_qos.assert_awaited_once()
-            assert mock_channel.set_qos.await_args.kwargs["global_"] is False
+            # One shared channel for topology plus one delivery channel per data type.
+            assert mock_channel.set_qos.await_count == 1 + len(mod.DATA_TYPES)
+            assert all(call.kwargs["global_"] is False for call in mock_channel.set_qos.await_args_list)
             # Exchanges/queues declared and consumers started for every data type.
             assert mock_channel.declare_exchange.await_count >= len(mod.DATA_TYPES)
             assert mock_queue.consume.await_count == len(mod.DATA_TYPES)

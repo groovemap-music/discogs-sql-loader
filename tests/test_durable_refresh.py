@@ -93,6 +93,11 @@ async def test_versionless_terminal_is_dead_lettered_before_purge_or_schedule() 
     recorded.assert_not_awaited()
 
 
+def _delivery_channel(queue: MagicMock) -> MagicMock:
+    """A per-type delivery channel whose declared queue is ``queue``."""
+    return MagicMock(is_closed=False, declare_queue=AsyncMock(return_value=queue), set_qos=AsyncMock())
+
+
 @pytest.mark.asyncio
 async def test_repeated_commit_failure_pauses_broker_before_nack_then_recovers() -> None:
     """Many DB probes consume no additional x-delivery-count; one recovery commits."""
@@ -102,6 +107,7 @@ async def test_repeated_commit_failure_pauses_broker_before_nack_then_recovers()
     queue.consume = AsyncMock(return_value="resumed-tag")
     service.consumer_tags = {"artists": "original-tag"}
     service.queues = {"artists": queue}
+    service.delivery_channels = {"artists": _delivery_channel(queue)}
     service.active_connection = MagicMock()
     service.active_channel = MagicMock()
     service.durable_refresh_worker_task = MagicMock()  # Already running.
@@ -148,6 +154,7 @@ async def test_missing_schema_keeps_startup_consumers_closed_until_probe_recover
     queue = MagicMock()
     queue.consume = AsyncMock(return_value="restored-tag")
     service.queues = {"artists": queue}
+    service.delivery_channels = {"artists": _delivery_channel(queue)}
     service.active_connection = MagicMock()
     service.active_channel = MagicMock()
     service.durable_refresh_worker_task = MagicMock()
@@ -238,6 +245,7 @@ async def test_partial_resubscription_cancel_failure_requires_broker_reset() -> 
     labels = MagicMock()
     labels.consume = AsyncMock(side_effect=RuntimeError("subscribe failed"))
     service.queues = {"artists": artists, "labels": labels}
+    service.delivery_channels = {"artists": _delivery_channel(artists), "labels": _delivery_channel(labels)}
     connection = MagicMock()
     connection.close = AsyncMock()
     service.active_connection = connection

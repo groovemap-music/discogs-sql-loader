@@ -46,6 +46,9 @@ PIPELINE_BATCH_SIZE = "groovemap.pipeline.batch.size"
 PIPELINE_BATCH_FLUSH_DURATION = "groovemap.pipeline.batch.flush.duration"
 PIPELINE_CONSUMERS_ACTIVE = "groovemap.pipeline.consumers.active"
 PIPELINE_PURGE_CONSECUTIVE_VETOES = "groovemap.pipeline.purge.consecutive_vetoes"
+PIPELINE_BATCH_STALLED = "groovemap.pipeline.batch.stalled"
+PIPELINE_BATCH_OLDEST_UNSETTLED_AGE = "groovemap.pipeline.batch.oldest_unsettled_age"
+PIPELINE_BATCH_REQUEUED = "groovemap.pipeline.batch.requeued"
 DERIVED_REFRESH_JOBS = "groovemap.derived_refresh.jobs"
 DERIVED_REFRESH_PENDING_AGE = "groovemap.derived_refresh.pending.age"
 DERIVED_REFRESH_ATTEMPTS = "groovemap.derived_refresh.attempts"
@@ -99,6 +102,19 @@ def _build_instruments() -> dict[str, Any]:
         PIPELINE_PURGE_CONSECUTIVE_VETOES: meter.create_gauge(
             PIPELINE_PURGE_CONSECUTIVE_VETOES,
             description="Extractions in a row that vetoed this entity's stale-row purge.",
+        ),
+        PIPELINE_BATCH_STALLED: meter.create_gauge(
+            PIPELINE_BATCH_STALLED,
+            description="1 while this entity's oldest unwritten record has waited past the stall bound with nothing acked or rejected, else 0.",
+        ),
+        PIPELINE_BATCH_OLDEST_UNSETTLED_AGE: meter.create_gauge(
+            PIPELINE_BATCH_OLDEST_UNSETTLED_AGE,
+            unit="s",
+            description="How long this entity's oldest unwritten record has waited, requeues to the broker included.",
+        ),
+        PIPELINE_BATCH_REQUEUED: meter.create_counter(
+            PIPELINE_BATCH_REQUEUED,
+            description="Deliveries returned to the broker unwritten, by reason (held_timeout, delivery_lost).",
         ),
         DERIVED_REFRESH_JOBS: meter.create_counter(
             DERIVED_REFRESH_JOBS,
@@ -217,6 +233,24 @@ def record_purge_consecutive_vetoes(entity: str, count: int) -> None:
         _instrument(PIPELINE_PURGE_CONSECUTIVE_VETOES).set(count, {"loader": SOURCE, "entity": entity})
     except Exception:  # pragma: no cover - defensive
         logger.debug("Could not record %s", PIPELINE_PURGE_CONSECUTIVE_VETOES, exc_info=True)
+
+
+def record_batch_stall(entity: str, stalled: bool, oldest_age_s: float) -> None:
+    """Record whether this entity's batches are settling, and how long its oldest record has waited."""
+    attributes = {"loader": SOURCE, "entity": entity}
+    try:
+        _instrument(PIPELINE_BATCH_STALLED).set(1 if stalled else 0, attributes)
+        _instrument(PIPELINE_BATCH_OLDEST_UNSETTLED_AGE).set(oldest_age_s, attributes)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not record %s", PIPELINE_BATCH_STALLED, exc_info=True)
+
+
+def record_batch_requeued(entity: str, reason: str) -> None:
+    """Count one delivery returned to the broker unwritten."""
+    try:
+        _instrument(PIPELINE_BATCH_REQUEUED).add(1, {"loader": SOURCE, "entity": entity, "reason": reason})
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not record %s", PIPELINE_BATCH_REQUEUED, exc_info=True)
 
 
 def record_derived_refresh_transition(outcome: str, duration_s: float) -> None:

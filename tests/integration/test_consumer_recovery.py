@@ -132,6 +132,12 @@ async def loader() -> AsyncIterator[Loader]:
         state.recoveries.append(time.monotonic())
         await real_recover()
 
+    real_recover_type = service._recover_data_type
+
+    async def recover_type(data_type: str) -> bool:
+        state.recoveries.append(time.monotonic())
+        return await real_recover_type(data_type)
+
     service.rabbitmq_manager = AsyncResilientRabbitMQ(connection_url=url, max_retries=3, heartbeat=600, connection_attempts=3, retry_delay=1.0)
     service.active_connection = await service.rabbitmq_manager.connect()
     service.active_channel = await service.active_connection.channel()
@@ -141,11 +147,12 @@ async def loader() -> AsyncIterator[Loader]:
     with (
         patch.object(service, "on_data_message", on_data_message),
         patch.object(service, "_recover_consumers", recover),
+        patch.object(service, "_recover_data_type", recover_type),
         patch.object(service, "STUCK_CHECK_INTERVAL", CHECK_INTERVAL),
         patch.object(service, "STARTUP_IDLE_TIMEOUT", 1),
     ):
         for data_type in service.DATA_TYPES:
-            service.consumer_tags[data_type] = await service.queues[data_type].consume(service.make_data_handler(data_type))
+            service.consumer_tags[data_type] = await service._start_consumer(data_type)
         checker = asyncio.create_task(service.periodic_queue_checker())
         try:
             yield state
@@ -256,7 +263,7 @@ async def test_real_broker_cancel_is_detected_when_the_client_does_not_restore_i
     version = loader.broker.connection.server_properties["version"]
     if tuple(int(part) for part in str(version).split(".")[:2]) < (4, 3):
         pytest.skip("this broker does not send basic.cancel on an ack timeout")
-    channel = await service.active_channel.get_underlay_channel()
+    channel = await service.delivery_channels[HOLD_TYPE].get_underlay_channel()
     tag = service.consumer_tags[HOLD_TYPE]
     loader.hold = True
     with patch.object(RobustConnection, "_request_recovery", lambda _self: None):
@@ -285,7 +292,7 @@ async def _recovered(loader: Loader) -> bool:
 @pytest.mark.asyncio
 async def test_real_channel_close_resumes_consumption_without_a_false_recovery(loader: Loader) -> None:
     """A broker-closed channel reopens with its tags; closing the connection would requeue work."""
-    channel = await service.active_channel.get_underlay_channel()
+    channel = await service.delivery_channels[HOLD_TYPE].get_underlay_channel()
     with pytest.raises(aiormq.exceptions.ChannelPreconditionFailed):
         await channel.queue_declare(service.catalog_queue_name(service.AMQP_CONSUMER_NAME, HOLD_TYPE), durable=False)
 
@@ -303,7 +310,7 @@ async def test_real_channel_close_resumes_consumption_without_a_false_recovery(l
 
 @pytest.mark.asyncio
 async def test_channel_the_client_will_not_reopen_is_recovered(loader: Loader) -> None:
-    await service.active_channel.close()
+    await service.delivery_channels[HOLD_TYPE].close()
 
     await _until(lambda: _recovered(loader), 5, "the checker to notice the closed channel")
     await _until(lambda: _all_attached(loader), 10, "consumers after recovery")
