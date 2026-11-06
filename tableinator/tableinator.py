@@ -112,6 +112,10 @@ message_counts = {"artists": 0, "labels": 0, "masters": 0, "releases": 0}
 progress_interval = 100  # Log progress every 100 messages
 last_message_time = {"artists": 0.0, "labels": 0.0, "masters": 0.0, "releases": 0.0}
 completed_files: set[str] = set()  # Track which files have completed processing
+# Types whose extraction_complete this process has settled. A type that is in completed_files, has no
+# consumer and is not in here is waiting for its terminal marker, which the extractor publishes only
+# after every file is done and so lands on a queue nobody is consuming (gm-discogs-sql-loader-ryro).
+extraction_signalled: set[str] = set()
 
 # Non-batch mode only: paces requeues while PostgreSQL is unavailable, because a nacked
 # message comes straight back. run_delivery counts x-acquired-count and dead-letters after
@@ -202,6 +206,11 @@ QUEUE_CHECK_INTERVAL = int(
     os.environ.get("QUEUE_CHECK_INTERVAL", "3600")
 )  # Default 1 hour - how often to check for new messages when connection is closed
 
+# How often to look for an extraction_complete parked on a type whose consumer was already cancelled.
+# A passive declare on a queue is a single cheap RPC, and a parked marker is only visible to the
+# console as NO CONSUMER for as long as this interval, instead of up to QUEUE_CHECK_INTERVAL.
+MARKER_CHECK_INTERVAL = int(os.environ.get("MARKER_CHECK_INTERVAL", "5"))
+
 # Interval for checking stuck state (consumers died unexpectedly)
 STUCK_CHECK_INTERVAL = int(os.environ.get("STUCK_CHECK_INTERVAL", "30"))  # Default 30 seconds - how often to check for stuck state
 
@@ -291,6 +300,8 @@ def get_health_data() -> dict[str, Any]:
         "stalled_batches": {data_type: round(age, 1) for data_type, age in stalled_batches.items()},
         "active_consumers": list(consumer_tags.keys()),
         "completed_files": list(completed_files),
+        # Expected waits, not faults: types whose consumer is cancelled until their terminal marker arrives.
+        "awaiting_extraction_complete": types_awaiting_marker(),
         # A refresh that is silently not happening is the failure this field exists to surface.
         "derived_relation_refresh": ("degraded" if not durable_refresh_ready else str(durable_refresh_health.get("status", "starting")))
         if durable_refresh_active
@@ -872,6 +883,71 @@ async def _recover_data_type(data_type: str) -> bool:
     return True
 
 
+def types_awaiting_marker() -> list[str]:
+    """Types whose file is done and whose consumer is cancelled, but whose extraction_complete is not settled."""
+    return [t for t in DATA_TYPES if t in completed_files and t not in consumer_tags and t not in extraction_signalled]
+
+
+async def queue_depth(data_type: str) -> int | None:
+    """Return the messages ready on one type's queue, or None if the broker cannot say.
+
+    A new channel, because a passive declare reads the live count only on a channel that does
+    not know the queue yet.
+    """
+    connection = active_connection
+    if connection is None:
+        return None
+    channel = None
+    try:
+        channel = await connection.channel()
+        declared = await channel.declare_queue(name=catalog_queue_name(AMQP_CONSUMER_NAME, data_type), passive=True, robust=False)
+        return int(declared.declaration_result.message_count)
+    except Exception as error:
+        logger.warning("⚠️ Could not read the queue depth", data_type=data_type, error_type=type(error).__name__)
+        return None
+    finally:
+        if channel is not None:
+            with contextlib.suppress(Exception):
+                await channel.close()
+
+
+async def recover_parked_markers() -> bool:
+    """Resubscribe, one type at a time, any type whose extraction_complete is queued with no consumer.
+
+    The consumer is cancelled CONSUMER_CANCEL_DELAY after file_complete to hold nothing while the
+    other files run, but the extractor publishes extraction_complete only after the last file. This
+    restarts a type's consumer the moment its marker is queued instead of waiting for the idle
+    reconnect, and leaves every other type, and the cancellation bound, untouched: the consumer
+    cancels again CONSUMER_CANCEL_DELAY after the marker is settled.
+    """
+    pending = types_awaiting_marker()
+    if not pending or shutdown_requested:
+        return False
+    if durable_refresh_active and (durable_refresh_paused or not durable_refresh_ready):
+        return False
+    if active_connection is None:
+        # Every consumer is cancelled and the transport is closed: the full probe reconnects and
+        # restarts consumption when a queue holds anything.
+        await _recover_consumers()
+        return True
+    resumed = False
+    for data_type in pending:
+        depth = await queue_depth(data_type)
+        if not depth or data_type in consumer_tags or active_connection is None:
+            continue
+        try:
+            consumer_tags[data_type] = await _start_consumer(data_type)
+        except Exception as exc:
+            logger.error("❌ Could not resubscribe to a parked extraction_complete", data_type=data_type, error_type=type(exc).__name__)
+            delivery_channels.pop(data_type, None)
+            continue
+        telemetry.record_consumer_started()
+        last_message_time[data_type] = time.time()
+        resumed = True
+        logger.info("📬 Resubscribed to deliver a parked terminal signal", data_type=data_type, queued=depth)
+    return resumed
+
+
 async def periodic_queue_checker() -> None:
     """Periodically check queue health and recover from stuck states.
 
@@ -884,10 +960,12 @@ async def periodic_queue_checker() -> None:
     """
 
     last_full_check = 0.0  # Track when we last did a full queue check
+    last_stuck_check = time.monotonic()
 
     while not shutdown_requested:
         try:
-            await asyncio.sleep(STUCK_CHECK_INTERVAL)
+            # Tick fast only while a terminal marker may be parked on a cancelled consumer.
+            await asyncio.sleep(min(STUCK_CHECK_INTERVAL, MARKER_CHECK_INTERVAL) if types_awaiting_marker() else STUCK_CHECK_INTERVAL)
             if durable_refresh_active and (durable_refresh_paused or not durable_refresh_ready):
                 continue
 
@@ -897,6 +975,14 @@ async def periodic_queue_checker() -> None:
                 if await _reset_durable_broker():
                     await _recover_consumers()
                 continue
+
+            await recover_parked_markers()
+
+            # Everything below keeps its own STUCK_CHECK_INTERVAL cadence: it confirms a lost
+            # consumer only on two consecutive looks, which a faster tick would shorten.
+            if time.monotonic() - last_stuck_check < STUCK_CHECK_INTERVAL:
+                continue
+            last_stuck_check = time.monotonic()
 
             current_time = time.time()
 
@@ -1326,6 +1412,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
             # The first record of the next extraction re-arms progress/stuck detection
             # and invalidates the previous run's grace-period cancellation timer.
             completed_files.discard(data_type)
+            extraction_signalled.discard(data_type)
             pending_cancel = consumer_cancel_tasks.pop(data_type, None)
             if pending_cancel is not None:
                 pending_cancel.cancel()
@@ -1540,6 +1627,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                 # A plain restart between the file_complete ack and this delivery
                 # reaches the same terminal state.
                 completed_files.add(data_type)
+                extraction_signalled.add(data_type)
 
                 # Re-arm cancellation: the file_complete that originally scheduled it
                 # was consumed in an earlier session or before recovery.
