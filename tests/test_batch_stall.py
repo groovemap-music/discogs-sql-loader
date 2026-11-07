@@ -21,19 +21,22 @@ def settle(observer: PostgreSQLBatchObserver, settlement: Settlement, outcome: s
 
 class TestWhatCountsAsProgress:
     def test_only_ack_and_reject_advance_last_settled_at(self) -> None:
+        # The observer stamps time.monotonic(), whose origin is the boot time on Linux: a fixed number such as
+        # 100.0 is in the future on a freshly booted CI runner. The baseline is taken from the same clock instead.
         observer = PostgreSQLBatchObserver()
-        observer.last_settled_at["artists"] = 100.0
+        baseline = time.monotonic() - 1000.0
+        observer.last_settled_at["artists"] = baseline
 
         settle(observer, Settlement.REQUEUE, "held_timeout")
-        assert observer.last_settled_at["artists"] == 100.0
+        assert observer.last_settled_at["artists"] == baseline
         settle(observer, Settlement.REQUEUE, "delivery_lost")
-        assert observer.last_settled_at["artists"] == 100.0
+        assert observer.last_settled_at["artists"] == baseline
 
         settle(observer, Settlement.ACK)
-        assert observer.last_settled_at["artists"] > 100.0
-        observer.last_settled_at["artists"] = 100.0
+        assert observer.last_settled_at["artists"] > baseline
+        observer.last_settled_at["artists"] = baseline
         settle(observer, Settlement.REJECT, "poison")
-        assert observer.last_settled_at["artists"] > 100.0
+        assert observer.last_settled_at["artists"] > baseline
 
     def test_a_requeue_keeps_the_wait_and_only_ack_or_reject_ends_it(self) -> None:
         observer = PostgreSQLBatchObserver()
