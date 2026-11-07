@@ -133,6 +133,7 @@ exclude_lines = [
 name = "cz_conventional_commits"
 version_provider = "uv"
 version_scheme = "pep440"
+major_version_zero = true
 version_files = ["tableinator/__init__.py:__version__"]
 tag_format = "v$version"
 annotated_tag = true
