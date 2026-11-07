@@ -3,6 +3,25 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.5.0 (2026-11-06)
+
+### Release notes
+
+Needs the database-schema release that carries `purge_vetoed`: deploy the schema first. A parked extraction_complete is now delivered within about a second instead of up to QUEUE_CHECK_INTERVAL. Purge vetoes are durable and alert on consecutive extractions, and a stalled batch reports unhealthy.
+
+### Feat
+
+- **purge**: alert when purges are vetoed on consecutive extractions
+
+### Fix
+
+- **consumers**: deliver extraction_complete parked on a cancelled consumer
+- **batch**: adopt the engine's marker and write bounds
+- **health**: start a held wait only for a held_timeout requeue
+- **health**: keep a held record's wait across requeues
+- **health**: report unhealthy when batches stop settling, isolate channels per data type
+- **purge**: keep the veto across restarts and broker dead-letters
+
 ## v0.4.5 (2026-11-05)
 
 ### Operator notes
