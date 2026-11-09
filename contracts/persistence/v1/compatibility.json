@@ -48,7 +48,7 @@
       "otel",
       "postgres"
     ],
-    "tested_commit": "6d0425f908e01a446b040e2993045e2afe30460e",
+    "tested_commit": "e5d5ad620b22db7f92143f6a6f7228ecadb8aecf",
     "tested_version": "0.1.0"
   },
   "catalog_item_supersession": {
@@ -151,7 +151,8 @@
     },
     "column_writers": {
       "loader_extraction_latch.purge_vetoed": [
-        "discogs-sql-loader"
+        "discogs-sql-loader",
+        "musicbrainz-sql-loader"
       ]
     },
     "consumers": [
@@ -273,7 +274,7 @@
     "consumers": [
       "catalog-api"
     ],
-    "design_decision": "catalog-api's Identity Ledger works list and density routes computed every release item's event history per request (71.5 s p95 for the default works list at 50% scale, against a 2 s budget), and no index helps because each statement aggregates the whole history before it filters. Four tables hold what those statements compute, maintained off the request path by one function. They were materialized views until gm-database-schema-xen5: REFRESH recomputes all history whether or not anything changed, and CONCURRENTLY diffs every row, so a materialized view cannot cost less than its history (45 s on lux to produce 4 rows). The definitions remain catalog-api's route SQL with the filters lifted out, as its prototype composed them (scripts/ledger_scale.py, _view_statements, catalog-api 6d744e2); identity_ledger_verify() and the integration suite pin the tables to them. They are declared after the graph statements because the capture triggers and the refresh reach graph.derived_from.",
+    "design_decision": "catalog-api's Identity Ledger works list and density routes computed every release item's event history per request (71.5 s p95 for the default works list at 50% scale, against a 2 s budget), and no index helps because each statement aggregates the whole history before it filters. Four tables hold what those statements compute, and a fifth rolls the works list up per UTC day (gm-database-schema-9dcd), all maintained off the request path by one function. They were materialized views until gm-database-schema-xen5: REFRESH recomputes all history whether or not anything changed, and CONCURRENTLY diffs every row, so a materialized view cannot cost less than its history (45 s on lux to produce 4 rows). The definitions remain catalog-api's route SQL with the filters lifted out, as its prototype composed them (scripts/ledger_scale.py, _view_statements, catalog-api 6d744e2); identity_ledger_verify() and the integration suite pin the tables to them. They are declared after the graph statements because the capture triggers and the refresh reach graph.derived_from.",
     "introduced_in_contract_version": 1,
     "kind": "additive",
     "populate": "every table is created empty, so applying the schema never runs the whole history inline; identity_ledger_refresh_state holds no row until the first refresh commits, and that row, not the tables' emptiness, answers 'refreshed yet?', because a catalog with no events is empty too; reapplying the schema never empties a table",
@@ -285,6 +286,7 @@
         "identity_ledger_edition_events",
         "identity_ledger_edition_parents",
         "identity_ledger_work_summary",
+        "identity_ledger_work_summary_day",
         "identity_ledger_density"
       ],
       "privilege": "SECURITY INVOKER: the caller needs SELECT, INSERT, UPDATE, DELETE on IDENTITY_LEDGER_REFRESH_GRANTS and SELECT on the six sources. catalog-api connects as the login that owns public, like every service (deployment .env.example), and EXECUTE defaults to PUBLIC, so no grant is declared. The capture functions are SECURITY DEFINER, so a writer of a source needs no grant on the log",
@@ -373,6 +375,30 @@
             "work_id"
           ],
           "index": "idx_identity_ledger_work_summary_key"
+        }
+      },
+      "identity_ledger_work_summary_day": {
+        "columns": [
+          "work_id",
+          "event",
+          "day",
+          "prev_day",
+          "editions",
+          "first_event",
+          "last_event"
+        ],
+        "indexes": [
+          "idx_identity_ledger_work_summary_day_work ON public.identity_ledger_work_summary_day (work_id)"
+        ],
+        "meaning": "the works list's rollup per UTC day, for windows of full days. One row per work, event filter ('any', an event type, or the pseudo filter 'repaired' for reattached, promoted or reverted), day and prev_day; editions counts the work's editions with an event of that filter on that day, and prev_day is that edition's previous day with an event of the same filter, '-infinity' for its first. WINDOW RULE for full UTC days [a, b]: evented_editions = sum(editions) over event = F, day in [a, b] and prev_day < a, which counts an edition once at its first day in the window; repaired_editions = the same over event = 'repaired' when F = 'any', editions itself when F is a repair type, and 0 otherwise; first_event and last_event = min(first_event) and max(last_event) over every row of event F with day in [a, b]. Summing editions over days without the prev_day condition counts an edition once per day it has events",
+        "unique": {
+          "columns": [
+            "event",
+            "day",
+            "work_id",
+            "prev_day"
+          ],
+          "index": "idx_identity_ledger_work_summary_day_key"
         }
       },
       "identity_ledger_density": {
@@ -602,6 +628,7 @@
       "graph.medium_label",
       "graph.refresh_artist_member_of",
       "graph.refresh_vertex_degree",
+      "graph.strip_person_name",
       "graph.text_key"
     ],
     "introduced_in_contract_version": 1,
@@ -1081,6 +1108,28 @@
     },
     "views": 37
   },
+  "master_search": {
+    "backfill": "CALL public.master_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0), run once by the operator outside a transaction block; the initializer never runs it. Each batch takes SHARE on public.master_search (never a lock on masters beyond a read's ACCESS SHARE), so readers never block and a load's trigger waits at most one batch; first_page resumes from its last progress notice; its heap pass upserts, rewriting a row only when its vector or year differs, so it also repairs stale rows; rerunning it is harmless; its SQL runs in step functions with a pinned search_path, and PUBLIC has no EXECUTE on it or them",
+    "columns": {
+      "master_id": "VARCHAR PRIMARY KEY, equal to masters.data_id",
+      "title_tsv": "TSVECTOR NOT NULL",
+      "year": "TEXT, NULL when the document has no year"
+    },
+    "consumers": [
+      "catalog-api"
+    ],
+    "consumer_rollout": "expand phase: catalog-api ranks, year-filters and decade-facets masters by master_search only after master_search_drift() reports no missing rows on that database; until then it keeps reading masters.data through idx_masters_fts, which this change leaves in place",
+    "design_decision": "Master search and the masters half of the decade facet computed to_tsvector over masters.data for every match and read each match's heap row of whole documents (lux: 2.6M masters, 2.4 GB of heap at about nine a page; 'love' 71,692 matches, 69,224 buffers for the ranked branch, 0.97 per match). A side table built by the same generator as release_search holds the vector and the year, so a ranking or a facet reads a narrow row per match and reads masters only for the rows that survive its LIMIT; on a lux-shaped 2.6M-row sample 'love' falls from 1.05 to 0.38 buffers per match (2.8x) and from 6.6 s to 0.18 s cold, with the same 40 results in the same order; a side table rather than columns on masters for the reasons release_search gives (gm-database-schema-nu0c)",
+    "drift": "public.master_search_drift() RETURNS TABLE (missing bigint, orphaned bigint, stale bigint); missing and orphaned read keys only, stale recomputes every vector and year together and so reads every document",
+    "index": "idx_master_search_title_tsv ON public.master_search USING GIN (title_tsv)",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "maintenance": "triggers on public.masters keep it current, so no loader changes: an insert or delete is captured once per statement, an update only when it sets data_id or data (so the loaders' updated_at refresh and identity backfill pay nothing), and a truncate empties it; a capture writes a row only when its vector or year changed; the capture functions are SECURITY DEFINER, so a role that writes masters needs no grant on master_search; each refuses to run on any table but public.masters, and PUBLIC has no EXECUTE on them",
+    "relation": "public.master_search",
+    "rollback": "the statements in MASTER_SEARCH_ROLLBACK_STATEMENTS, in order; they touch no masters row and nothing of release_search",
+    "vector": "to_tsvector('english', COALESCE(data->>'title', '')) of the master's data, the expression idx_masters_fts indexes, for every master and no other row",
+    "year": "data->>'year' of the master's data verbatim, as text: catalog-api's (year)::int filter and its '^[0-9]{4}$' decade test apply to it unchanged, and no document value can make a capture fail"
+  },
   "musicbrainz_delete_reconciliation": {
     "columns": {
       "musicbrainz.external_links.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
@@ -1094,7 +1143,7 @@
   "musicbrainz_relationship_key": {
     "consumer": "musicbrainz-sql-loader",
     "introduced_in_contract_version": 1,
-    "kind": "additive",
+    "kind": "retirement",
     "key": {
       "function": "musicbrainz.relationship_key",
       "index": "musicbrainz.relationships_key",
@@ -1108,22 +1157,170 @@
         "end_date",
         "attributes"
       ],
-      "beside": "relationships_natural_key (UNIQUE NULLS NOT DISTINCT over the same eight columns), which stays"
+      "conflict_target": "ON CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes))"
     },
-    "later_step": {
-      "kind": "retirement",
-      "action": "drop the relationships_natural_key constraint, once the loader's conflict target is the expression",
-      "after": "gm-musicbrainz-sql-loader-1twk moves the writer: ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) becomes ON CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)); the column list and the DO UPDATE clause do not change",
-      "before": "MusicBrainz is enabled",
-      "why": "the index per row only falls when the constraint goes; while both exist the table pays for both keys",
-      "tracked_in": "gm-database-schema-ngw9"
+    "retired": {
+      "constraint": "relationships_natural_key",
+      "relation": "musicbrainz.relationships",
+      "was": "UNIQUE NULLS NOT DISTINCT over the same eight columns",
+      "statement": "musicbrainz.relationships_natural_key retire",
+      "guard": "dropped only when relationships_key exists and is unique, valid and ready; otherwise the statement keeps the constraint and raises a notice",
+      "never_recreated": "neither the CREATE TABLE nor the five-column migration declares it, so applying the schema again does not bring it back",
+      "breaking_for": "an ON CONFLICT (<eight columns>) target, which then fails with: there is no unique or exclusion constraint matching the ON CONFLICT specification"
     },
-    "note": "Additive: the current loader keeps working, because the eight-column constraint still names its conflict target. The hash key is the same rule as the constraint except that attributes is hashed as jsonb text: key order does not matter, but a number keeps its written scale, so 1 and 1.0 are two hash keys where jsonb equality calls them one; while the constraint stays it rejects the second. A NULL value is one key and is distinct from an empty string and from jsonb null.",
-    "rollback": "DROP INDEX musicbrainz.relationships_key and DROP FUNCTION musicbrainz.relationship_key; nothing depends on them while the constraint stays."
+    "rollout_order": [
+      {
+        "phase": "expand",
+        "step": "database-schema adds musicbrainz.relationship_key and the unique index musicbrainz.relationships_key beside the constraint",
+        "shipped_in": "database-schema v0.8.0 or earlier",
+        "tracked_in": "gm-database-schema-ngw9"
+      },
+      {
+        "phase": "migrate",
+        "step": "musicbrainz-sql-loader moves its conflict target to the expression",
+        "requires": "musicbrainz-sql-loader v0.6.0 or later, deployed and running",
+        "tracked_in": "gm-musicbrainz-sql-loader-1twk"
+      },
+      {
+        "phase": "contract",
+        "step": "database-schema drops relationships_natural_key",
+        "requires": "no writer still names the eight columns as its conflict target",
+        "tracked_in": "gm-database-schema-00ke"
+      },
+      {
+        "phase": "enable",
+        "step": "MusicBrainz is enabled and the first load runs",
+        "requires": "the contract phase has been applied",
+        "tracked_in": "gm-database-schema-00ke"
+      }
+    ],
+    "note": "The hash key is the old constraint's rule except that attributes is hashed as jsonb text: key order does not matter, but a number keeps its written scale, so 1 and 1.0 are two keys where jsonb equality calls them one. With the constraint retired they are two rows. A NULL value is one key and is distinct from an empty string and from jsonb null. MusicBrainz attributes are strings and arrays of strings, so none is known to hit the scale case. No index leads with source_mbid after the drop: a source_mbid lookup is answered by idx_mb_rels_endpoint_source (source_entity_type, target_entity_type, source_mbid) through PostgreSQL 18's B-tree skip scan.",
+    "rollback": "Restore the constraint with ALTER TABLE musicbrainz.relationships ADD CONSTRAINT relationships_natural_key UNIQUE NULLS NOT DISTINCT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes); it builds a unique index over the table, so it takes a write lock for the build and fails if the table holds two rows that the jsonb comparison calls equal (the 1 and 1.0 case). Applying the schema does not restore it. A writer that names the eight columns may run again only after that."
   },
   "owners": [
     "database-schema"
   ],
+  "release_search": {
+    "attributes": "gm-database-schema-1sle: catalog-api's facet and filter inputs, each exactly the expression it evaluates over releases today, so its genre, decade and media facets and its year, genre, media and country filters can read release_search instead of detoasting releases.data per match; nothing is typed or cleaned, so a clause answers the same for every row and no value can make a capture trigger fail",
+    "backfill": "CALL public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0), run once by the operator outside a transaction block; the initializer never runs it. Each batch takes SHARE on public.release_search (never a lock on releases beyond a read's ACCESS SHARE), so readers never block and a load's trigger waits at most one batch; first_page resumes from its last progress notice; its heap pass upserts, rewriting a row only when one of its values differs, so it fills columns added to a populated table and repairs stale rows; rerunning it is harmless; its SQL runs in step functions with a pinned search_path, and PUBLIC has no EXECUTE on it or them",
+    "columns": {
+      "country": "TEXT, data->>'country' of the release, exactly as catalog-api's country filter (= ANY) reads it",
+      "genres": "JSONB, data->'genres' of the release, exactly as catalog-api's genre filter (?|) and facet (jsonb_array_elements_text) read it",
+      "media_families": "JSONB, media->'families' of the release, exactly as catalog-api's media filter (?|) and facet (jsonb_array_elements_text) read it",
+      "media_mediums": "JSONB, jsonb_path_query_array(media, '$.items[*].medium[*]'): NULL exactly when media is NULL (catalog-api's media IS NULL), and media_mediums ? m exactly when jsonb_path_exists(media, '$.items[*] ? (@.medium == $m)', ...)",
+      "release_id": "VARCHAR PRIMARY KEY, equal to releases.data_id",
+      "title_tsv": "TSVECTOR NOT NULL",
+      "year": "TEXT, data->>'year' of the release, exactly as catalog-api's year filter (::int) and decade facet (~ '^[0-9]{4}$') read it; TEXT like master_search.year"
+    },
+    "consumer_rollout": "expand phase: catalog-api ranks by title_tsv only after release_search_drift() reports no missing rows on that database; until then it keeps ranking by idx_releases_fts, which this change leaves in place; catalog-api moves its facets and filtered release branches onto the attribute columns only after the backfill that follows this upgrade and a drift of (0, 0, 0); until then it reads releases as today",
+    "consumers": [
+      "catalog-api"
+    ],
+    "design_decision": "Ranking a common title term computed to_tsvector for every match, detoasting the whole releases.data document per match (lux: 'love' 497k matches, about 4.7 buffers each, 16.6 s first run). A side table holds the vector so a ranking reads a row of about 86 bytes per match and reads releases only for the rows that survive its LIMIT. A side table rather than a column on releases: a stored generated column rewrites the table under ACCESS EXCLUSIVE, and a nullable column filled in batches writes a new version of all 19.6M rows into every index on releases, while the side table is created empty and filled without writing to releases (gm-database-schema-fi4a)",
+    "drift": "public.release_search_drift() RETURNS TABLE (missing bigint, orphaned bigint, stale bigint); missing and orphaned read keys only, stale recomputes every carried column and so reads every document",
+    "index": "idx_release_search_title_tsv ON public.release_search USING GIN (title_tsv)",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "maintenance": "triggers on public.releases keep it current, so no loader changes: an insert or delete is captured once per statement, an update that sets data_id or data rewrites every column, an update that changes media (WHEN OLD.media IS DISTINCT FROM NEW.media, via release_search_capture_update_media) rewrites media_families and media_mediums only and never reads data, and a truncate empties it; so the loaders' updated_at refresh and identity backfills pay nothing; the capture functions are SECURITY DEFINER, so a role that writes releases needs no grant on release_search; each refuses to run on any table but public.releases, and PUBLIC has no EXECUTE on them",
+    "relation": "public.release_search",
+    "rollback": "move catalog-api's readers back to releases first; then the statements in RELEASE_SEARCH_ROLLBACK_STATEMENTS, in order (they also drop the media trigger and its function); they touch no releases row",
+    "upgrade": "from v0.11.0's (release_id, title_tsv): each attribute column is added by ALTER TABLE public.release_search ADD COLUMN IF NOT EXISTS, nullable with no default (a catalog change under ACCESS EXCLUSIVE on release_search only, about 1 ms each on a populated table; skipped, taking no lock, once the column exists), and the five triggers are recreated together under SHARE ROW EXCLUSIVE on releases (about 4-6 ms); the columns are NULL until CALL public.release_search_backfill() fills them",
+    "vector": "to_tsvector('english', COALESCE(data->>'title', '')) of the release's data, the expression idx_releases_fts indexes, for every release and no other row"
+  },
+  "reload_seen_lists": {
+    "kind": "additive",
+    "introduced_in_contract_version": 1,
+    "consumers": [
+      "discogs-sql-loader",
+      "musicbrainz-sql-loader"
+    ],
+    "design_decision": "A reload proved a row still upstream by rewriting it for updated_at: discogs-sql-loader's hash gate touched every unchanged row and musicbrainz-sql-loader's upserts rewrite every conflict, because the stale-row purge deletes what updated_at says the extraction did not reach (measured on a lux-shaped releases sample: 230 us and 7.8 KB of WAL a row, 0 HOT; about 150 GB and 75 minutes for lux's 19.6M releases). A seen list records the same fact without the rewrite: the loader appends the row's key, in the transaction that would have touched the row, to a narrow, unlogged, index-free list (14-18 us and under 2 bytes of WAL a row), and the purge deletes a row only when it is older than the extraction AND not in the list. One design for both loaders, by operator decision 2026-11-04 (gm-database-schema-uw6d, gm-discogs-sql-loader-g77f, gm-musicbrainz-sql-loader-3osm).",
+    "schema": "loader_seen",
+    "lists": {
+      "loader_seen.discogs_artists": {
+        "reconciles": "public.artists",
+        "seen_key": "TEXT NOT NULL, the row's data_id"
+      },
+      "loader_seen.discogs_labels": {
+        "reconciles": "public.labels",
+        "seen_key": "TEXT NOT NULL, the row's data_id"
+      },
+      "loader_seen.discogs_masters": {
+        "reconciles": "public.masters",
+        "seen_key": "TEXT NOT NULL, the row's data_id"
+      },
+      "loader_seen.discogs_releases": {
+        "reconciles": "public.releases",
+        "seen_key": "TEXT NOT NULL, the row's data_id"
+      },
+      "loader_seen.musicbrainz_relationships": {
+        "reconciles": "musicbrainz.relationships",
+        "seen_key": "BIGINT NOT NULL, loader_seen.hash_key(musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes))"
+      },
+      "loader_seen.musicbrainz_external_links": {
+        "reconciles": "musicbrainz.external_links",
+        "seen_key": "BIGINT NOT NULL, loader_seen.hash_key(musicbrainz.external_link_key(mbid, entity_type, service_name, url))"
+      }
+    },
+    "list_columns": {
+      "seen_at": "TIMESTAMPTZ NOT NULL DEFAULT now(), the appending transaction's start, as updated_at = NOW() was",
+      "seen_key": "the list's key, as above"
+    },
+    "storage": "UNLOGGED, no index, no key, autovacuum_vacuum_insert_threshold = -1; append-only between restarts, emptied only by loader_seen.start; duplicates are expected and harmless",
+    "registry": {
+      "relation": "loader_seen.lists",
+      "columns": {
+        "loader": "TEXT NOT NULL",
+        "data_type": "TEXT NOT NULL",
+        "opened_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"
+      },
+      "primary_key": [
+        "loader",
+        "data_type"
+      ],
+      "storage": "UNLOGGED, so crash recovery empties it together with the lists it vouches for",
+      "intact": "a list is intact for an extraction when its registry row exists and opened_at <= started_at - 15 minutes (the clock margin between the extractor's started_at and the database's now())"
+    },
+    "functions": {
+      "loader_seen.start(p_loader text, p_data_type text) RETURNS timestamptz": "TRUNCATE the one list and stamp its registry row with now(), in the caller's transaction; raises 22023 for an unknown list",
+      "loader_seen.intact(p_loader text, p_data_type text, p_started_at timestamptz) RETURNS boolean": "one registry read, no scan",
+      "loader_seen.status(p_loader text, p_data_type text, p_started_at timestamptz) RETURNS TABLE (opened_at timestamptz, intact boolean, seen_keys bigint)": "seen_keys counts distinct keys appended at or after p_started_at; one scan of the list; raises 22023 for an unknown list",
+      "loader_seen.<list>_stale(p_started_at timestamptz) RETURNS TABLE (<row id>)": "the purge set: rows of the reconciled table with updated_at < p_started_at AND no key in the list since p_started_at; returns data_id text for Discogs lists and id bigint for MusicBrainz lists; raises 55000 when the list is not intact",
+      "loader_seen.<list>_shadow(p_started_at timestamptz, p_sample integer DEFAULT 20) RETURNS TABLE (intact boolean, total_rows bigint, touch_purge bigint, seen_purge bigint, refreshed_not_seen bigint, seen_not_refreshed bigint, refreshed_not_seen_sample <row id>[], seen_not_refreshed_sample <row id>[])": "for a shadow reload, which still touches: touch_purge is the old purge set (updated_at < p_started_at), seen_purge what the seen purge deletes once the touch is gone (not in the list); any refreshed_not_seen blocks the switch",
+      "loader_seen.hash_key(key bytea) RETURNS bigint": "the first 8 bytes of a key hash; IMMUTABLE STRICT; a collision only keeps a stale row one more month",
+      "musicbrainz.external_link_key(mbid uuid, entity_type text, service_name text, url text) RETURNS bytea": "SHA-256 of the link's unique key, length-prefixed as musicbrainz.relationship_key is; IMMUTABLE"
+    },
+    "loader_obligations": [
+      "append every row a batch processes (inserted, changed, unchanged, and each sighting of a MusicBrainz child row) to its list in the batch's own transaction, on every write path",
+      "before a purge: skip it, as for a dead-letter veto, when loader_seen.intact is false, or when status.seen_keys is below the guard fraction of the extractor's record_counts for that type (Discogs); keep PURGE_MAX_DELETE_FRACTION on the stale set",
+      "purge from loader_seen.<list>_stale only; delete graph rows and entity rows by the returned ids, not by updated_at",
+      "call loader_seen.start for the list when the extraction settles for it (purged, vetoed or skipped), in the purge's transaction when it purges",
+      "never TRUNCATE or DELETE from a list directly"
+    ],
+    "consumer_rollout": [
+      {
+        "phase": "expand",
+        "step": "database-schema adds loader_seen; the initializer starts every list once, when it creates it",
+        "tracked_in": "gm-database-schema-uw6d"
+      },
+      {
+        "phase": "shadow",
+        "step": "each loader appends, keeps the touch and the updated_at purge, and logs loader_seen.<list>_shadow at every purge for one full reload",
+        "tracked_in": "gm-discogs-sql-loader-g77f, gm-musicbrainz-sql-loader-3osm"
+      },
+      {
+        "phase": "switch",
+        "step": "with operator approval, once a shadow reload reports refreshed_not_seen = 0 and touch_purge = seen_purge (or every difference explained): stop touching unchanged rows and purge from loader_seen.<list>_stale",
+        "tracked_in": "gm-discogs-sql-loader-g77f, gm-musicbrainz-sql-loader-3osm"
+      },
+      {
+        "phase": "contract",
+        "step": "drop idx_<table>_updated_at if no reader remains; a separate database-schema change",
+        "tracked_in": "not yet filed"
+      }
+    ],
+    "rollback": "a loader switches back to the touch and the updated_at purge by configuration; the first purge after switching back still sees every unchanged row as stale, so it must be a reload with the touch on, not a purge of the reload that ran without it. The schema's own rollback is SEEN_LIST_ROLLBACK_STATEMENTS: DROP SCHEMA loader_seen CASCADE and drop musicbrainz.external_link_key; no other relation reads them"
+  },
   "retired_relations": {
     "consumer_rollout": "contract phase of expand, migrate consumers, then contract: catalog-api stopped writing and reading both tables (gm-catalog-api-gz4r) and operations-console reads queue and service-health history from VictoriaMetrics, so the drop lands only after a catalog-api release containing that removal is deployed",
     "data": "historical rows are not migrated; VictoriaMetrics holds the same series at finer resolution for its retention window (ADR 0018)",

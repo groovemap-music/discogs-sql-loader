@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "groovemap-discogs-sql-loader"
-version = "0.5.0"
+version = "0.6.0"
 description = "Consume Discogs events and build GrooveMap analytical PostgreSQL tables"
 authors = [{name = "Robert Wlodarczyk", email = "robert@simplicityguy.com"}]
 readme = "README.md"
@@ -40,7 +40,7 @@ dev = [
     "build>=1.6.1",
     "commitizen>=4.19.2",
     "cyclonedx-bom>=7.5.0",
-    "groovemap-database-schema==0.7.0",
+    "groovemap-database-schema==0.13.0",
     "mypy>=2.4.0",
     "pip-audit>=2.10.1",
     "pip-licenses>=5.5.5",
@@ -63,7 +63,7 @@ override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "89811f45331df19b2ce065e2fec86fd516a47a43" }
-groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "66a7017096b6166806d02f7fe2a9ad411b39100b" }
+groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "a225c3db6556adf3141ce115b5afb96068d2c44e" }
 
 [tool.ruff]
 extend-exclude = ["tableinator/catalog_contract.py"]

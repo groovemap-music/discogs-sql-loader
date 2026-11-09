@@ -3,6 +3,20 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.6.0 (2026-11-09)
+
+### Release notes
+
+The loader starts in shadow mode when `loader_seen` exists. A startup probe checks for it and falls back to touch mode otherwise, so restart the loader after the schema is applied. Shadow keeps today's touch and purge and logs the seen-list comparison at each purge. Seen mode needs operator approval after a matching shadow run. Shadow and seen need database-schema 0.13.0; on older schemas the loader runs in touch mode.
+
+### Feat
+
+- **purge**: record reload sightings in loader_seen lists, shadow mode first
+
+### Fix
+
+- **release**: keep breaking changes below 1.0 with major_version_zero
+
 ## v0.5.0 (2026-11-06)
 
 ### Release notes
