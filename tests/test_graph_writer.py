@@ -305,6 +305,19 @@ class TestPurge:
         assert cursor.rows_for('"graph"."by_artist"') == ("2026-07-20T00:00:00+00:00",)
 
     @pytest.mark.asyncio
+    async def test_a_seen_purge_joins_the_stale_ids_instead_of_updated_at(self) -> None:
+        """Without the touch an unchanged document's updated_at is old, so age alone names live ones."""
+        cursor = RecordingCursor()
+
+        await purge_document_graph(cursor, "releases", "2026-07-20T00:00:00+00:00", stale_table="seen_stale")
+
+        for statement in cursor.statements():
+            assert 'USING "seen_stale" AS stale' in statement
+            assert "updated_at" not in statement
+        assert cursor.rows_for('"graph"."issued_on"') == ("discogs",)
+        assert cursor.rows_for('"graph"."by_artist"') == ()
+
+    @pytest.mark.asyncio
     async def test_a_purged_artist_takes_only_the_relations_it_asserted(self) -> None:
         """`graph.by_artist` belongs to the releases that name the artist, which still do."""
         cursor = RecordingCursor()
