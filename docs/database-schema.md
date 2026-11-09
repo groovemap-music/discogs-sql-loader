@@ -31,8 +31,11 @@ Each name maps directly to one public PostgreSQL table:
 
 `data` preserves the complete normalized event payload as JSONB. `hash` is the
 producer-supplied SHA-256 value used to avoid rewriting an unchanged document.
-`updated_at` is refreshed for every accepted catalog record so terminal cleanup can
-distinguish rows observed during the current extraction.
+`updated_at` is refreshed for every inserted or changed record. In `touch` and `shadow` mode it
+is also refreshed on hash-unchanged records so terminal cleanup can distinguish rows observed
+during the current extraction. In `seen` mode the batch path records those rows in a seen list
+instead (see [Reload seen lists](#reload-seen-lists)). The single-record path
+(`POSTGRES_BATCH_MODE=false`) still rewrites every row it receives, and appends it too.
 
 For `releases`, `media` is the separately queryable canonical media block. The loader
 uses an event's canonical block when present and derives a compatibility value from
@@ -57,6 +60,31 @@ Extraction signals and the derived-refresh obligation are recorded in
 [the derived-refresh acknowledgement budget](derived-refresh-ack-budget.md) for the durable
 handoff, and [Cross-store parity](store-parity.md) for how the graph rows are held to the
 Neo4j projection. All of these relations are created and migrated by `database-schema`.
+
+## Reload seen lists
+
+database-schema's `reload_seen_lists` (gm-database-schema-uw6d) declares the `loader_seen`
+schema: one unlogged, index-free list per Discogs table (`loader_seen.discogs_artists`,
+`_labels`, `_masters`, `_releases`, keyed by `data_id`), the unlogged registry
+`loader_seen.lists`, and the functions `start`, `intact`, `status`, `discogs_<type>_stale` and
+`discogs_<type>_shadow`. The loader uses them as that contract entry specifies
+(`tableinator/seen_list.py`):
+
+- At startup it reads the catalog for every one of those objects (`to_regclass`,
+  `to_regprocedure`) and runs in `touch` mode if any is missing. It never creates them.
+- In `shadow` and `seen` mode, `PostgreSQLBatchWriter._process_batch` appends every id the batch
+  processed (unchanged, changed, new, and backfilled), and
+  `PostgreSQLRecordPersistence.persist_record` appends its one id, each in the write's own
+  transaction: `INSERT INTO loader_seen.discogs_<type> (seen_key) SELECT unnest(%s::text[])`.
+- The purge reads `status` and `discogs_<type>_shadow` or materializes `discogs_<type>_stale`
+  into a temporary table, deletes by those ids, and empties a list only through
+  `loader_seen.start`, in the purge's transaction. It reads `loader_seen.lists.opened_at` to
+  leave a list alone that was already restarted after the extraction began.
+
+The persistence contract pinned in `contracts/persistence/` predates `reload_seen_lists`. The
+probe is what lets this loader run against both; pin the contract to the database-schema release
+that carries it once that release exists. See [Operations](operations.md#reload-seen-lists) for
+the modes and the switch.
 
 ## Native identity
 

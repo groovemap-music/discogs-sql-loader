@@ -160,6 +160,7 @@ def sample_artist_data() -> dict[str, Any]:
 def reset_service_state() -> Iterator[None]:
     """Prevent mutable tableinator state from leaking between tests."""
     import tableinator.tableinator as service
+    from tableinator.seen_list import DEFAULT_MIN_FRACTION, SeenMode
 
     def reset() -> None:
         service.shutdown_requested = False
@@ -195,6 +196,8 @@ def reset_service_state() -> Iterator[None]:
         service.durable_refresh_pause_lock = asyncio.Lock()
         service.durable_refresh_broker_reset_pending = False
         service.durable_refresh_health = {"status": "starting"}
+        service.seen_mode = SeenMode.TOUCH
+        service.seen_min_fraction = DEFAULT_MIN_FRACTION
 
     reset()
     yield

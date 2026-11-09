@@ -96,6 +96,13 @@ preferred for deployed containers.
 | `STARTUP_DELAY` | `5` seconds | Delay before dependency initialization |
 | `PURGE_MAX_DELETE_FRACTION` | `0.90` | Refuse cleanup at or above this fraction |
 
+### Reload seen lists
+
+| Variable | Required/default | Purpose |
+| --- | --- | --- |
+| `SEEN_LIST_MODE` | `shadow` | `touch`, `shadow`, or `seen`; see [Reload seen lists](#reload-seen-lists). Without database-schema's `loader_seen` schema the loader runs `touch` whatever this says. An unknown value fails startup |
+| `SEEN_MIN_FRACTION` | `0.95` | `seen` mode skips the purge when the list holds fewer distinct ids than this share of the extractor's `record_counts` for the type. Must lie in (0, 1]; calibrate it from the `seen_ratio` the shadow reload logs |
+
 ### Logging
 
 | Variable | Required/default | Purpose |
@@ -183,6 +190,64 @@ first. In the wrong order nothing is lost: the startup probe declines the latch 
 reports degraded until the schema arrives. The derived-relation refresh and the record on the latch
 stop meanwhile, and the veto still reads this run's rejections and the DLQ.
 
+### Reload seen lists
+
+A reload used to prove that a hash-unchanged row was still upstream by rewriting it
+(`UPDATE ... SET updated_at = NOW()`), only so the purge would not delete it: about 230 µs and
+7.8 KB of WAL per release, and one dead tuple each. database-schema's `reload_seen_lists`
+(the `loader_seen` schema) records the same fact in a narrow, unlogged list per Discogs table
+instead. Every id a batch or a single-record write processes is appended to it in the write's
+own transaction, and the purge deletes a row only when it is older than the extraction **and**
+absent from the list. See [the persistence boundary](database-schema.md#reload-seen-lists) for
+what the loader reads and writes.
+
+| Mode | Unchanged rows | Appends | Purge |
+| --- | --- | --- | --- |
+| `touch` | rewritten | no | `updated_at < started_at`, as before |
+| `shadow` | rewritten | yes | the same `updated_at` purge, after logging `loader_seen.discogs_<type>_shadow` |
+| `seen` | not written | yes | `loader_seen.discogs_<type>_stale`, behind the guards below |
+
+At startup the loader probes for every `loader_seen` object it uses. If any is missing it logs
+`The reload seen lists are not declared — running in touch mode` and runs `touch`, so it can be
+deployed before the schema. The probe runs once: after applying the schema, restart the loader.
+`/health` reports the mode it is running in as `seen_list_mode`.
+
+**Shadow reload.** With the schema deployed the default mode is `shadow`. At each type's purge
+the loader logs `discogs_<type>_shadow: the seen purge matches the touch purge` at info, or
+`... differs from the touch purge` at warning, with `intact`, `total_rows`, `touch_purge`,
+`seen_purge`, `refreshed_not_seen`, `seen_not_refreshed`, samples of each difference,
+`seen_keys`, `record_count`, `seen_ratio`, and `guard` (why `seen` mode would skip this purge,
+or null). The comparison never deletes anything, and a failure in it is logged and does not stop
+the touch purge. The first extraction that began before the schema was applied reports
+`intact: false`: it proves nothing, so the shadow reload is the next full one.
+
+**Switching to `seen` needs operator approval** after one full shadow reload whose four types
+each logged `intact: true`, `refreshed_not_seen: 0` and `touch_purge` equal to `seen_purge`, or
+with every difference explained. Any `refreshed_not_seen` is a write path that does not append,
+and after the switch it would delete live rows: it blocks the switch. Set `SEEN_LIST_MODE=seen`
+between extractions and restart.
+
+**What `seen` mode skips.** In one transaction, with `work_mem` raised to 256 MB, the purge
+reads `loader_seen.status`. It skips the purge when the list is not intact (crash recovery
+emptied it, or it was started after the extraction began), when the signal has no
+`record_counts` for the type, or when the list holds fewer than `SEEN_MIN_FRACTION` of them. It
+logs `Skipping stale row purge — the seen list cannot be trusted` with the reason, and records
+the skip in `purge_vetoed` like a dead-letter veto, so the consecutive-veto alert counts it.
+Otherwise it builds the stale set once, keeps `PURGE_MAX_DELETE_FRACTION`, and deletes the graph
+rows and then the entity rows by those ids. A crash therefore leaves one month of stale rows in
+place and never deletes a live one.
+
+**Restarting the list.** When an extraction settles for a type (purged, refused by the cap,
+vetoed, or skipped by a guard), the loader calls `loader_seen.start` for that type's list, in the
+purge's own transaction when it purges. A list already restarted since the extraction began is
+left alone, so a redelivered `extraction_complete` neither purges again nor empties the next
+extraction's list.
+
+**Rolling back** is `SEEN_LIST_MODE=touch` (or `shadow`) and a restart. The first purge after
+switching back must follow a reload that ran with the touch on. A purge right after a reload that
+ran in `seen` mode would see every unchanged row as stale, and only `PURGE_MAX_DELETE_FRACTION`
+would stand between it and the table.
+
 Completion state is in memory. On process restart, the producer may resume and skip
 files completed earlier. The delete guard is therefore part of the restart-safety
 contract. During shutdown, consumers are canceled before the potentially slow batch
@@ -197,7 +262,8 @@ The JSON at `/health`:
 
 - identifies the service as `discogs-sql-loader`;
 - reports `starting`, `healthy`, or `unhealthy`;
-- lists the current task, per-entity counts, active consumers, and completed files.
+- lists the current task, per-entity counts, active consumers, and completed files;
+- reports `seen_list_mode`, the [reload seen-list mode](#reload-seen-lists) the startup probe allowed.
 
 Container logs go through the shared structured-logging runtime under the same service name,
 to the console and to `/logs/discogs-sql-loader.log` (override with `LOG_FILE`; running locally without `/logs`

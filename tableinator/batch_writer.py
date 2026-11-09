@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 
 from tableinator.graph_writer import write_document_graph
 from tableinator.identity import alias_ref, alias_targets, attach_alias_targets
+from tableinator.seen_list import SeenMode, append_seen
 
 
 if TYPE_CHECKING:
@@ -82,11 +83,13 @@ class PostgreSQLBatchWriter:
         logger: Any,
         media_resolver: Callable[[dict[str, Any]], dict[str, Any]],
         admission: WriteAdmission | None = None,
+        seen_mode: SeenMode = SeenMode.TOUCH,
     ) -> None:
         self.connection_pool = connection_pool
         self.logger = logger
         self.media_resolver = media_resolver
         self.admission = admission
+        self.seen_mode = seen_mode
 
     async def process_batch(
         self,
@@ -192,10 +195,12 @@ class PostgreSQLBatchWriter:
                         identity_backfilled=len(identity_backfills),
                     )
                     # A backfill UPDATE carries its own NOW(), so the rows it touches are
-                    # excluded from the plain updated_at refresh rather than written twice.
+                    # excluded from the plain updated_at refresh rather than written twice. In
+                    # seen mode there is no refresh at all: the seen list below records that
+                    # the extraction saw these rows, and the purge reads it instead.
                     backfilled_ids = media_backfilled_ids | identity_backfilled_ids
                     refresh_ids = [data_id for data_id in unchanged_ids if data_id not in backfilled_ids]
-                    if refresh_ids:
+                    if refresh_ids and self.seen_mode.touches:
                         await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
                             sql.SQL("UPDATE {table} SET updated_at = NOW() WHERE data_id = ANY(%s)").format(table=sql.Identifier(data_type)),
                             (refresh_ids,),
@@ -240,5 +245,13 @@ class PostgreSQLBatchWriter:
                 # transaction, so a document and the edges derived from it commit or roll
                 # back together. A document the hash gate skipped is skipped here too.
                 await write_document_graph(cursor, data_type, changed_documents)
+
+                # Every id this batch processed — unchanged, changed, new, and backfilled — on
+                # this same transaction, so a batch that rolls back appends nothing and a
+                # committed one has always appended. Appending changed and new rows too, which
+                # the purge's age test would keep anyway, is what makes the seen count
+                # comparable to the extractor's record_counts.
+                if self.seen_mode.appends:
+                    await append_seen(cursor, data_type, data_ids)
 
                 return BatchWriteResult(set(unchanged_ids), media_backfilled_ids, identity_backfilled_ids)

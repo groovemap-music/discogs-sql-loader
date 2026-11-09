@@ -79,6 +79,14 @@ from tableinator.queue_names import (
     dead_letter_queue_name as catalog_dead_letter_queue_name,
 )
 from tableinator.record_persistence import PostgreSQLRecordPersistence
+from tableinator.seen_list import (
+    DEFAULT_MIN_FRACTION,
+    SeenMode,
+    configured_min_fraction,
+    configured_mode,
+    effective_mode,
+    probe_seen_lists,
+)
 
 
 if TYPE_CHECKING:
@@ -144,6 +152,14 @@ CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # D
 PURGE_MAX_DELETE_FRACTION = float(
     os.environ.get("PURGE_MAX_DELETE_FRACTION", "0.90")
 )  # Default 90% - refuse purges that would delete this share or more of a table
+
+# ── gm-discogs-sql-loader-g77f: reload seen lists ────────────────────────────
+# How the loader proves a reload saw a row: touch (rewrite updated_at), shadow (touch and append
+# to the seen list, and log how the two purges compare), or seen (append only, purge from the
+# list). `main` resolves SEEN_LIST_MODE against the startup probe; until then, and in unit tests,
+# the loader touches. See tableinator.seen_list and docs/database-schema.md.
+seen_mode: SeenMode = SeenMode.TOUCH
+seen_min_fraction: float = DEFAULT_MIN_FRACTION
 
 # ── gm-discogs-sql-loader-2eg.3: the derived-relation refresh ────────────────
 # The counter, degree, and genre-aggregate relations are whole-catalog sums over the edge
@@ -310,6 +326,8 @@ def get_health_data() -> dict[str, Any]:
         # ... and this one surfaces the other shape of that failure: the latch is enabled and
         # a signal was still dropped, because it named no extraction to key on.
         "derived_relation_refresh_last_refused": derived_relation_refresh_last_refused,
+        # touch, shadow, or seen: the mode the startup probe allowed, not only the one configured.
+        "seen_list_mode": seen_mode.value,
         "timestamp": datetime.now(UTC).isoformat(),
     }
 
@@ -1329,21 +1347,41 @@ async def report_purge_vetoes(data_type: str) -> None:
         )
 
 
-async def purge_stale_rows(data_type: str, started_at: str, record_count: int | None = None) -> None:
-    """Delete rows not refreshed by the current extraction when safe."""
-    if connection_pool is None:
-        return
-    admission = write_admission
-    if admission is None:
-        raise DatabaseUnavailableError("Write admission not initialized")
-    persistence = PostgreSQLRecordPersistence(
+def record_persistence() -> PostgreSQLRecordPersistence:
+    """Return the record persistence for the running pool and seen-list mode."""
+    return PostgreSQLRecordPersistence(
         connection_pool,
         logger,
         PURGE_MAX_DELETE_FRACTION,
         media_for_release,
+        seen_mode,
+        seen_min_fraction,
     )
+
+
+async def purge_stale_rows(data_type: str, started_at: str, record_count: int | None = None) -> str | None:
+    """Delete rows not refreshed by the current extraction when safe.
+
+    Returns why a seen-mode guard skipped the purge, which the caller records as a veto.
+    """
+    if connection_pool is None:
+        return None
+    admission = write_admission
+    if admission is None:
+        raise DatabaseUnavailableError("Write admission not initialized")
     async with admission.slot():
-        await persistence.purge_stale_rows(data_type, started_at, record_count)
+        return await record_persistence().purge_stale_rows(data_type, started_at, record_count)
+
+
+async def start_seen_list(data_type: str, started_at: str) -> None:
+    """Restart the type's seen list after its extraction settled without a purge (a veto)."""
+    if connection_pool is None or not seen_mode.appends:
+        return
+    admission = write_admission
+    if admission is None:
+        return
+    async with admission.slot():
+        await record_persistence().start_seen_list(data_type, started_at)
 
 
 def make_data_handler(
@@ -1498,10 +1536,13 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                     reason=veto_reason,
                 )
                 purge_ok = await persist_purge_veto(data_type, data)
+                if purge_ok:
+                    await start_seen_list(data_type, data.get("started_at", ""))
             elif connection_pool is not None:
+                seen_veto: str | None = None
                 try:
                     record_counts = data.get("record_counts", {})
-                    await purge_stale_rows(
+                    seen_veto = await purge_stale_rows(
                         data_type,
                         data.get("started_at", ""),
                         record_counts.get(data_type),
@@ -1513,6 +1554,13 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
                         error=str(purge_exc),
                     )
                     purge_ok = False
+                if seen_veto is not None:
+                    # A seen list that is lost or short is recorded exactly like a dead-letter
+                    # veto, so a redelivery stays vetoed and the consecutive-veto alert counts it.
+                    # Then the list restarts, so the next extraction has an intact one.
+                    purge_ok = await persist_purge_veto(data_type, data)
+                    if purge_ok:
+                        await start_seen_list(data_type, data.get("started_at", ""))
 
             # Record the terminal signal only after this type's purge. Durable mode
             # commits the fourth signal and a scheduled job before ack; its worker
@@ -1737,12 +1785,7 @@ async def _process_data_message(message: AbstractIncomingMessage, data_type: str
         if connection_pool is None:
             raise DatabaseUnavailableError("Connection pool not initialized")
 
-        persistence = PostgreSQLRecordPersistence(
-            connection_pool,
-            logger,
-            PURGE_MAX_DELETE_FRACTION,
-            media_for_release,
-        )
+        persistence = record_persistence()
         admission = write_admission
         if admission is None:
             raise DatabaseUnavailableError("Write admission not initialized")
@@ -1930,7 +1973,9 @@ async def main() -> None:
         durable_refresh_ready, \
         durable_refresh_worker_task, \
         durable_refresh_recovery_task, \
-        durable_refresh_paused
+        durable_refresh_paused, \
+        seen_mode, \
+        seen_min_fraction
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -1967,6 +2012,12 @@ async def main() -> None:
         raise StartupFailure("previous PostgreSQL writer lifespan did not drain")
 
     durable_refresh_active = os.environ.get("DERIVED_REFRESH_MODE", "durable").lower() != "inline"
+    try:
+        requested_seen_mode = configured_mode()
+        seen_min_fraction = configured_min_fraction()
+    except ValueError as e:
+        logger.error("❌ Invalid reload seen-list configuration", error=str(e))
+        raise StartupFailure("invalid reload seen-list configuration") from e
     try:
         writer_capacity = writer_admission_capacity(config.postgres_pool_max_size, durable_refresh=durable_refresh_active)
     except ValueError as e:
@@ -2011,6 +2062,9 @@ async def main() -> None:
         # gm-discogs-sql-loader-2eg.3: resolve the declared extraction latch relation once,
         # read-only. A miss is a logged degraded mode, never a reason to create the table.
         extraction_latch = await probe_latch_relation(connection_pool, logger)
+        # gm-discogs-sql-loader-g77f: read-only as well. Without the schema the loader touches.
+        schema_present = requested_seen_mode is not SeenMode.TOUCH and await probe_seen_lists(connection_pool, logger)
+        seen_mode = effective_mode(requested_seen_mode, schema_present, logger)
         # The gauge lives in this process, so a restart must not read as the problem going away.
         for data_type in DATA_TYPES:
             await report_purge_vetoes(data_type)
@@ -2046,7 +2100,7 @@ async def main() -> None:
             validate_stall_s(BATCH_STALL_S, BATCH_MAX_HOLD_S)
         except ValueError as e:
             raise StartupFailure(str(e)) from e
-        batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config(), write_admission)
+        batch_processor = PostgreSQLBatchProcessor(connection_pool, batch_config(), write_admission, seen_mode)
         logger.info(
             "🚀 Async batch processing enabled",
             batch_size=BATCH_SIZE,
