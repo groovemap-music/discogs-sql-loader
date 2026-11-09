@@ -166,17 +166,25 @@ def _scoped_delete(relation: str, column: str, source_scoped: bool) -> sql.Compo
     )
 
 
-def _purge_delete(relation: str, column: str, entity_table: str, source_scoped: bool) -> sql.Composed:
+def _purge_delete(relation: str, column: str, entity_table: str, source_scoped: bool, stale_table: str | None = None) -> sql.Composed:
     """Return the set-based delete removing one relation's rows for every stale document.
 
-    The stale set is named by the same `updated_at` predicate the entity purge itself runs,
-    joined server-side, so no deleted id is ever streamed back and buffered — a purge of a
-    shrunk dump stays O(1) in the client however many rows it removes, which is the reason
-    this is not `DELETE ... RETURNING data_id`.
+    The stale set is named server-side, so no deleted id is ever streamed back and buffered — a
+    purge of a shrunk dump stays O(1) in the client however many rows it removes, which is the
+    reason this is not `DELETE ... RETURNING data_id`. In touch mode it is the same `updated_at`
+    predicate the entity purge runs. In seen mode it is STALE_TABLE, the temporary table of ids
+    `loader_seen.discogs_<type>_stale` returned: without the touch an unchanged document's
+    `updated_at` predates the extraction, so the age test alone would name live documents.
     """
     predicate = sql.SQL("edge.{column} = stale.data_id").format(column=sql.Identifier(column))
     if source_scoped:
         predicate = sql.SQL("{predicate} AND edge.{source} = %s").format(predicate=predicate, source=sql.Identifier("source"))
+    if stale_table is not None:
+        return sql.SQL("DELETE FROM {relation} AS edge USING {stale} AS stale WHERE {predicate}").format(
+            relation=sql.Identifier(GRAPH_SCHEMA, relation),
+            stale=sql.Identifier(stale_table),
+            predicate=predicate,
+        )
     return sql.SQL("DELETE FROM {relation} AS edge USING {table} AS stale WHERE stale.updated_at < %s AND {predicate}").format(
         relation=sql.Identifier(GRAPH_SCHEMA, relation),
         table=sql.Identifier(entity_table),
@@ -236,7 +244,7 @@ async def write_document_graph(
             await cursor.execute(_insert(relation, EDGE_COLUMNS[relation]), _columns(pending, _edge_order))
 
 
-async def purge_document_graph(cursor: Any, data_type: str, started_at: Any) -> None:
+async def purge_document_graph(cursor: Any, data_type: str, started_at: Any, *, stale_table: str | None = None) -> None:
     """Delete the graph rows of every document the stale-row purge is about to remove.
 
     Called from inside `PostgreSQLRecordPersistence.purge_stale_rows`, on its transaction and
@@ -246,9 +254,14 @@ async def purge_document_graph(cursor: Any, data_type: str, started_at: Any) -> 
     Args:
         cursor: An open async cursor on the purge's transaction.
         data_type: One of the four contract entity tables.
-        started_at: The extraction start the purge compares `updated_at` against.
+        started_at: The extraction start the touch purge compares `updated_at` against.
+        stale_table: In seen mode, the temporary table of stale `data_id`s to delete by instead.
     """
     for relation in _PURGE_SCOPE.get(data_type, ()):
         column, source_scoped = _DOCUMENT_SCOPE[relation]
-        parameters: tuple[Any, ...] = (started_at, DISCOGS_SOURCE) if source_scoped else (started_at,)
-        await cursor.execute(_purge_delete(relation, column, data_type, source_scoped), parameters)
+        parameters: tuple[Any, ...]
+        if stale_table is not None:
+            parameters = (DISCOGS_SOURCE,) if source_scoped else ()
+        else:
+            parameters = (started_at, DISCOGS_SOURCE) if source_scoped else (started_at,)
+        await cursor.execute(_purge_delete(relation, column, data_type, source_scoped, stale_table), parameters)

@@ -27,6 +27,7 @@ from common.postgres_resilient import PostgreSQLFailureClassifier
 from tableinator import telemetry
 from tableinator.batch_writer import BatchWriteResult, PostgreSQLBatchWriter
 from tableinator.media import media_for_release
+from tableinator.seen_list import SeenMode
 
 
 if TYPE_CHECKING:
@@ -422,9 +423,16 @@ class PostgreSQLBatchSink:
 class PostgreSQLBatchProcessor:
     """Owner adapter around :class:`common.batch.AsyncBatchEngine`."""
 
-    def __init__(self, connection_pool: Any, config: BatchConfig | None = None, admission: WriteAdmission | None = None) -> None:
+    def __init__(
+        self,
+        connection_pool: Any,
+        config: BatchConfig | None = None,
+        admission: WriteAdmission | None = None,
+        seen_mode: SeenMode = SeenMode.TOUCH,
+    ) -> None:
         self.connection_pool = connection_pool
         self.admission = admission
+        self.seen_mode = seen_mode
         self.config = config or BatchConfig()
         env_batch_size = os.environ.get("POSTGRES_BATCH_SIZE")
         if env_batch_size:
@@ -532,7 +540,7 @@ class PostgreSQLBatchProcessor:
         return True
 
     async def _process_batch(self, data_type: str, messages: list[PendingMessage]) -> BatchWriteResult:
-        writer = PostgreSQLBatchWriter(self.connection_pool, logger, media_for_release, self.admission)
+        writer = PostgreSQLBatchWriter(self.connection_pool, logger, media_for_release, self.admission, self.seen_mode)
         return await writer.process_batch(data_type, messages)
 
     async def flush_queue(self, data_type: str) -> bool:
